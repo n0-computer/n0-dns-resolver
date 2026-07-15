@@ -23,7 +23,8 @@ yet fully-featured DNS resolver. It does not perform recursive resolution.
 - With a crypto provider enabled, also speaks DNS-over-TLS and
   DNS-over-HTTPS, pooling and reusing connections.
 
-It does not currently perform DNSSEC validation or negative caching.
+It does not do negative caching. DNSSEC validation is available as an opt-in
+feature; see [DNSSEC validation](#dnssec-validation) below.
 
 ## Usage
 
@@ -59,9 +60,42 @@ fallback alongside the primary servers, `disable_fallback` removes it, and
 - `tls-ring`: enables DNS-over-TLS and DNS-over-HTTPS using the `ring` crypto
   provider.
 - `tls-aws-lc-rs`: the same, using the `aws-lc-rs` provider.
+- `dnssec`: enables DNSSEC validation (see below). Pulls in `ring` for the
+  signature and digest primitives.
 
-Neither is enabled by default; without a crypto provider the resolver speaks
-plain DNS over UDP and TCP only.
+None is enabled by default; without a crypto provider the resolver speaks plain
+DNS over UDP and TCP only, and without `dnssec` it performs no validation.
+
+## DNSSEC validation
+
+With the `dnssec` feature enabled, the builder's `validate_dnssec` turns on
+DNSSEC validation. Every answer is then checked against the chain of trust from
+the embedded IANA root key-signing keys down to the signing zone, and a lookup
+returns an error unless the answer is provably secure.
+
+Validation is fail-closed. It verifies the RRSIG signatures over the answer
+RRset (RSA/SHA-256 and RSA/SHA-512, ECDSA P-256 and P-384, and Ed25519), walks
+the DS and DNSKEY records up to the root, and uses NSEC and NSEC3 records to
+prove wildcard expansions and insecure, unsigned delegations. Anything it cannot
+prove secure is rejected.
+
+The validator is deliberately strict and covers the common signed-lookup case
+rather than being a full recursive validator. Its limitations:
+
+- It requires answers to be secure. An unsigned name, or a negative answer it
+  cannot authenticate, is rejected rather than returned, so enable validation
+  only for names you expect to be signed.
+- Authenticating NXDOMAIN and NODATA answers is not yet wired into the lookup
+  path, though the NSEC and NSEC3 proof code is present and tested.
+- Only the final answer RRset is validated. CNAME hops are followed but not
+  each checked individually.
+- The root trust anchors are compiled in (KSK-2017 and KSK-2024), so a build
+  must be updated after a root key rollover.
+- Deprecated algorithms (RSA/SHA-1 and DSA) are unsupported, and RSA keys
+  shorter than 2048 bits are rejected, which can reject zones still on 1024-bit
+  keys.
+- NSEC3 opt-out is honoured only for insecure delegations, empty non-terminal
+  NODATA is not proven, and NSEC3 records above 100 iterations are skipped.
 
 
 ## License
