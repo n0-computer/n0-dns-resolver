@@ -70,6 +70,10 @@ enum ValidateError {
     /// The queried name in a NODATA response did not parse as a domain name.
     #[error("NODATA response is for an invalid name {name}")]
     InvalidQname { name: String },
+    /// The SOA that named the signing zone is not the queried name's own zone or
+    /// an ancestor of it, so it cannot authoritatively deny records for the name.
+    #[error("NODATA SOA zone {zone} is not authoritative for {name}")]
+    NonAuthoritativeSoa { zone: String, name: String },
     /// The authority section did not prove the queried type is absent (NODATA).
     #[error("NODATA denial for {name} is not proven")]
     DenialUnproven { name: String, source: DenialError },
@@ -235,6 +239,22 @@ impl SimpleDnsResolver {
                 })
             })?
             .into_owned();
+
+        // The SOA owner is attacker-controlled, so it must be checked before it
+        // is trusted to name the signing zone. Only the queried name's own zone
+        // or an ancestor may authoritatively deny records for it; otherwise the
+        // holder of any signed zone could sign an NSEC for this name and forge a
+        // NODATA to suppress a real record. The authoritative relation is the same
+        // suffix check the positive path uses on RRSIG signers.
+        let authoritative = Name::new(&zone)
+            .map(|zone_name| signer_is_authoritative(&zone_name, &qname))
+            .unwrap_or(false);
+        if !authoritative {
+            return Err(e!(ValidateError::NonAuthoritativeSoa {
+                zone: zone.clone(),
+                name: host.to_string(),
+            }));
+        }
 
         let keys = match self.trusted_keys_for_zone(&zone).await? {
             ZoneTrust::Insecure => return Ok(()),
@@ -563,6 +583,32 @@ mod tests {
         assert!(
             matches!(result, Err(Error::DnssecBogus { .. })),
             "NODATA with no denial proof must be Bogus, got {result:?}"
+        );
+    }
+
+    /// The SOA names an unrelated zone the attacker controls. Even though that
+    /// zone may be signed, it is not authoritative for the queried name, so the
+    /// denial must be rejected before any chain fetch. Without this check the
+    /// holder of any signed zone could sign an NSEC for another name and forge a
+    /// NODATA, suppressing that name's records.
+    #[tokio::test]
+    async fn validate_nodata_rejects_non_authoritative_soa() {
+        let resolver = SimpleDnsResolver::builder()
+            .without_system_defaults()
+            .disable_fallback()
+            .validate_dnssec()
+            .build();
+        let response = nodata_reply("host.example.com", Some("attacker.com"));
+        // Assert the specific reason: the SOA zone is rejected as non-authoritative
+        // before any chain fetch. Checking the inner error (not just the wrapped
+        // Bogus) isolates this from the fetch failure a nameserver-less resolver
+        // would otherwise hit.
+        let result = resolver
+            .validate_nodata_inner("host.example.com", TYPE::A, &response)
+            .await;
+        assert!(
+            matches!(result, Err(ValidateError::NonAuthoritativeSoa { .. })),
+            "a non-authoritative SOA zone must be rejected, got {result:?}"
         );
     }
 
