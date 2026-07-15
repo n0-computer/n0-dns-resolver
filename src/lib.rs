@@ -87,6 +87,8 @@ pub struct Builder {
     fallback_nameservers: Option<Vec<Nameserver>>,
     #[cfg(with_crypto_provider)]
     tls_client_config: Option<rustls::ClientConfig>,
+    #[cfg(feature = "dnssec")]
+    validate_dnssec: bool,
 }
 
 impl Default for Builder {
@@ -98,6 +100,8 @@ impl Default for Builder {
             fallback_nameservers: None,
             #[cfg(with_crypto_provider)]
             tls_client_config: None,
+            #[cfg(feature = "dnssec")]
+            validate_dnssec: false,
         }
     }
 }
@@ -207,6 +211,31 @@ impl Builder {
     #[must_use]
     pub fn tls_client_config(mut self, config: rustls::ClientConfig) -> Self {
         self.tls_client_config = Some(config);
+        self
+    }
+
+    /// Validates every answer against the DNSSEC chain of trust before returning it.
+    ///
+    /// With this set, the resolver requests DNSSEC records (it sets the EDNS DO
+    /// bit), and before returning an answer it fetches the signing zone's DNSKEY
+    /// RRset and the DS chain up to the embedded root anchors, then walks that
+    /// chain. The lookup fails with the `DnssecBogus` error variant when the chain
+    /// does not validate.
+    ///
+    /// Validation is fail-closed and does not implement NSEC or NSEC3 authenticated
+    /// denial of existence. A name that is not DNSSEC-signed, or a negative answer,
+    /// cannot be proven and is therefore rejected as Bogus rather than passed
+    /// through as insecure. Enable this only when every name you resolve is signed.
+    ///
+    /// Only the final answer RRset is validated; intermediate CNAME hops in a
+    /// chain are followed but not individually validated.
+    #[cfg(any(feature = "dnssec", doc))]
+    #[must_use]
+    pub fn validate_dnssec(mut self) -> Self {
+        #[cfg(feature = "dnssec")]
+        {
+            self.validate_dnssec = true;
+        }
         self
     }
 

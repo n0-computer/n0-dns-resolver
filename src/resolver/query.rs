@@ -74,6 +74,20 @@ pub(super) fn build_query(host: &str, qtype: TYPE) -> Result<(u16, Vec<u8>), Que
     Ok((id, bytes))
 }
 
+/// Sets the EDNS(0) DO (DNSSEC OK) bit on a query built by [`build_query`].
+///
+/// `simple_dns` does not model the DO bit, so it is set directly on the built
+/// bytes. The DO bit is the high bit of the OPT record's TTL flags field
+/// (RFC 6891 section 6.1.3). [`build_query`] emits the OPT record last with no
+/// options, so its flags high byte sits four bytes from the end. When the buffer
+/// is too short to hold an OPT record this is a no-op.
+#[cfg(feature = "dnssec")]
+pub(super) fn set_do_bit(bytes: &mut [u8]) {
+    if let Some(flags_hi) = bytes.len().checked_sub(4).and_then(|i| bytes.get_mut(i)) {
+        *flags_hi |= 0x80;
+    }
+}
+
 /// Returns the RCODE if `data` is a server failure that warrants trying another
 /// nameserver (SERVFAIL or REFUSED), otherwise `None`.
 ///

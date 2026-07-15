@@ -25,6 +25,8 @@ use crate::{
 };
 
 mod cache;
+#[cfg(feature = "dnssec")]
+mod dnssec_validate;
 mod pool;
 mod query;
 mod rtt_map;
@@ -136,6 +138,10 @@ pub struct SimpleDnsResolver {
     /// ahead of the cache for A/AAAA lookups. Empty unless system defaults are
     /// in use.
     hosts: Hosts,
+    /// When set, every answer is validated against the DNSSEC chain of trust
+    /// before it is returned. See [`Builder::validate_dnssec`].
+    #[cfg(feature = "dnssec")]
+    validate_dnssec: bool,
     /// The settings this resolver was built from, kept so [`Self::reset`] can
     /// rebuild against a changed network.
     builder: Builder,
@@ -245,6 +251,8 @@ impl SimpleDnsResolver {
             conn_pool: ConnPool::new(),
             cache,
             hosts,
+            #[cfg(feature = "dnssec")]
+            validate_dnssec: builder.validate_dnssec,
             builder,
         }
     }
@@ -528,7 +536,14 @@ impl SimpleDnsResolver {
         for _ in 0..MAX_CNAME_DEPTH {
             let name = simple_dns::Name::new(&current_host)
                 .map_err(|e| e!(Error::InvalidQuery, AnyError::from_std(e)))?;
-            let (id, query_bytes) = query::build_query(&current_host, qtype)?;
+            #[cfg_attr(not(feature = "dnssec"), allow(unused_mut))]
+            let (id, mut query_bytes) = query::build_query(&current_host, qtype)?;
+            // With validation on, request the RRSIG records by setting the DO bit
+            // so the answer carries the signatures the chain walk needs.
+            #[cfg(feature = "dnssec")]
+            if self.validate_dnssec {
+                query::set_do_bit(&mut query_bytes);
+            }
             let response = self.send_query(&query_bytes).await?;
             let packet =
                 simple_dns::Packet::parse(&response).map_err(|_| e!(Error::InvalidResponse))?;
@@ -544,6 +559,12 @@ impl SimpleDnsResolver {
                 .any(|rr| rr.rdata.type_code() == qtype);
 
             if has_answer {
+                // Validate the answer before trusting it. Fail-closed: an
+                // unsigned or bogus answer becomes an error rather than a result.
+                #[cfg(feature = "dnssec")]
+                if self.validate_dnssec {
+                    self.validate_answer(qtype, &response).await?;
+                }
                 return Ok(response);
             }
 
@@ -1064,6 +1085,22 @@ mod tests {
             .await
             .map(|i| i.collect::<Vec<_>>());
         assert!(err.is_err(), "expected NXDOMAIN, got {err:?}");
+    }
+
+    /// End to end validation of a known DNSSEC-signed name against a public
+    /// resolver. `cloudflare.com` is signed, so the chain from the root anchors
+    /// down must validate and the lookup must succeed.
+    #[cfg(feature = "dnssec")]
+    #[tokio::test]
+    #[ignore = "requires network access"]
+    async fn validate_dnssec_signed_name() {
+        let resolver = SimpleDnsResolver::builder()
+            .without_system_defaults()
+            .disable_fallback()
+            .nameserver(CLOUDFLARE_DNS, DnsProtocol::Udp)
+            .validate_dnssec()
+            .build();
+        assert_resolves_ipv4(&resolver, "cloudflare.com").await;
     }
 
     mod search_names {
