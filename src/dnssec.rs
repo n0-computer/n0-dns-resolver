@@ -556,7 +556,7 @@ fn walk_from_trusted_root(
     for zone in &chain.zones {
         trusted = descend_zone(&trusted, zone)?;
     }
-    verify_rrset_with_keys(&chain.target, &trusted)
+    verify_rrset_with_keys(&chain.target, &trusted).map(|_| ())
 }
 
 /// Anchors the root DNSKEY RRset and returns its trusted keys.
@@ -700,10 +700,15 @@ pub(crate) fn descend_zone(
 ///
 /// Returns [`ChainError::NoSigningKey`] or [`ChainError::Link`] like
 /// [`verify_chain`].
+///
+/// Returns the `labels` field of the RRSIG that verified, so the caller can tell
+/// whether the accepted signature was a wildcard expansion (labels below the
+/// owner's label count) and demand the closer-match proof for exactly that
+/// signature rather than for some other RRSIG in the set.
 pub(crate) fn verify_rrset_with_keys(
     signed: &SignedRrset<'_>,
     keys: &[DNSKEY<'_>],
-) -> Result<(), ChainError> {
+) -> Result<u8, ChainError> {
     let refs: Vec<&DNSKEY<'_>> = keys.iter().collect();
     verify_signed_rrset(signed, &refs)
 }
@@ -716,8 +721,10 @@ pub(crate) fn verify_rrset_with_keys(
 /// two keys can share a tag, so a tag match alone does not pick the right key
 /// (RFC 4034 appendix B). Returns [`ChainError::NoSigningKey`] when no RRSIG has
 /// a matching key at all, and [`ChainError::Link`] when a matching key was tried
-/// but every signature check failed.
-fn verify_signed_rrset(signed: &SignedRrset<'_>, keys: &[&DNSKEY<'_>]) -> Result<(), ChainError> {
+/// but every signature check failed. On success returns the verifying RRSIG's
+/// `labels` field so the caller can bind a wildcard decision to the signature
+/// that actually validated, not to some other RRSIG in the set.
+fn verify_signed_rrset(signed: &SignedRrset<'_>, keys: &[&DNSKEY<'_>]) -> Result<u8, ChainError> {
     let mut matched_any = false;
     let mut last_err = None;
     let mut checks = 0usize;
@@ -726,7 +733,7 @@ fn verify_signed_rrset(signed: &SignedRrset<'_>, keys: &[&DNSKEY<'_>]) -> Result
             if key.algorithm == rrsig.algorithm && key_tag(key) == rrsig.key_tag {
                 matched_any = true;
                 match verify_rrsig(rrsig, &signed.records, key) {
-                    Ok(()) => return Ok(()),
+                    Ok(()) => return Ok(rrsig.labels),
                     Err(err) => last_err = Some(err),
                 }
                 // Stop after a generous number of checks so a response cannot
@@ -1524,12 +1531,24 @@ fn authority_rrset_signed(
     authority: &[ResourceRecord<'_>],
     keys: &[DNSKEY<'_>],
 ) -> bool {
+    let owner_labels = owner.as_bytes().count();
     let mut checks = 0usize;
     for rr in authority {
         let RData::RRSIG(sig) = &rr.rdata else {
             continue;
         };
         if rr.name != *owner || sig.type_covered != type_covered {
+            continue;
+        }
+        // A denial NSEC or NSEC3 must be signed at its own name, never as a
+        // wildcard expansion. If the RRSIG labels are below the owner's label
+        // count, `canonical_owner` reconstructs `*.zone` and verifies the
+        // signature over that: an attacker could then relabel a genuine
+        // wildcard-node record onto a victim name (labels untouched) and it
+        // would still verify, forging an exact-name match in the proofs
+        // (RFC 4035 section 5.3.2). A wildcard-node NSEC is never needed to prove
+        // denial, so requiring an exact-owner signature loses no valid proof.
+        if sig.labels as usize != owner_labels {
             continue;
         }
         for key in keys {
@@ -2513,11 +2532,24 @@ mod tests {
                 owner: &str,
                 rng: &SystemRandom,
             ) -> RRSIG<'static> {
+                self.sign_with_labels(records, type_covered, label_count(owner), rng)
+            }
+
+            /// Signs `records` with an explicit RRSIG `labels` field, so a test can
+            /// build the wildcard-expansion form (labels below the owner's label
+            /// count) whose signature covers the reconstructed `*.zone` name.
+            fn sign_with_labels(
+                &self,
+                records: &[ResourceRecord<'static>],
+                type_covered: u16,
+                labels: u8,
+                rng: &SystemRandom,
+            ) -> RRSIG<'static> {
                 let now = now();
                 let mut rrsig = RRSIG {
                     type_covered,
                     algorithm: 13,
-                    labels: label_count(owner),
+                    labels,
                     original_ttl: 3600,
                     signature_expiration: now + 3600,
                     signature_inception: now - 3600,
@@ -2807,6 +2839,45 @@ mod tests {
             let anchors: Vec<TrustAnchor> = ds_anchors.into_iter().map(TrustAnchor::Ds).collect();
             assert!(verify_chain_with_trust_anchors(&chain, &anchors).is_ok());
         }
+
+        #[test]
+        fn verify_rrset_reports_the_validating_signatures_labels() {
+            let rng = SystemRandom::new();
+            let zone = Zone::new("example.com", &rng);
+            // A wildcard answer: the record's on-wire owner is host.example.com,
+            // but the genuine RRSIG has labels=2, so its signature covers the
+            // reconstructed *.example.com.
+            let records = vec![ResourceRecord::new(
+                Name::new_unchecked("host.example.com").into_owned(),
+                CLASS::IN,
+                3600,
+                RData::A(A {
+                    address: u32::from_be_bytes([192, 0, 2, 1]),
+                }),
+            )];
+            let real = zone.sign_with_labels(&records, 1, 2, &rng);
+            // A decoy RRSIG under the same key, with a full label count and a
+            // broken signature, placed first. An attacker injects it to hide the
+            // wildcard expansion; the validator must still report the labels of
+            // the signature that actually verifies (2), not the decoy's (3), so
+            // the caller demands the closer-match proof.
+            let mut decoy = zone.sign(&records, 1, "host.example.com", &rng);
+            assert_eq!(decoy.labels, 3);
+            let mut sig = decoy.signature.to_vec();
+            sig[0] ^= 0xff;
+            decoy.signature = Cow::Owned(sig);
+
+            let signed = SignedRrset {
+                records,
+                rrsigs: vec![decoy, real],
+            };
+            let labels = verify_rrset_with_keys(&signed, std::slice::from_ref(&zone.dnskey))
+                .expect("the wildcard signature verifies");
+            assert_eq!(
+                labels, 2,
+                "must report the validating RRSIG's labels, not the decoy's",
+            );
+        }
     }
 
     mod denial {
@@ -2873,12 +2944,26 @@ mod tests {
                 owner: &str,
                 signer: &str,
             ) -> ResourceRecord<'static> {
+                self.sign_with_labels(records, type_covered, owner, label_count(owner), signer)
+            }
+
+            /// Signs `records` with an explicit RRSIG `labels` field, so a test can
+            /// forge the wildcard-expansion form (labels below the owner's label
+            /// count) that a genuine wildcard-node signer emits.
+            fn sign_with_labels(
+                &self,
+                records: &[ResourceRecord<'static>],
+                type_covered: u16,
+                owner: &str,
+                labels: u8,
+                signer: &str,
+            ) -> ResourceRecord<'static> {
                 let rng = SystemRandom::new();
                 let now = now();
                 let mut rrsig = RRSIG {
                     type_covered,
                     algorithm: 13,
-                    labels: label_count(owner),
+                    labels,
                     original_ttl: 3600,
                     signature_expiration: now + 3600,
                     signature_inception: now - 3600,
@@ -2924,6 +3009,52 @@ mod tests {
                 3600,
                 RData::NSEC(nsec),
             )
+        }
+
+        /// Rewrites a record's owner name, leaving its class, TTL, and RDATA (for
+        /// an RRSIG, the labels field and the signature) untouched. Models an
+        /// on-path attacker relabeling a genuinely signed record onto a victim name.
+        fn relabel(rr: &ResourceRecord<'static>, owner: &str) -> ResourceRecord<'static> {
+            ResourceRecord::new(
+                Name::new_unchecked(owner).into_owned(),
+                rr.class,
+                rr.ttl,
+                rr.rdata.clone(),
+            )
+        }
+
+        #[test]
+        fn nodata_nsec_rejects_relabeled_wildcard() {
+            // A genuine NSEC at the wildcard node *.example.com, signed with the
+            // RRSIG labels field set to 2 (RFC 4034 3.1.3 excludes the leftmost
+            // `*`), as a real wildcard-node signer emits. Its bitmap has AAAA but
+            // not A.
+            let signer = Signer::new();
+            let nsec = nsec_rr(
+                "*.example.com",
+                "z.example.com",
+                &[AAAA, RRSIG_BIT, NSEC_BIT],
+            );
+            let rrsig = signer.sign_with_labels(
+                std::slice::from_ref(&nsec),
+                NSEC_BIT,
+                "*.example.com",
+                2,
+                "example.com",
+            );
+            // The attacker relabels both records onto host.example.com, leaving
+            // labels=2 and the signature intact. `canonical_owner` still
+            // reconstructs *.example.com, so the signature itself still verifies,
+            // and without the exact-owner check this would forge NODATA for A at
+            // host.example.com and suppress its real A RRset.
+            let forged_nsec = relabel(&nsec, "host.example.com");
+            let forged_rrsig = relabel(&rrsig, "host.example.com");
+            let authority = vec![forged_nsec, forged_rrsig];
+            let qname = Name::new_unchecked("host.example.com");
+            assert!(matches!(
+                prove_nodata(&qname, A, &authority, &signer.keys()),
+                Err(DenialError::NoProof { .. })
+            ));
         }
 
         /// Raw NSEC3 RDATA with salt `aabbccdd` and 12 iterations (RFC 5155 B).

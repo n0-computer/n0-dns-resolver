@@ -273,14 +273,6 @@ impl SimpleDnsResolver {
         signing_rrsig: &RRSIG<'static>,
         response: &[u8],
     ) -> Result<(), ValidateError> {
-        // A wildcard-expanded answer (RRSIG labels below the owner's label count)
-        // is a valid signature over `*.zone`. Proving it applies to this name
-        // needs an authority-section NSEC or NSEC3 showing no closer match exists
-        // (RFC 4035 section 5.3.4); that proof runs after the chain validates the
-        // signing zone's keys.
-        let wildcard_labels =
-            is_wildcard_expansion(signing_rrsig.labels, owner).then_some(signing_rrsig.labels);
-
         // The RRSIG signer names the zone that signed the answer. Build its
         // trusted DNSKEY set by walking the chain from the root down.
         let signing_zone = signing_rrsig.signer_name.to_string();
@@ -293,16 +285,22 @@ impl SimpleDnsResolver {
             ZoneTrust::Secure(keys) => keys,
         };
 
-        // The signing zone's keys are now trusted. Validate the answer RRset.
-        verify_rrset_with_keys(target, &trusted)
+        // The signing zone's keys are now trusted. Validate the answer RRset. The
+        // returned labels belong to the RRSIG that actually verified, which is the
+        // only signature we may draw a wildcard conclusion from: a decoy RRSIG
+        // with the same signer but a full label count must not suppress the
+        // closer-match proof for a wildcard signature that verified separately.
+        let verified_labels = verify_rrset_with_keys(target, &trusted)
             .map_err(|source| e!(ValidateError::Chain, source))?;
 
-        // Finally, a wildcard-expanded answer needs its closer-match proof from
-        // the same response's authority section, validated against the signing
-        // zone keys we just trusted.
-        if let Some(labels) = wildcard_labels {
+        // A wildcard-expanded answer (the verifying RRSIG's labels below the
+        // owner's label count) is a valid signature over `*.zone`. Proving it
+        // applies to this name needs an authority-section NSEC or NSEC3 showing no
+        // closer match exists (RFC 4035 section 5.3.4), validated against the
+        // signing zone keys we just trusted.
+        if is_wildcard_expansion(verified_labels, owner) {
             let authority = authority_records(response);
-            prove_wildcard(owner, labels, &authority, &trusted).map_err(|source| {
+            prove_wildcard(owner, verified_labels, &authority, &trusted).map_err(|source| {
                 e!(ValidateError::WildcardUnproven {
                     owner: owner.to_string(),
                     source,
