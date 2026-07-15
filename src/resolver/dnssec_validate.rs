@@ -13,7 +13,10 @@
 //! RRset is validated; CNAME hops are followed but not individually checked.
 
 use n0_error::{AnyError, e, stack_error};
-use simple_dns::{Name, Packet, TYPE, rdata::RData};
+use simple_dns::{
+    Name, Packet, TYPE,
+    rdata::{RData, RRSIG},
+};
 use tracing::{debug, warn};
 
 use super::SimpleDnsResolver;
@@ -110,7 +113,12 @@ impl SimpleDnsResolver {
         target
             .rrsigs
             .retain(|sig| signer_is_authoritative(&sig.signer_name, &owner));
-        let Some(signing_rrsig) = target.rrsigs.first() else {
+        // Take the signing zone from the most specific surviving signer, which is
+        // the RRset's actual zone apex. Honest RRSIGs over one RRset all name that
+        // apex, but an on-path attacker can prepend a bogus RRSIG signed by an
+        // ancestor zone; picking the first survivor would then build the chain too
+        // shallow and reject a legitimate answer.
+        let Some(signing_rrsig) = most_specific_signer(&target.rrsigs) else {
             return Err(e!(ValidateError::SignerNotAuthoritative {
                 signer: rejected_signer.unwrap_or_default(),
                 owner: owner.to_string(),
@@ -207,6 +215,18 @@ impl SimpleDnsResolver {
 /// compared case-insensitively. This rejects an RRSIG whose signer is an
 /// unrelated (but validly signed) zone, which would otherwise chain to the root
 /// and validate.
+/// Returns the RRSIG with the most specific (longest) signer name.
+///
+/// All authoritative RRSIGs over one RRset name the same zone in an honest
+/// response. Choosing the longest signer keeps the chain anchored at the RRset's
+/// real zone apex even if an on-path attacker injects an RRSIG signed by a
+/// shallower ancestor zone.
+fn most_specific_signer<'a>(rrsigs: &'a [RRSIG<'static>]) -> Option<&'a RRSIG<'static>> {
+    rrsigs
+        .iter()
+        .max_by_key(|sig| sig.signer_name.as_bytes().count())
+}
+
 fn signer_is_authoritative(signer: &Name<'_>, owner: &Name<'_>) -> bool {
     let signer_labels: Vec<Vec<u8>> = signer.as_bytes().map(<[u8]>::to_ascii_lowercase).collect();
     let owner_labels: Vec<Vec<u8>> = owner.as_bytes().map(<[u8]>::to_ascii_lowercase).collect();
@@ -298,6 +318,40 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn most_specific_signer_prefers_the_deepest_zone() {
+        let rrsig = |signer: &str| RRSIG {
+            type_covered: u16::from(TYPE::A),
+            algorithm: 13,
+            labels: 3,
+            original_ttl: 300,
+            signature_expiration: 1_800_000_000,
+            signature_inception: 1_700_000_000,
+            key_tag: 1,
+            signer_name: Name::new_unchecked(signer).into_owned(),
+            signature: Cow::Owned(vec![0u8; 64]),
+        };
+        // The RRset's real apex (example.com) must win over an injected
+        // ancestor-signed RRSIG (com), regardless of order.
+        let rrsigs = vec![rrsig("com"), rrsig("example.com")];
+        assert_eq!(
+            most_specific_signer(&rrsigs)
+                .unwrap()
+                .signer_name
+                .to_string(),
+            "example.com"
+        );
+        let rrsigs = vec![rrsig("example.com"), rrsig("com")];
+        assert_eq!(
+            most_specific_signer(&rrsigs)
+                .unwrap()
+                .signer_name
+                .to_string(),
+            "example.com"
+        );
+        assert!(most_specific_signer(&[]).is_none());
+    }
 
     #[test]
     fn signer_must_be_owner_or_ancestor() {
