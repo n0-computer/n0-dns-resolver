@@ -1285,6 +1285,13 @@ pub fn prove_nxdomain(
 }
 
 /// Runs the NSEC3 closest-encloser proof for NXDOMAIN (RFC 5155 section 8.4).
+///
+/// The next closer name must be covered by a record without the Opt-Out flag: an
+/// opt-out NSEC3 spans possible unsigned delegations, so it does not prove the
+/// next closer is absent, only that no signed name exists there (RFC 5155 section
+/// 8.4, RFC 7129 section 5.3). Treating an opt-out-covered next closer as proof
+/// would let a name that is actually an insecure delegation be reported as
+/// non-existent.
 fn prove_nxdomain_nsec3(
     qname: &Name<'_>,
     nsec3s: &[(Name<'static>, Nsec3)],
@@ -1307,8 +1314,10 @@ fn prove_nxdomain_nsec3(
         if !matched {
             continue;
         }
+        // The next closer must be covered by a non-opt-out record; an opt-out
+        // cover proves only insecure delegation, not non-existence.
         let next_closer = suffix_name(qname, encloser_labels + 1);
-        if !nsec3s_cover(nsec3s, &hash(&next_closer)) {
+        if !nsec3s_cover_proving_absence(nsec3s, &hash(&next_closer)) {
             continue;
         }
         let wildcard = prepend_wildcard(&encloser);
@@ -1545,6 +1554,22 @@ fn nsec3s_cover(nsec3s: &[(Name<'static>, Nsec3)], target: &str) -> bool {
             let next_hash = base32hex_encode(&nsec3.next_hashed_owner);
             nsec3_covers(&owner_hash, &next_hash, target)
         })
+    })
+}
+
+/// Returns whether a non-opt-out NSEC3 in `nsec3s` covers the hash `target`.
+///
+/// Unlike [`nsec3s_cover`], a record with the Opt-Out flag set does not count: an
+/// opt-out gap may span an unsigned delegation, so it proves only that no signed
+/// name exists in the gap, not that `target` is absent (RFC 5155 section 7.2.1).
+/// The NXDOMAIN next-closer proof needs true non-existence, so it requires this.
+fn nsec3s_cover_proving_absence(nsec3s: &[(Name<'static>, Nsec3)], target: &str) -> bool {
+    nsec3s.iter().any(|(owner, nsec3)| {
+        nsec3.flags & NSEC3_FLAG_OPT_OUT == 0
+            && nsec3_owner_hash(owner).is_some_and(|owner_hash| {
+                let next_hash = base32hex_encode(&nsec3.next_hashed_owner);
+                nsec3_covers(&owner_hash, &next_hash, target)
+            })
     })
 }
 
@@ -3311,6 +3336,67 @@ mod tests {
             let authority = vec![matcher, matcher_sig, cover, cover_sig];
             let qname = Name::new_unchecked("x.a.example");
             assert!(prove_nxdomain(&qname, &authority, &signer.keys()).is_ok());
+        }
+
+        #[test]
+        fn nxdomain_nsec3_optout_next_closer_not_proven() {
+            // Prove x.a.example does not exist. The matcher matches the closest
+            // encloser a.example but its gap is one hash wide, so it does not cover
+            // the next closer. Only the wide `cover` record spans the next closer
+            // and the wildcard. When that cover carries the Opt-Out flag it may
+            // span an unsigned delegation, so it does not prove the next closer is
+            // absent: the NXDOMAIN proof must fail closed (finding S3). The same
+            // layout with a non-opt-out cover proves the name absent, confirming
+            // the flag is what blocks the proof.
+            let signer = Signer::new();
+            let all_high = [0xffu8; 20];
+            let low = "0".repeat(32);
+            let salt = [0xaa, 0xbb, 0xcc, 0xdd];
+
+            // The matcher's gap runs from the encloser hash to the next hash value
+            // (the encloser hash plus one), so it matches a.example but covers no
+            // other name, leaving the next closer to the wide `cover` record.
+            let encloser_raw = nsec3_hash(&Name::new_unchecked("a.example"), &salt, 12);
+            let encloser_hash = base32hex_encode(&encloser_raw);
+            let mut matcher_next = encloser_raw.clone();
+            for byte in matcher_next.iter_mut().rev() {
+                if *byte == 0xff {
+                    *byte = 0;
+                } else {
+                    *byte += 1;
+                    break;
+                }
+            }
+            let matcher = nsec3_rr("example", &encloser_hash, 0, &matcher_next, &[A, NS]);
+            let matcher_owner = format!("{encloser_hash}.example");
+            let matcher_sig = signer.sign(
+                std::slice::from_ref(&matcher),
+                NSEC3_TYPE_CODE,
+                &matcher_owner,
+                "example",
+            );
+            let cover_owner = format!("{low}.example");
+
+            let proof = |cover_flags: u8| {
+                let cover = nsec3_rr("example", &low, cover_flags, &all_high, &[]);
+                let cover_sig = signer.sign(
+                    std::slice::from_ref(&cover),
+                    NSEC3_TYPE_CODE,
+                    &cover_owner,
+                    "example",
+                );
+                let authority = vec![matcher.clone(), matcher_sig.clone(), cover, cover_sig];
+                let qname = Name::new_unchecked("x.a.example");
+                prove_nxdomain(&qname, &authority, &signer.keys())
+            };
+
+            // An opt-out cover does not prove the next closer absent.
+            assert!(matches!(
+                proof(NSEC3_FLAG_OPT_OUT),
+                Err(DenialError::NoProof { .. })
+            ));
+            // The identical layout with a non-opt-out cover does prove it.
+            assert!(proof(0).is_ok());
         }
 
         #[test]
