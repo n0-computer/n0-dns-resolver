@@ -120,6 +120,30 @@ pub const ROOT_TRUST_ANCHORS: &[DS<'static>] = &[
     },
 ];
 
+/// A trust anchor for the root DNSKEY RRset.
+///
+/// A chain is trusted only when a key in its root DNSKEY RRset is anchored by one
+/// of these. The two forms match the two ways an operator holds a root anchor. A
+/// [`TrustAnchor::Ds`] carries a DS-style digest over a root key, exactly as the
+/// IANA root-anchors file publishes it (and as [`ROOT_TRUST_ANCHORS`] holds the
+/// current KSKs). A [`TrustAnchor::Dnskey`] pins a root key directly by its
+/// algorithm and public-key bytes, which is convenient when the operator holds
+/// the key material itself rather than a digest of it, for example when pinning a
+/// pending KSK during a rollover or a private root's key.
+///
+/// Pass a slice of these to [`verify_chain_with_trust_anchors`]. The DS-only
+/// [`verify_chain_with_anchors`] remains available for callers that hold anchors
+/// as plain DS records.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub enum TrustAnchor {
+    /// A DS-style anchor: a root key is anchored when its DS digest matches.
+    Ds(DS<'static>),
+    /// A DNSKEY-style anchor: a root key is anchored when its algorithm and
+    /// public-key bytes match this key.
+    Dnskey(DNSKEY<'static>),
+}
+
 /// An error returned while validating DNSSEC records.
 #[allow(missing_docs)]
 #[stack_error(derive, add_meta, std_sources)]
@@ -495,14 +519,43 @@ pub fn verify_chain_with_anchors(
     chain: &ChainOfTrust<'_>,
     anchors: &[DS<'_>],
 ) -> Result<(), ChainError> {
-    // Anchor the root, then carry the trusted DNSKEY set down one zone cut at a
-    // time. After a level validates, the whole child DNSKEY RRset is trusted and
-    // signs the next level (the next DS, or the target).
-    let mut trusted = trust_root(&chain.root_dnskeys, anchors)?;
+    let trusted = trust_root(&chain.root_dnskeys, anchors)?;
+    walk_from_trusted_root(chain, trusted)
+}
+
+/// Validates a chain of trust against a set of [`TrustAnchor`]s.
+///
+/// Behaves like [`verify_chain_with_anchors`] but accepts anchors in either DS or
+/// DNSKEY form (see [`TrustAnchor`]). A root key is anchored when a
+/// [`TrustAnchor::Ds`] digest matches it or a [`TrustAnchor::Dnskey`] matches its
+/// algorithm and public-key bytes. Use this to pin a root key directly, for a
+/// pending KSK rollover or a private root.
+///
+/// # Errors
+///
+/// Returns the same [`ChainError`] variants as [`verify_chain`]; in particular
+/// [`ChainError::UntrustedRoot`] when no root key matches an anchor.
+pub fn verify_chain_with_trust_anchors(
+    chain: &ChainOfTrust<'_>,
+    anchors: &[TrustAnchor],
+) -> Result<(), ChainError> {
+    let trusted = trust_root_with_anchors(&chain.root_dnskeys, anchors)?;
+    walk_from_trusted_root(chain, trusted)
+}
+
+/// Walks a chain from an already-anchored root DNSKEY set down to the target.
+///
+/// Carries the trusted DNSKEY set down one zone cut at a time. After a level
+/// validates, the whole child DNSKEY RRset is trusted and signs the next level
+/// (the next DS, or the target). The target RRset is signed by the deepest zone's
+/// now-trusted DNSKEY set.
+fn walk_from_trusted_root(
+    chain: &ChainOfTrust<'_>,
+    mut trusted: Vec<DNSKEY<'static>>,
+) -> Result<(), ChainError> {
     for zone in &chain.zones {
         trusted = descend_zone(&trusted, zone)?;
     }
-    // The target RRset is signed by the deepest zone's now-trusted DNSKEY set.
     verify_rrset_with_keys(&chain.target, &trusted)
 }
 
@@ -521,16 +574,51 @@ pub(crate) fn trust_root(
     root_dnskeys: &SignedRrset<'_>,
     anchors: &[DS<'_>],
 ) -> Result<Vec<DNSKEY<'static>>, ChainError> {
+    trust_root_inner(root_dnskeys, |owner, key| {
+        anchors
+            .iter()
+            .any(|anchor| verify_ds(owner, key, anchor).is_ok())
+    })
+}
+
+/// Anchors the root DNSKEY RRset against [`TrustAnchor`]s and returns its keys.
+///
+/// Behaves like [`trust_root`] but accepts DS-form and DNSKEY-form anchors. A
+/// root key is anchored when a [`TrustAnchor::Ds`] digest matches it or a
+/// [`TrustAnchor::Dnskey`] matches its algorithm and public-key bytes.
+///
+/// # Errors
+///
+/// Returns [`ChainError::UntrustedRoot`] when no root key matches an anchor, or a
+/// [`ChainError::Link`] when the self-signature does not verify.
+pub(crate) fn trust_root_with_anchors(
+    root_dnskeys: &SignedRrset<'_>,
+    anchors: &[TrustAnchor],
+) -> Result<Vec<DNSKEY<'static>>, ChainError> {
+    trust_root_inner(root_dnskeys, |owner, key| {
+        anchors
+            .iter()
+            .any(|anchor| key_matches_anchor(owner, key, anchor))
+    })
+}
+
+/// Anchors the root DNSKEY RRset given a predicate that recognizes anchored keys.
+///
+/// The root RRset must contain a key `is_anchored` accepts and must be
+/// self-signed by such a key (RFC 4035 section 5). On success the whole root
+/// DNSKEY set is returned as owned records, which the caller carries down as the
+/// trusted set for the next zone cut. Sharing this core keeps the DS-form and
+/// [`TrustAnchor`]-form entry points identical apart from how a key is matched.
+fn trust_root_inner(
+    root_dnskeys: &SignedRrset<'_>,
+    is_anchored: impl Fn(&Name<'_>, &DNSKEY<'_>) -> bool,
+) -> Result<Vec<DNSKEY<'static>>, ChainError> {
     let root_keys = dnskeys_of(&root_dnskeys.records)?;
     let root_owner = owner_of(&root_dnskeys.records)?;
     let anchored: Vec<&DNSKEY<'_>> = root_keys
         .iter()
         .copied()
-        .filter(|key| {
-            anchors
-                .iter()
-                .any(|anchor| verify_ds(root_owner, key, anchor).is_ok())
-        })
+        .filter(|key| is_anchored(root_owner, key))
         .collect();
     if anchored.is_empty() {
         return Err(e!(ChainError::UntrustedRoot));
@@ -540,6 +628,24 @@ pub(crate) fn trust_root(
         .into_iter()
         .map(|key| key.clone().into_owned())
         .collect())
+}
+
+/// Returns whether `key`, owned by `owner`, is anchored by `anchor`.
+///
+/// A [`TrustAnchor::Ds`] anchors the key when its DS digest matches (the same
+/// check [`verify_ds`] performs). A [`TrustAnchor::Dnskey`] anchors the key when
+/// its algorithm and public-key bytes are identical. The DNSKEY match ignores the
+/// flags field: a later self-signature check still requires the key to be a
+/// usable zone key, so pinning by algorithm and public key is enough to identify
+/// it.
+fn key_matches_anchor(owner: &Name<'_>, key: &DNSKEY<'_>, anchor: &TrustAnchor) -> bool {
+    match anchor {
+        TrustAnchor::Ds(ds) => verify_ds(owner, key, ds).is_ok(),
+        TrustAnchor::Dnskey(anchor_key) => {
+            anchor_key.algorithm == key.algorithm
+                && anchor_key.public_key.as_ref() == key.public_key.as_ref()
+        }
+    }
 }
 
 /// Descends one zone cut and returns the child zone's trusted keys.
@@ -2604,6 +2710,48 @@ mod tests {
                 assert_eq!(ds.digest_type, 2);
                 assert_eq!(ds.digest.len(), 32);
             }
+        }
+
+        /// Returns the DNSKEY published in a root DNSKEY RRset.
+        fn root_key(chain: &ChainOfTrust<'static>) -> DNSKEY<'static> {
+            match &chain.root_dnskeys.records[0].rdata {
+                RData::DNSKEY(key) => key.clone(),
+                _ => panic!("root DNSKEY RRset must carry a DNSKEY"),
+            }
+        }
+
+        #[test]
+        fn accepts_a_dnskey_form_anchor() {
+            let rng = SystemRandom::new();
+            let (chain, _) = good_chain(&rng);
+            // Pin the root key directly instead of by its DS digest. The same chain
+            // that a DS-form anchor accepts must validate under the matching
+            // DNSKEY-form anchor.
+            let anchors = vec![TrustAnchor::Dnskey(root_key(&chain))];
+            assert!(verify_chain_with_trust_anchors(&chain, &anchors).is_ok());
+        }
+
+        #[test]
+        fn rejects_a_wrong_dnskey_form_anchor() {
+            let rng = SystemRandom::new();
+            let (chain, _) = good_chain(&rng);
+            // A DNSKEY-form anchor over an unrelated key does not anchor this root.
+            let stranger = Zone::new("", &rng);
+            let anchors = vec![TrustAnchor::Dnskey(stranger.dnskey.clone())];
+            assert!(matches!(
+                verify_chain_with_trust_anchors(&chain, &anchors),
+                Err(ChainError::UntrustedRoot { .. })
+            ));
+        }
+
+        #[test]
+        fn ds_form_trust_anchor_still_works() {
+            let rng = SystemRandom::new();
+            let (chain, ds_anchors) = good_chain(&rng);
+            // The DS-form anchor from `good_chain`, wrapped as a `TrustAnchor`,
+            // validates the same chain through the new entry point.
+            let anchors: Vec<TrustAnchor> = ds_anchors.into_iter().map(TrustAnchor::Ds).collect();
+            assert!(verify_chain_with_trust_anchors(&chain, &anchors).is_ok());
         }
     }
 
