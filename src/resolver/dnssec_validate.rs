@@ -38,6 +38,10 @@ enum ValidateError {
     /// of it, so the signing zone is not authoritative for the answer.
     #[error("RRSIG signer {signer} is not authoritative for {owner}")]
     SignerNotAuthoritative { signer: String, owner: String },
+    /// The answer was synthesized from a wildcard, which cannot be proven secure
+    /// without NSEC or NSEC3 denial of existence.
+    #[error("wildcard-expanded answer for {owner} cannot be proven without NSEC")]
+    WildcardUnproven { owner: String },
     /// No DNSKEY RRset with its signature could be fetched for a zone.
     #[error("no signed DNSKEY RRset for zone {zone}")]
     MissingDnskey { zone: String },
@@ -112,6 +116,17 @@ impl SimpleDnsResolver {
                 owner: owner.to_string(),
             }));
         };
+
+        // A wildcard-expanded answer (RRSIG labels below the owner's label count)
+        // is a valid signature over `*.zone`, but proving it applies to this name
+        // needs an NSEC or NSEC3 record showing no closer match exists (RFC 4035
+        // section 5.3.4). Without denial of existence we cannot prove that, so we
+        // reject rather than accept the answer unproven, staying fail-closed.
+        if is_wildcard_expansion(signing_rrsig.labels, &owner) {
+            return Err(e!(ValidateError::WildcardUnproven {
+                owner: owner.to_string(),
+            }));
+        }
 
         // The RRSIG signer names the zone that signed the answer. Validate from
         // the root down through every zone cut between them.
@@ -197,6 +212,16 @@ fn signer_is_authoritative(signer: &Name<'_>, owner: &Name<'_>) -> bool {
     let owner_labels: Vec<Vec<u8>> = owner.as_bytes().map(<[u8]>::to_ascii_lowercase).collect();
     signer_labels.len() <= owner_labels.len()
         && owner_labels[owner_labels.len() - signer_labels.len()..] == signer_labels[..]
+}
+
+/// Returns whether an answer was synthesized from a wildcard.
+///
+/// The RRSIG `labels` field counts the labels the signer covered, excluding the
+/// root and any leading `*`. When it is smaller than the owner's label count the
+/// record was expanded from a `*.zone` wildcard rather than published for the
+/// exact name (RFC 4035 section 5.3.2).
+fn is_wildcard_expansion(rrsig_labels: u8, owner: &Name<'_>) -> bool {
+    (rrsig_labels as usize) < owner.as_bytes().count()
 }
 
 /// Splits a zone name into its ancestor zones, from the top-level domain down to
@@ -306,6 +331,15 @@ mod tests {
             &Name::new_unchecked("a.host.example.com"),
             &owner
         ));
+    }
+
+    #[test]
+    fn wildcard_expansion_detected_by_label_count() {
+        let owner = Name::new_unchecked("host.example.com");
+        // Three owner labels signed by three RRSIG labels: an exact-name answer.
+        assert!(!is_wildcard_expansion(3, &owner));
+        // Two RRSIG labels: the record came from `*.example.com`.
+        assert!(is_wildcard_expansion(2, &owner));
     }
 
     #[test]

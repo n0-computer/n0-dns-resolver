@@ -227,6 +227,10 @@ impl Builder {
     /// cannot be proven and is therefore rejected as Bogus rather than passed
     /// through as insecure. Enable this only when every name you resolve is signed.
     ///
+    /// The same fail-closed reasoning rejects a wildcard-expanded answer: proving
+    /// that no closer non-wildcard match exists needs an NSEC or NSEC3 record, so
+    /// an answer synthesized from a `*.zone` wildcard is treated as Bogus.
+    ///
     /// Only the final answer RRset is validated; intermediate CNAME hops in a
     /// chain are followed but not individually validated.
     #[cfg(any(feature = "dnssec", doc))]

@@ -59,8 +59,24 @@ const EDNS_UDP_PAYLOAD_SIZE: u16 = 1232;
 /// validate an RRset.
 const DNSKEY_ZONE_FLAG: u16 = 0x0100;
 
+/// The REVOKE flag in the DNSKEY flags field (RFC 5011 section 2.1).
+///
+/// A key with this flag set has been revoked by its zone and must not be used to
+/// validate an RRset.
+const DNSKEY_REVOKE_FLAG: u16 = 0x0080;
+
 /// The protocol value every DNSKEY must carry (RFC 4034 section 2.1.2).
 const DNSKEY_PROTOCOL: u8 = 3;
+
+/// The largest number of signature checks one RRset may force during validation.
+///
+/// A key tag is a checksum, so many DNSKEYs can share one tag and many RRSIGs can
+/// name it, which multiplies into a quadratic pile of expensive signature checks
+/// an attacker can pack into a single response (the KeyTrap denial of service,
+/// CVE-2023-50387). Legitimate RRsets need only a handful of checks, so the walk
+/// stops after this many and fails closed. The bound sits well above any honest
+/// RRset (a few keys signed by a few RRSIGs).
+const MAX_SIGNATURE_CHECKS: usize = 16;
 
 /// SHA-256 digest of the root KSK-2017, key tag 20326 (IANA anchor `Klajeyz`).
 const ROOT_KSK_2017_DIGEST: [u8; 32] = [
@@ -310,6 +326,11 @@ pub fn verify_rrsig(
     if dnskey.protocol != DNSKEY_PROTOCOL || dnskey.flags & DNSKEY_ZONE_FLAG == 0 {
         return Err(e!(DnssecError::InvalidKey));
     }
+    // A revoked key (RFC 5011 section 2.1) has been retired by its zone and must
+    // not validate anything, even though it is still a well-formed zone key.
+    if dnskey.flags & DNSKEY_REVOKE_FLAG != 0 {
+        return Err(e!(DnssecError::InvalidKey));
+    }
     if dnskey.algorithm != rrsig.algorithm {
         return Err(e!(DnssecError::InvalidKey));
     }
@@ -317,19 +338,35 @@ pub fn verify_rrsig(
         return Err(e!(DnssecError::KeyTagMismatch));
     }
 
+    // RFC 4034 section 3.1.5 requires the inception and expiration to be compared
+    // to the current time with RFC 1982 serial-number arithmetic, not a plain
+    // integer compare, so the window stays correct across the 2106 wrap of the
+    // 32-bit seconds counter.
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0) as u32;
-    if now < rrsig.signature_inception {
+    if !serial_le(rrsig.signature_inception, now) {
         return Err(e!(DnssecError::SignatureNotYetValid));
     }
-    if now > rrsig.signature_expiration {
+    if !serial_le(now, rrsig.signature_expiration) {
         return Err(e!(DnssecError::SignatureExpired));
     }
 
     let signed = signed_data(rrsig, rrset)?;
     verify_signature(rrsig, dnskey, &signed)
+}
+
+/// Returns whether `a` is less than or equal to `b` in RFC 1982 serial-number
+/// arithmetic over 32 bits.
+///
+/// Serial arithmetic treats the value space as a circle, so `a <= b` holds when
+/// `b` is at most a half-space ahead of `a` (`b - a < 2^31`, computed with
+/// wrapping subtraction). This keeps RRSIG inception and expiration comparisons
+/// correct as the 32-bit Unix-seconds counter wraps in 2106 (RFC 4034 section
+/// 3.1.5).
+fn serial_le(a: u32, b: u32) -> bool {
+    b.wrapping_sub(a) < 0x8000_0000
 }
 
 /// A parsed DNS resource record, re-exported from [`simple_dns`] for use with
@@ -515,13 +552,20 @@ pub fn verify_chain_with_anchors(
 fn verify_signed_rrset(signed: &SignedRrset<'_>, keys: &[&DNSKEY<'_>]) -> Result<(), ChainError> {
     let mut matched_any = false;
     let mut last_err = None;
-    for rrsig in &signed.rrsigs {
+    let mut checks = 0usize;
+    'search: for rrsig in &signed.rrsigs {
         for key in keys {
             if key.algorithm == rrsig.algorithm && key_tag(key) == rrsig.key_tag {
                 matched_any = true;
                 match verify_rrsig(rrsig, &signed.records, key) {
                     Ok(()) => return Ok(()),
                     Err(err) => last_err = Some(err),
+                }
+                // Stop after a generous number of checks so a response cannot
+                // force unbounded work (see [`MAX_SIGNATURE_CHECKS`]).
+                checks += 1;
+                if checks >= MAX_SIGNATURE_CHECKS {
+                    break 'search;
                 }
             }
         }
@@ -623,6 +667,13 @@ fn signed_data(rrsig: &RRSIG<'_>, rrset: &[ResourceRecord<'_>]) -> Result<Vec<u8
         rdatas.push(canonical_rdata(&rr.rdata)?);
     }
     rdatas.sort_unstable();
+    // RFC 4034 section 6.3: if two RRs in the set are identical, only one is
+    // included in the signed data. Owner, type, class, and TTL are identical
+    // across the RRset (checked above), so equal canonical RDATA means a
+    // duplicate RR. A signer removes duplicates before signing, so a response
+    // that repeats a record would otherwise produce different signed data and a
+    // spurious verification failure.
+    rdatas.dedup();
 
     // Each record contributes owner | type | class | RRSIG original TTL | RDLEN |
     // RDATA in canonical form. Owner, type, class, and TTL are identical across
@@ -1259,6 +1310,71 @@ mod tests {
             verify_rrsig(&rrsig, &rrset, &dnskey),
             Err(DnssecError::UnsupportedAlgorithm { algorithm: 5, .. })
         ));
+    }
+
+    #[test]
+    fn verify_rrsig_rejects_revoked_key() {
+        // A key with the REVOKE bit set is a well-formed zone key but must not
+        // validate anything (RFC 5011). The check precedes the key-tag compare,
+        // so a revoked key is refused before any crypto runs.
+        let (rrset, rrsig) = a_rrset_and_rrsig(13, 0);
+        let dnskey = DNSKEY {
+            flags: DNSKEY_ZONE_FLAG | DNSKEY_REVOKE_FLAG,
+            protocol: 3,
+            algorithm: 13,
+            public_key: Cow::Owned(vec![0u8; 64]),
+        };
+        assert!(matches!(
+            verify_rrsig(&rrsig, &rrset, &dnskey),
+            Err(DnssecError::InvalidKey { .. })
+        ));
+    }
+
+    #[test]
+    fn serial_le_handles_the_32_bit_wrap() {
+        assert!(serial_le(10, 20));
+        assert!(!serial_le(20, 10));
+        assert!(serial_le(100, 100));
+        // A time just after the counter wraps is still "after" one just before.
+        let before_wrap = u32::MAX - 10;
+        let after_wrap = 5u32;
+        assert!(serial_le(before_wrap, after_wrap));
+        assert!(!serial_le(after_wrap, before_wrap));
+    }
+
+    #[test]
+    fn signed_data_removes_duplicate_rrs() {
+        // RFC 4034 section 6.3: a duplicate RR is dropped when building the signed
+        // data, so a set that repeats a record hashes the same as one that does
+        // not, and a signature over the deduplicated set still verifies.
+        let a_record = |addr: [u8; 4]| {
+            ResourceRecord::new(
+                Name::new_unchecked("www.example.com"),
+                CLASS::IN,
+                3600,
+                RData::A(A {
+                    address: u32::from_be_bytes(addr),
+                }),
+            )
+        };
+        let rrsig = RRSIG {
+            type_covered: 1,
+            algorithm: 13,
+            labels: 3,
+            original_ttl: 3600,
+            signature_expiration: 1_700_000_000,
+            signature_inception: 1_600_000_000,
+            key_tag: 12345,
+            signer_name: Name::new_unchecked("example.com"),
+            signature: Cow::Borrowed(&[]),
+        };
+        let once = signed_data(&rrsig, &[a_record([192, 0, 2, 1])]).unwrap();
+        let twice = signed_data(
+            &rrsig,
+            &[a_record([192, 0, 2, 1]), a_record([192, 0, 2, 1])],
+        )
+        .unwrap();
+        assert_eq!(once, twice);
     }
 
     #[test]
