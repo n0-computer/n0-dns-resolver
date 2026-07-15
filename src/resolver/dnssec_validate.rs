@@ -58,8 +58,13 @@ impl SimpleDnsResolver {
     /// Returns `Ok(())` when the answer's RRset validates from the embedded root
     /// anchors down. Any failure is fail-closed and surfaces as
     /// [`Error::DnssecBogus`].
-    pub(super) async fn validate_answer(&self, qtype: TYPE, response: &[u8]) -> Result<(), Error> {
-        match self.validate_inner(qtype, response).await {
+    pub(super) async fn validate_answer(
+        &self,
+        host: &str,
+        qtype: TYPE,
+        response: &[u8],
+    ) -> Result<(), Error> {
+        match self.validate_inner(host, qtype, response).await {
             Ok(()) => Ok(()),
             Err(err) => {
                 warn!(%err, "DNSSEC validation rejected an answer");
@@ -68,9 +73,18 @@ impl SimpleDnsResolver {
         }
     }
 
-    /// Assembles and walks the chain of trust for an answer.
-    async fn validate_inner(&self, qtype: TYPE, response: &[u8]) -> Result<(), ValidateError> {
-        let target = parse_signed_rrset(response, qtype)
+    /// Assembles and walks the chain of trust for the answer to `host`.
+    async fn validate_inner(
+        &self,
+        host: &str,
+        qtype: TYPE,
+        response: &[u8],
+    ) -> Result<(), ValidateError> {
+        // Bind validation to the queried name: only an RRset owned by `host`
+        // counts. Without this a response could carry a validly signed RRset for
+        // an unrelated name that the attacker controls, pass the chain walk on
+        // that RRset, and slip forged records for `host` through alongside it.
+        let target = parse_signed_rrset(response, host, qtype)
             .ok_or_else(|| e!(ValidateError::MissingSignature))?;
 
         // The signer name is attacker-controlled, so it must be checked against
@@ -146,7 +160,7 @@ impl SimpleDnsResolver {
             .send_query(&query)
             .await
             .map_err(|err| e!(ValidateError::Fetch, AnyError::from_stack(err)))?;
-        Ok(parse_signed_rrset(&response, qtype))
+        Ok(parse_signed_rrset(&response, name, qtype))
     }
 }
 
@@ -182,21 +196,27 @@ fn zone_ancestors(zone: &str) -> Vec<String> {
         .collect()
 }
 
-/// Extracts the RRset of `qtype` and its RRSIG from a DNS response.
+/// Extracts the `qtype` RRset owned by `expected_owner` and its RRSIG.
 ///
-/// Finds the RRSIG in the answer section that covers `qtype`, then gathers every
-/// answer record of `qtype` sharing that RRSIG's owner name. Returns `None` when
-/// the response does not parse, carries no such RRSIG, or has no matching
-/// records, all of which are treated as a missing signature by the caller.
-fn parse_signed_rrset(response: &[u8], qtype: TYPE) -> Option<SignedRrset<'static>> {
+/// Finds the RRSIG in the answer section that is owned by `expected_owner` and
+/// covers `qtype`, then gathers every answer record of `qtype` under that same
+/// owner. Requiring the owner ties the returned RRset to the name that was
+/// queried, so a signed RRset for a different name in the same response cannot
+/// stand in for it. Returns `None` when the response does not parse, the
+/// expected name is invalid, or no such RRSIG or records are present, all of
+/// which the caller treats as a missing signature.
+fn parse_signed_rrset(
+    response: &[u8],
+    expected_owner: &str,
+    qtype: TYPE,
+) -> Option<SignedRrset<'static>> {
     let packet = Packet::parse(response).ok()?;
     let covered = u16::from(qtype);
+    let owner = Name::new(expected_owner).ok()?;
 
-    let rrsig_rr = packet
-        .answers
-        .iter()
-        .find(|rr| matches!(&rr.rdata, RData::RRSIG(sig) if sig.type_covered == covered))?;
-    let owner = &rrsig_rr.name;
+    let rrsig_rr = packet.answers.iter().find(|rr| {
+        rr.name == owner && matches!(&rr.rdata, RData::RRSIG(sig) if sig.type_covered == covered)
+    })?;
     let RData::RRSIG(rrsig) = &rrsig_rr.rdata else {
         return None;
     };
@@ -205,7 +225,7 @@ fn parse_signed_rrset(response: &[u8], qtype: TYPE) -> Option<SignedRrset<'stati
     let records: Vec<ResourceRecord<'static>> = packet
         .answers
         .iter()
-        .filter(|rr| u16::from(rr.rdata.type_code()) == covered && &rr.name == owner)
+        .filter(|rr| u16::from(rr.rdata.type_code()) == covered && rr.name == owner)
         .map(|rr| rr.clone().into_owned())
         .collect();
     if records.is_empty() {
@@ -311,7 +331,8 @@ mod tests {
     #[test]
     fn parse_signed_rrset_extracts_records_and_signature() {
         let response = reply_with_signed_a("host.example.com");
-        let signed = parse_signed_rrset(&response, TYPE::A).expect("signed RRset present");
+        let signed = parse_signed_rrset(&response, "host.example.com", TYPE::A)
+            .expect("signed RRset present");
         assert_eq!(signed.records.len(), 1);
         assert_eq!(signed.rrsig.signer_name.to_string(), "example.com");
         assert_eq!(signed.rrsig.key_tag, 12345);
@@ -331,13 +352,22 @@ mod tests {
             }),
         ));
         let response = packet.build_bytes_vec().unwrap();
-        assert!(parse_signed_rrset(&response, TYPE::A).is_none());
+        assert!(parse_signed_rrset(&response, "host.example.com", TYPE::A).is_none());
     }
 
     #[test]
     fn parse_signed_rrset_none_for_other_type() {
         // The RRSIG covers A, so asking for AAAA finds no signature.
         let response = reply_with_signed_a("host.example.com");
-        assert!(parse_signed_rrset(&response, TYPE::AAAA).is_none());
+        assert!(parse_signed_rrset(&response, "host.example.com", TYPE::AAAA).is_none());
+    }
+
+    #[test]
+    fn parse_signed_rrset_none_for_other_owner() {
+        // A signed RRset for a different name must not satisfy a query for `host`:
+        // the response carries a valid signature over host.attacker.com, but the
+        // queried name is host.example.com.
+        let response = reply_with_signed_a("host.attacker.com");
+        assert!(parse_signed_rrset(&response, "host.example.com", TYPE::A).is_none());
     }
 }

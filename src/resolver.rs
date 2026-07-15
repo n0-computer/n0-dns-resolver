@@ -563,7 +563,8 @@ impl SimpleDnsResolver {
                 // unsigned or bogus answer becomes an error rather than a result.
                 #[cfg(feature = "dnssec")]
                 if self.validate_dnssec {
-                    self.validate_answer(qtype, &response).await?;
+                    self.validate_answer(&current_host, qtype, &response)
+                        .await?;
                 }
                 return Ok(response);
             }
