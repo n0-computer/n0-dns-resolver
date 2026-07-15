@@ -10,13 +10,23 @@
 //!
 //! # Scope
 //!
-//! This is deliberately narrow. It validates a single signature or delegation
-//! link, not a chain of trust: it does not walk DNSKEY and DS records from the
-//! root trust anchor down to a name, so nothing here proves that a name is
-//! genuinely signed from the root. NSEC and NSEC3 authenticated denial of
-//! existence is not covered. Only two signature algorithms are supported:
-//! ECDSA P-256 SHA-256 (algorithm 13, RFC 6605) and RSA/SHA-256 (algorithm 8,
-//! RFC 5702).
+//! [`verify_rrsig`] and [`verify_ds`] validate a single signature or delegation
+//! link. [`verify_chain`] walks a full sequence of those links from the embedded
+//! IANA root trust anchors ([`ROOT_TRUST_ANCHORS`]) down to a target RRset, and
+//! is fail-closed: it treats a missing DS, an absent record, or a broken
+//! signature as a validation failure rather than as proof that a name is
+//! unsigned.
+//!
+//! NSEC and NSEC3 authenticated denial of existence is not covered. Because
+//! [`verify_chain`] proves signatures rather than their absence, a legitimately
+//! unsigned delegation or a negative answer is rejected rather than proven, which
+//! is the intended fail-closed behavior.
+//!
+//! The supported signature algorithms are RSA/SHA-256 (8, RFC 5702), RSA/SHA-512
+//! (10, RFC 5702), ECDSA P-256 SHA-256 (13, RFC 6605), ECDSA P-384 SHA-384 (14,
+//! RFC 6605), and Ed25519 (15, RFC 8080). The deprecated RSA/SHA-1 and DSA
+//! algorithms are deliberately absent. Supported DS digest types are SHA-1 (1),
+//! SHA-256 (2), and SHA-384 (4).
 //!
 //! The canonical forms follow RFC 4034 section 6, and the signature input
 //! follows RFC 4035 section 5.3.
@@ -427,8 +437,16 @@ fn ds_rdata(ds: &DS<'_>) -> Vec<u8> {
 
 /// Verifies the signature over `signed` using the RRSIG's algorithm and the key.
 ///
-/// Dispatches on the RRSIG algorithm number: 13 is ECDSA P-256 SHA-256
-/// (RFC 6605), 8 is RSA/SHA-256 (RFC 5702). Any other algorithm is unsupported.
+/// Dispatches on the RRSIG algorithm number:
+///
+/// - 8 is RSA/SHA-256 (RFC 5702).
+/// - 10 is RSA/SHA-512 (RFC 5702).
+/// - 13 is ECDSA P-256 SHA-256 (RFC 6605).
+/// - 14 is ECDSA P-384 SHA-384 (RFC 6605).
+/// - 15 is Ed25519 (RFC 8080).
+///
+/// Any other algorithm is unsupported. The deprecated RSA/SHA-1 (5 and 7) and
+/// DSA (3 and 6) algorithms are deliberately absent.
 fn verify_signature(
     rrsig: &RRSIG<'_>,
     dnskey: &DNSKEY<'_>,
@@ -449,18 +467,45 @@ fn verify_signature(
             key.verify(signed, &rrsig.signature)
                 .map_err(|_| e!(DnssecError::BadSignature))
         }
-        8 => {
+        14 => {
+            // RFC 6605: the P-384 DNSKEY holds the raw 96-byte curve point
+            // x || y. As for P-256, prepend the 0x04 uncompressed-point tag and
+            // verify the fixed-width r || s signature.
+            if dnskey.public_key.len() != 96 {
+                return Err(e!(DnssecError::InvalidKey));
+            }
+            let mut point = Vec::with_capacity(97);
+            point.push(0x04);
+            point.extend_from_slice(&dnskey.public_key);
+            let key = signature::UnparsedPublicKey::new(&signature::ECDSA_P384_SHA384_FIXED, point);
+            key.verify(signed, &rrsig.signature)
+                .map_err(|_| e!(DnssecError::BadSignature))
+        }
+        15 => {
+            // RFC 8080: the DNSKEY holds the raw 32-byte Ed25519 public key, and
+            // the RRSIG holds the 64-byte Ed25519 signature.
+            if dnskey.public_key.len() != 32 {
+                return Err(e!(DnssecError::InvalidKey));
+            }
+            let key = signature::UnparsedPublicKey::new(&signature::ED25519, &dnskey.public_key);
+            key.verify(signed, &rrsig.signature)
+                .map_err(|_| e!(DnssecError::BadSignature))
+        }
+        8 | 10 => {
+            // RFC 5702: both share the RFC 3110 key encoding and differ only in
+            // the hash. Algorithm 8 is SHA-256, algorithm 10 is SHA-512.
+            let params = if rrsig.algorithm == 8 {
+                &signature::RSA_PKCS1_2048_8192_SHA256
+            } else {
+                &signature::RSA_PKCS1_2048_8192_SHA512
+            };
             let (exponent, modulus) = split_rsa_public_key(&dnskey.public_key)?;
             let components = signature::RsaPublicKeyComponents {
                 n: modulus,
                 e: exponent,
             };
             components
-                .verify(
-                    &signature::RSA_PKCS1_2048_8192_SHA256,
-                    signed,
-                    &rrsig.signature,
-                )
+                .verify(params, signed, &rrsig.signature)
                 .map_err(|_| e!(DnssecError::BadSignature))
         }
         algorithm => Err(e!(DnssecError::UnsupportedAlgorithm { algorithm })),
@@ -501,7 +546,8 @@ mod tests {
     use ring::{
         rand::SystemRandom,
         signature::{
-            ECDSA_P256_SHA256_FIXED_SIGNING, EcdsaKeyPair, KeyPair, RSA_PKCS1_SHA256, RsaKeyPair,
+            ECDSA_P256_SHA256_FIXED_SIGNING, ECDSA_P384_SHA384_FIXED_SIGNING, EcdsaKeyPair,
+            Ed25519KeyPair, KeyPair, RSA_PKCS1_SHA256, RSA_PKCS1_SHA512, RsaKeyPair,
         },
     };
     use simple_dns::{
@@ -751,6 +797,91 @@ mod tests {
     }
 
     #[test]
+    fn verify_rrsig_ecdsa_p384_round_trip() {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, &rng).unwrap();
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P384_SHA384_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
+        // The public key is the uncompressed SEC1 point 0x04 || x || y; the
+        // DNSKEY carries only the 96-byte x || y (RFC 6605).
+        let public_key = key_pair.public_key().as_ref()[1..].to_vec();
+        assert_eq!(public_key.len(), 96);
+        let dnskey = DNSKEY {
+            flags: 256,
+            protocol: 3,
+            algorithm: 14,
+            public_key: Cow::Owned(public_key),
+        };
+        let tag = key_tag(&dnskey);
+
+        let (rrset, mut rrsig) = a_rrset_and_rrsig(14, tag);
+        let signed = signed_data(&rrsig, &rrset).unwrap();
+        let signature = key_pair.sign(&rng, &signed).unwrap();
+        rrsig.signature = Cow::Owned(signature.as_ref().to_vec());
+
+        assert!(verify_rrsig(&rrsig, &rrset, &dnskey).is_ok());
+
+        let mut bad = rrsig.clone();
+        let mut sig_bytes = bad.signature.into_owned();
+        sig_bytes[0] ^= 0xFF;
+        bad.signature = Cow::Owned(sig_bytes);
+        assert!(matches!(
+            verify_rrsig(&bad, &rrset, &dnskey),
+            Err(DnssecError::BadSignature { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_rrsig_ed25519_round_trip() {
+        let rng = SystemRandom::new();
+        let pkcs8 = Ed25519KeyPair::generate_pkcs8(&rng).unwrap();
+        let key_pair = Ed25519KeyPair::from_pkcs8(pkcs8.as_ref()).unwrap();
+        // RFC 8080: the DNSKEY carries the raw 32-byte Ed25519 public key.
+        let public_key = key_pair.public_key().as_ref().to_vec();
+        assert_eq!(public_key.len(), 32);
+        let dnskey = DNSKEY {
+            flags: 256,
+            protocol: 3,
+            algorithm: 15,
+            public_key: Cow::Owned(public_key),
+        };
+        let tag = key_tag(&dnskey);
+
+        let (rrset, mut rrsig) = a_rrset_and_rrsig(15, tag);
+        let signed = signed_data(&rrsig, &rrset).unwrap();
+        let signature = key_pair.sign(&signed);
+        rrsig.signature = Cow::Owned(signature.as_ref().to_vec());
+
+        assert!(verify_rrsig(&rrsig, &rrset, &dnskey).is_ok());
+
+        // A tampered signature is rejected.
+        let mut bad = rrsig.clone();
+        let mut sig_bytes = bad.signature.into_owned();
+        sig_bytes[0] ^= 0xFF;
+        bad.signature = Cow::Owned(sig_bytes);
+        assert!(matches!(
+            verify_rrsig(&bad, &rrset, &dnskey),
+            Err(DnssecError::BadSignature { .. })
+        ));
+
+        // A tampered record is rejected.
+        let mut tampered = rrset.clone();
+        tampered[0] = ResourceRecord::new(
+            Name::new_unchecked("www.example.com"),
+            CLASS::IN,
+            3600,
+            RData::A(A {
+                address: u32::from_be_bytes([203, 0, 113, 9]),
+            }),
+        );
+        assert!(matches!(
+            verify_rrsig(&rrsig, &tampered, &dnskey),
+            Err(DnssecError::BadSignature { .. })
+        ));
+    }
+
+    #[test]
     fn verify_rrsig_rsa_sha256_round_trip() {
         // A fixed 2048-bit RSA key (PKCS#8 DER) so the test stays offline and
         // deterministic. Signing with RSA PKCS#1 v1.5 is deterministic.
@@ -774,6 +905,44 @@ mod tests {
         let rng = SystemRandom::new();
         key_pair
             .sign(&RSA_PKCS1_SHA256, &rng, &signed, &mut signature)
+            .unwrap();
+        rrsig.signature = Cow::Owned(signature);
+
+        assert!(verify_rrsig(&rrsig, &rrset, &dnskey).is_ok());
+
+        let mut bad = rrsig.clone();
+        let mut sig_bytes = bad.signature.into_owned();
+        sig_bytes[0] ^= 0xFF;
+        bad.signature = Cow::Owned(sig_bytes);
+        assert!(matches!(
+            verify_rrsig(&bad, &rrset, &dnskey),
+            Err(DnssecError::BadSignature { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_rrsig_rsa_sha512_round_trip() {
+        // Reuse the fixed RSA key; algorithm 10 shares the RFC 3110 encoding and
+        // differs from algorithm 8 only in the hash (SHA-512).
+        let key_pair = RsaKeyPair::from_pkcs8(RSA_PKCS8_DER).unwrap();
+
+        let mut public_key = vec![RSA_EXPONENT.len() as u8];
+        public_key.extend_from_slice(RSA_EXPONENT);
+        public_key.extend_from_slice(RSA_MODULUS);
+        let dnskey = DNSKEY {
+            flags: 256,
+            protocol: 3,
+            algorithm: 10,
+            public_key: Cow::Owned(public_key),
+        };
+        let tag = key_tag(&dnskey);
+
+        let (rrset, mut rrsig) = a_rrset_and_rrsig(10, tag);
+        let signed = signed_data(&rrsig, &rrset).unwrap();
+        let mut signature = vec![0u8; key_pair.public().modulus_len()];
+        let rng = SystemRandom::new();
+        key_pair
+            .sign(&RSA_PKCS1_SHA512, &rng, &signed, &mut signature)
             .unwrap();
         rrsig.signature = Cow::Owned(signature);
 
