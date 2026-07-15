@@ -228,25 +228,58 @@ impl SimpleDnsResolver {
         target
             .rrsigs
             .retain(|sig| signer_is_authoritative(&sig.signer_name, &owner));
-        // Take the signing zone from the most specific surviving signer, which is
-        // the RRset's actual zone apex. Honest RRSIGs over one RRset all name that
-        // apex, but an on-path attacker can prepend a bogus RRSIG signed by an
-        // ancestor zone; picking the first survivor would then build the chain too
-        // shallow and reject a legitimate answer.
-        let Some(signing_rrsig) = most_specific_signer(&target.rrsigs) else {
-            return Err(e!(ValidateError::SignerNotAuthoritative {
+
+        // Each surviving signer names a candidate signing zone. Honest RRSIGs
+        // over one RRset all name the RRset's real apex, but an on-path attacker
+        // can inject an extra RRSIG signed by, say, the answer owner itself, which
+        // points the chain walk at a zone cut that does not exist. Committing to a
+        // single signer (even the most specific one) would then reject a
+        // legitimate answer. Instead try every distinct candidate and accept if
+        // any one yields a valid chain and signature; only fail if all of them do.
+        // The candidates are ordered most specific first so the RRset's real apex,
+        // the common case, is tried before an injected ancestor signer.
+        let candidates = candidate_signers(&target.rrsigs);
+        let mut last_err = None;
+        for signing_rrsig in &candidates {
+            match self
+                .validate_with_signer(&target, &owner, signing_rrsig, response)
+                .await
+            {
+                Ok(()) => return Ok(()),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        // No candidate validated. Surface the last chain failure, or the
+        // authority rejection when there was no authoritative signer to try.
+        Err(last_err.unwrap_or_else(|| {
+            e!(ValidateError::SignerNotAuthoritative {
                 signer: rejected_signer.unwrap_or_default(),
                 owner: owner.to_string(),
-            }));
-        };
+            })
+        }))
+    }
 
+    /// Validates the answer RRset against one candidate signing zone.
+    ///
+    /// Builds the trusted DNSKEY set for the zone named by `signing_rrsig`, then
+    /// verifies the answer RRset under it. When the RRSIG is a wildcard expansion,
+    /// the authority section must also prove no closer match exists. Returns
+    /// `Ok(())` when this candidate proves the answer (or its zone is proven
+    /// insecure); any failure is returned so the caller can try another candidate.
+    async fn validate_with_signer(
+        &self,
+        target: &SignedRrset<'static>,
+        owner: &Name<'static>,
+        signing_rrsig: &RRSIG<'static>,
+        response: &[u8],
+    ) -> Result<(), ValidateError> {
         // A wildcard-expanded answer (RRSIG labels below the owner's label count)
         // is a valid signature over `*.zone`. Proving it applies to this name
         // needs an authority-section NSEC or NSEC3 showing no closer match exists
         // (RFC 4035 section 5.3.4); that proof runs after the chain validates the
         // signing zone's keys.
         let wildcard_labels =
-            is_wildcard_expansion(signing_rrsig.labels, &owner).then_some(signing_rrsig.labels);
+            is_wildcard_expansion(signing_rrsig.labels, owner).then_some(signing_rrsig.labels);
 
         // The RRSIG signer names the zone that signed the answer. Build its
         // trusted DNSKEY set by walking the chain from the root down.
@@ -261,7 +294,7 @@ impl SimpleDnsResolver {
         };
 
         // The signing zone's keys are now trusted. Validate the answer RRset.
-        verify_rrset_with_keys(&target, &trusted)
+        verify_rrset_with_keys(target, &trusted)
             .map_err(|source| e!(ValidateError::Chain, source))?;
 
         // Finally, a wildcard-expanded answer needs its closer-match proof from
@@ -269,7 +302,7 @@ impl SimpleDnsResolver {
         // zone keys we just trusted.
         if let Some(labels) = wildcard_labels {
             let authority = authority_records(response);
-            prove_wildcard(&owner, labels, &authority, &trusted).map_err(|source| {
+            prove_wildcard(owner, labels, &authority, &trusted).map_err(|source| {
                 e!(ValidateError::WildcardUnproven {
                     owner: owner.to_string(),
                     source,
@@ -493,6 +526,31 @@ fn soa_zone(authority: &[ResourceRecord<'_>]) -> Option<String> {
     })
 }
 
+/// Returns one RRSIG per distinct signer zone, most specific (longest) first.
+///
+/// All authoritative RRSIGs over one RRset name the same zone in an honest
+/// response, but an on-path attacker can inject an RRSIG signed by a different
+/// authoritative zone: an ancestor, or the answer owner itself. Each distinct
+/// signer names a candidate signing zone the chain walk can try, so the caller
+/// accepts the answer if any candidate yields a valid chain. Ordering the
+/// deepest signer first tries the RRset's real apex, the common case, before any
+/// injected one, and deduping bounds the number of chain walks by the number of
+/// distinct signer zones.
+fn candidate_signers(rrsigs: &[RRSIG<'static>]) -> Vec<RRSIG<'static>> {
+    let mut ordered: Vec<&RRSIG<'static>> = rrsigs.iter().collect();
+    ordered.sort_by_key(|sig| std::cmp::Reverse(sig.signer_name.as_bytes().count()));
+    let mut seen: Vec<String> = Vec::new();
+    let mut out = Vec::new();
+    for sig in ordered {
+        let name = sig.signer_name.to_string().to_ascii_lowercase();
+        if !seen.contains(&name) {
+            seen.push(name);
+            out.push(sig.clone());
+        }
+    }
+    out
+}
+
 /// Returns whether `signer` may sign records owned by `owner`.
 ///
 /// A zone signs only the names at or below its apex, so the signer must equal
@@ -500,18 +558,6 @@ fn soa_zone(authority: &[ResourceRecord<'_>]) -> Option<String> {
 /// compared case-insensitively. This rejects an RRSIG whose signer is an
 /// unrelated (but validly signed) zone, which would otherwise chain to the root
 /// and validate.
-/// Returns the RRSIG with the most specific (longest) signer name.
-///
-/// All authoritative RRSIGs over one RRset name the same zone in an honest
-/// response. Choosing the longest signer keeps the chain anchored at the RRset's
-/// real zone apex even if an on-path attacker injects an RRSIG signed by a
-/// shallower ancestor zone.
-fn most_specific_signer<'a>(rrsigs: &'a [RRSIG<'static>]) -> Option<&'a RRSIG<'static>> {
-    rrsigs
-        .iter()
-        .max_by_key(|sig| sig.signer_name.as_bytes().count())
-}
-
 fn signer_is_authoritative(signer: &Name<'_>, owner: &Name<'_>) -> bool {
     let signer_labels: Vec<Vec<u8>> = signer.as_bytes().map(<[u8]>::to_ascii_lowercase).collect();
     let owner_labels: Vec<Vec<u8>> = owner.as_bytes().map(<[u8]>::to_ascii_lowercase).collect();
@@ -718,11 +764,11 @@ mod tests {
     }
 
     #[test]
-    fn most_specific_signer_prefers_the_deepest_zone() {
-        let rrsig = |signer: &str| RRSIG {
+    fn candidate_signers_orders_deepest_first_and_dedups() {
+        let rrsig = |signer: &str, labels: u8| RRSIG {
             type_covered: u16::from(TYPE::A),
             algorithm: 13,
-            labels: 3,
+            labels,
             original_ttl: 300,
             signature_expiration: 1_800_000_000,
             signature_inception: 1_700_000_000,
@@ -730,25 +776,31 @@ mod tests {
             signer_name: Name::new_unchecked(signer).into_owned(),
             signature: Cow::Owned(vec![0u8; 64]),
         };
-        // The RRset's real apex (example.com) must win over an injected
-        // ancestor-signed RRSIG (com), regardless of order.
-        let rrsigs = vec![rrsig("com"), rrsig("example.com")];
-        assert_eq!(
-            most_specific_signer(&rrsigs)
-                .unwrap()
-                .signer_name
-                .to_string(),
-            "example.com"
-        );
-        let rrsigs = vec![rrsig("example.com"), rrsig("com")];
-        assert_eq!(
-            most_specific_signer(&rrsigs)
-                .unwrap()
-                .signer_name
-                .to_string(),
-            "example.com"
-        );
-        assert!(most_specific_signer(&[]).is_none());
+        // An injected owner-signed RRSIG (host.example.com) plus the real apex
+        // (example.com) and a shallower ancestor (com): every distinct signer is a
+        // candidate, ordered deepest first so the real apex is tried before an
+        // injected ancestor, regardless of input order.
+        let rrsigs = vec![
+            rrsig("com", 3),
+            rrsig("example.com", 3),
+            rrsig("host.example.com", 3),
+        ];
+        let names: Vec<String> = candidate_signers(&rrsigs)
+            .iter()
+            .map(|sig| sig.signer_name.to_string())
+            .collect();
+        assert_eq!(names, ["host.example.com", "example.com", "com"]);
+
+        // Duplicate signer names collapse to one candidate, so the number of chain
+        // walks stays bounded by the distinct signer zones.
+        let rrsigs = vec![rrsig("example.com", 3), rrsig("example.com", 2)];
+        let names: Vec<String> = candidate_signers(&rrsigs)
+            .iter()
+            .map(|sig| sig.signer_name.to_string())
+            .collect();
+        assert_eq!(names, ["example.com"]);
+
+        assert!(candidate_signers(&[]).is_empty());
     }
 
     #[test]
