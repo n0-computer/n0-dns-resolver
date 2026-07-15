@@ -1321,13 +1321,21 @@ fn validated_nsecs<'a>(
 /// Collects the validated NSEC3 records from an authority section.
 ///
 /// Records whose hash algorithm is not SHA-1 or whose iteration count exceeds
-/// [`MAX_NSEC3_ITERATIONS`] are dropped, and each survivor must carry a valid
-/// signature under `keys`.
+/// [`MAX_NSEC3_ITERATIONS`] are dropped, as are records that set a reserved flag
+/// bit (RFC 5155 section 3.1.2 defines only Opt-Out). All survivors must share
+/// the hash algorithm, iterations, and salt of the first validated record (RFC
+/// 5155 section 8.2), so a mixed set cannot smuggle in a record hashed under
+/// different parameters. Each survivor must also carry a valid signature under
+/// `keys`.
 fn validated_nsec3s<'a>(
     authority: &'a [ResourceRecord<'a>],
     keys: &[DNSKEY<'_>],
 ) -> Vec<(Name<'static>, Nsec3)> {
     let mut out = Vec::new();
+    // The parameters of the first validated record, which every later record must
+    // match. Set only after a signature check so an unsigned record cannot fix the
+    // reference parameters and evict the real ones.
+    let mut params: Option<(u8, u16, Vec<u8>)> = None;
     for rr in authority {
         let RData::NULL(NSEC3_TYPE_CODE, null) = &rr.rdata else {
             continue;
@@ -1338,8 +1346,22 @@ fn validated_nsec3s<'a>(
         if nsec3.hash_algorithm != NSEC3_HASH_SHA1 || nsec3.iterations > MAX_NSEC3_ITERATIONS {
             continue;
         }
+        if nsec3.flags & !NSEC3_FLAG_OPT_OUT != 0 {
+            continue;
+        }
+        if let Some((algorithm, iterations, salt)) = &params {
+            if nsec3.hash_algorithm != *algorithm
+                || nsec3.iterations != *iterations
+                || nsec3.salt != *salt
+            {
+                continue;
+            }
+        }
         let records = [rr.clone()];
         if authority_rrset_signed(&records, &rr.name, NSEC3_TYPE_CODE, authority, keys) {
+            if params.is_none() {
+                params = Some((nsec3.hash_algorithm, nsec3.iterations, nsec3.salt.clone()));
+            }
             out.push((rr.name.clone().into_owned(), nsec3));
         }
     }
@@ -1646,6 +1668,161 @@ mod tests {
             verify_ds(&owner, &rfc4034_dnskey(), &ds),
             Err(DnssecError::DigestMismatch { .. })
         ));
+    }
+
+    #[test]
+    fn verify_ds_accepts_sha1_and_sha384_digests() {
+        // Independently computed (Python hashlib) digests over canonical
+        // "example.com" plus the RFC 4034 DNSKEY RDATA, mirroring the SHA-256
+        // test for digest types 1 (SHA-1) and 4 (SHA-384).
+        let owner = Name::new_unchecked("example.com");
+
+        let sha1: &[u8] = &[
+            133, 176, 190, 195, 215, 137, 33, 162, 82, 229, 233, 184, 162, 161, 244, 166, 35, 99,
+            104, 171,
+        ];
+        let ds1 = DS {
+            key_tag: 2642,
+            algorithm: 5,
+            digest_type: 1,
+            digest: Cow::Borrowed(sha1),
+        };
+        assert!(verify_ds(&owner, &rfc4034_dnskey(), &ds1).is_ok());
+
+        let sha384: &[u8] = &[
+            121, 192, 160, 149, 17, 201, 94, 3, 190, 25, 216, 248, 35, 127, 89, 189, 37, 72, 201,
+            21, 135, 243, 180, 86, 242, 229, 2, 111, 217, 139, 236, 83, 10, 19, 218, 21, 70, 251,
+            59, 156, 222, 217, 164, 150, 86, 53, 88, 103,
+        ];
+        let ds4 = DS {
+            key_tag: 2642,
+            algorithm: 5,
+            digest_type: 4,
+            digest: Cow::Borrowed(sha384),
+        };
+        assert!(verify_ds(&owner, &rfc4034_dnskey(), &ds4).is_ok());
+
+        // A tampered SHA-384 digest is rejected.
+        let mut tampered = sha384.to_vec();
+        tampered[0] ^= 0xFF;
+        let ds_bad = DS {
+            key_tag: 2642,
+            algorithm: 5,
+            digest_type: 4,
+            digest: Cow::Owned(tampered),
+        };
+        assert!(matches!(
+            verify_ds(&owner, &rfc4034_dnskey(), &ds_bad),
+            Err(DnssecError::DigestMismatch { .. })
+        ));
+    }
+
+    /// Decodes a hex string into bytes for the static algorithm known-answer
+    /// vectors.
+    fn hex(input: &str) -> Vec<u8> {
+        (0..input.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&input[i..i + 2], 16).expect("valid hex"))
+            .collect()
+    }
+
+    #[test]
+    fn verify_signature_ecdsa_p256_known_answer() {
+        // RFC 6979 Appendix A.2.5: NIST P-256, SHA-256, message "sample". The
+        // DNSKEY holds the raw 64-byte point x || y; the RRSIG holds the
+        // fixed-width r || s. A published vector catches a point-format or r || s
+        // regression that a self-consistent sign-then-verify would miss.
+        let public_key = hex(concat!(
+            "60FED4BA255A9D31C961EB74C6356D68C049B8923B61FA6CE669622E60F29FB6",
+            "7903FE1008B8BC99A41AE9E95628BC64F2F1B20C2D7E9F5177A3C294D4462299",
+        ));
+        let signature = hex(concat!(
+            "EFD48B2AACB6A8FD1140DD9CD45E81D69D2C877B56AAF991C34D0EA84EAF3716",
+            "F7CB1C942D657C41D436C7A1B6E29F65F3E900DBB9AFF4064DC4AB2F843ACDA8",
+        ));
+        let dnskey = DNSKEY {
+            flags: 256,
+            protocol: 3,
+            algorithm: 13,
+            public_key: Cow::Owned(public_key),
+        };
+        let rrsig = kat_rrsig(13, signature);
+        assert!(verify_signature(&rrsig, &dnskey, b"sample").is_ok());
+        // A one-character change to the message breaks the check.
+        assert!(matches!(
+            verify_signature(&rrsig, &dnskey, b"Sample"),
+            Err(DnssecError::BadSignature { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_signature_ecdsa_p384_known_answer() {
+        // RFC 6979 Appendix A.2.6: NIST P-384, SHA-384, message "sample". The
+        // DNSKEY holds the raw 96-byte point x || y; the RRSIG holds r || s.
+        let public_key = hex(concat!(
+            "EC3A4E415B4E19A4568618029F427FA5DA9A8BC4AE92E02E06AAE5286B300C64",
+            "DEF8F0EA9055866064A254515480BC13",
+            "8015D9B72D7D57244EA8EF9AC0C621896708A59367F9DFB9F54CA84B3F1C9DB1",
+            "288B231C3AE0D4FE7344FD2533264720",
+        ));
+        let signature = hex(concat!(
+            "94EDBB92A5ECB8AAD4736E56C691916B3F88140666CE9FA73D64C4EA95AD133C",
+            "81A648152E44ACF96E36DD1E80FABE46",
+            "99EF4AEB15F178CEA1FE40DB2603138F130E740A19624526203B6351D0A3A94F",
+            "A329C145786E679E7B82C71A38628AC8",
+        ));
+        let dnskey = DNSKEY {
+            flags: 256,
+            protocol: 3,
+            algorithm: 14,
+            public_key: Cow::Owned(public_key),
+        };
+        let rrsig = kat_rrsig(14, signature);
+        assert!(verify_signature(&rrsig, &dnskey, b"sample").is_ok());
+        assert!(matches!(
+            verify_signature(&rrsig, &dnskey, b"Sample"),
+            Err(DnssecError::BadSignature { .. })
+        ));
+    }
+
+    #[test]
+    fn verify_signature_ed25519_known_answer() {
+        // RFC 8032 section 7.1 TEST 2: Ed25519, 1-byte message 0x72. The DNSKEY
+        // holds the raw 32-byte public key and the RRSIG the 64-byte signature.
+        let public_key = hex("3d4017c3e843895a92b70aa74d1b7ebc9c982ccf2ec4968cc0cd55f12af4660c");
+        let signature = hex(concat!(
+            "92a009a9f0d4cab8720e820b5f642540a2b27b5416503f8fb3762223ebdb69da",
+            "085ac1e43e15996e458f3613d0f11d8c387b2eaeb4302aeeb00d291612bb0c00",
+        ));
+        let dnskey = DNSKEY {
+            flags: 256,
+            protocol: 3,
+            algorithm: 15,
+            public_key: Cow::Owned(public_key),
+        };
+        let rrsig = kat_rrsig(15, signature);
+        assert!(verify_signature(&rrsig, &dnskey, &hex("72")).is_ok());
+        // A one-byte change to the message breaks the check.
+        assert!(matches!(
+            verify_signature(&rrsig, &dnskey, &hex("73")),
+            Err(DnssecError::BadSignature { .. })
+        ));
+    }
+
+    /// An RRSIG carrying just the algorithm and signature that
+    /// [`verify_signature`] reads; the other fields are irrelevant to it.
+    fn kat_rrsig(algorithm: u8, signature: Vec<u8>) -> RRSIG<'static> {
+        RRSIG {
+            type_covered: 1,
+            algorithm,
+            labels: 0,
+            original_ttl: 0,
+            signature_expiration: 0,
+            signature_inception: 0,
+            key_tag: 0,
+            signer_name: Name::new_unchecked("."),
+            signature: Cow::Owned(signature),
+        }
     }
 
     #[test]
@@ -2549,11 +2726,21 @@ mod tests {
 
         /// Raw NSEC3 RDATA with salt `aabbccdd` and 12 iterations (RFC 5155 B).
         fn nsec3_rdata(flags: u8, next_hash: &[u8], types: &[u16]) -> Vec<u8> {
-            let salt = [0xaa, 0xbb, 0xcc, 0xdd];
+            nsec3_rdata_params(&[0xaa, 0xbb, 0xcc, 0xdd], 12, flags, next_hash, types)
+        }
+
+        /// Raw NSEC3 RDATA with a custom salt and iteration count.
+        fn nsec3_rdata_params(
+            salt: &[u8],
+            iterations: u16,
+            flags: u8,
+            next_hash: &[u8],
+            types: &[u16],
+        ) -> Vec<u8> {
             let mut out = vec![1u8, flags];
-            out.extend_from_slice(&12u16.to_be_bytes());
+            out.extend_from_slice(&iterations.to_be_bytes());
             out.push(salt.len() as u8);
-            out.extend_from_slice(&salt);
+            out.extend_from_slice(salt);
             out.push(next_hash.len() as u8);
             out.extend_from_slice(next_hash);
             let bits = bitmap(types);
@@ -2561,6 +2748,17 @@ mod tests {
             out.push(bits.len() as u8);
             out.extend_from_slice(&bits);
             out
+        }
+
+        /// Builds a name from raw-octet labels (most significant last), so labels
+        /// with non-printable octets like RFC 4034's `\001` and `\200` can be
+        /// expressed for the canonical-ordering vector.
+        fn octet_name(labels: &[&[u8]]) -> Name<'static> {
+            let labels: Vec<simple_dns::Label<'static>> = labels
+                .iter()
+                .map(|label| simple_dns::Label::new_unchecked(label.to_vec()))
+                .collect();
+            Name::new_with_labels(&labels).into_owned()
         }
 
         /// An NSEC3 resource record whose owner is `owner_hash` under `zone`.
@@ -2964,6 +3162,187 @@ mod tests {
             let authority = vec![record, rrsig];
             let qname = Name::new_unchecked("a.example");
             assert!(prove_nodata(&qname, A, &authority, &signer.keys()).is_err());
+        }
+
+        #[test]
+        fn nsec3_hash_folds_case() {
+            // The hash is over the lowercased wire form, so an uppercase name
+            // hashes to the same value as its lowercase form (RFC 5155 section 5).
+            assert_eq!(hash("EXAMPLE"), hash("example"));
+            assert_eq!(hash("EXAMPLE"), "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom");
+        }
+
+        #[test]
+        fn canonical_name_cmp_matches_rfc4034_example() {
+            // The canonical ordering example from RFC 4034 section 6.1, ascending.
+            // It exercises right-to-left label comparison, case folding, the
+            // length tie-break, and labels with non-printable octets.
+            let ordered = [
+                octet_name(&[b"example"]),
+                octet_name(&[b"a", b"example"]),
+                octet_name(&[b"yljkjljk", b"a", b"example"]),
+                octet_name(&[b"Z", b"a", b"example"]),
+                octet_name(&[b"zABC", b"a", b"EXAMPLE"]),
+                octet_name(&[b"z", b"example"]),
+                octet_name(&[&[0x01], b"z", b"example"]),
+                octet_name(&[b"*", b"z", b"example"]),
+                octet_name(&[&[0x80], b"z", b"example"]),
+            ];
+            for (i, pair) in ordered.windows(2).enumerate() {
+                assert_eq!(
+                    canonical_name_cmp(&pair[0], &pair[1]),
+                    Ordering::Less,
+                    "names {i} and {} are out of canonical order",
+                    i + 1
+                );
+            }
+            // Case folding makes names differing only in case compare equal.
+            assert_eq!(
+                canonical_name_cmp(
+                    &octet_name(&[b"Z", b"a", b"example"]),
+                    &octet_name(&[b"z", b"a", b"example"]),
+                ),
+                Ordering::Equal
+            );
+        }
+
+        #[test]
+        fn nsec3_parse_rejects_truncated_rdata() {
+            // Salt length runs past the end of the RDATA.
+            let mut rdata = vec![1u8, 0, 0, 12, 8];
+            rdata.extend_from_slice(&[0xaa, 0xbb]);
+            assert!(Nsec3::parse(&rdata).is_none());
+
+            // Hash length runs past the end.
+            let mut rdata = vec![1u8, 0, 0, 12, 0, 20];
+            rdata.extend_from_slice(&[0u8; 4]);
+            assert!(Nsec3::parse(&rdata).is_none());
+
+            // A bitmap window length runs past the end.
+            let mut rdata = vec![1u8, 0, 0, 12, 0, 4];
+            rdata.extend_from_slice(&[0u8; 4]);
+            rdata.extend_from_slice(&[0, 10, 0, 0]);
+            assert!(Nsec3::parse(&rdata).is_none());
+
+            // An empty RDATA has no hash-algorithm byte.
+            assert!(Nsec3::parse(&[]).is_none());
+        }
+
+        #[test]
+        fn nsec_short_window_reports_absent_without_panic() {
+            // A window block above 32 with a one-byte bitmap must not over-read: a
+            // type whose byte index lies past the bitmap is reported absent.
+            let nsec = NSEC {
+                next_name: Name::new_unchecked("z.example.com").into_owned(),
+                type_bit_maps: vec![NsecTypeBitMap {
+                    window_block: 40,
+                    bitmap: Cow::Owned(vec![0x01]),
+                }],
+            };
+            // A type in a window that is not listed at all is absent.
+            assert!(!nsec_type_present(&nsec, A));
+            // A type in the short window whose byte index is past the bitmap.
+            assert!(!nsec_type_present(&nsec, 40 * 256 + 255));
+        }
+
+        #[test]
+        fn nsec3_reserved_flag_bits_rejected() {
+            // Only the Opt-Out flag (0x01) is defined; a record setting any other
+            // flag bit is dropped, so it cannot contribute to a proof (finding S4).
+            let signer = Signer::new();
+            let owner_hash = hash("a.example");
+            let next = nsec3_hash(
+                &Name::new_unchecked("z.example"),
+                &[0xaa, 0xbb, 0xcc, 0xdd],
+                12,
+            );
+            let nsec3 = nsec3_rr("example", &owner_hash, 0x02, &next, &[AAAA, RRSIG_BIT]);
+            let owner = format!("{owner_hash}.example");
+            let rrsig = signer.sign(
+                std::slice::from_ref(&nsec3),
+                NSEC3_TYPE_CODE,
+                &owner,
+                "example",
+            );
+            let authority = vec![nsec3, rrsig];
+            let qname = Name::new_unchecked("a.example");
+            assert!(matches!(
+                prove_nodata(&qname, A, &authority, &signer.keys()),
+                Err(DenialError::NoProof { .. })
+            ));
+        }
+
+        #[test]
+        fn nsec3_mismatched_salt_dropped() {
+            // Every NSEC3 in a response must share the salt (RFC 5155 section 8.2).
+            // A signed record under a different salt that would otherwise match the
+            // queried name is dropped, so the NODATA is not proven (finding S1).
+            let signer = Signer::new();
+            let salt_reference = [0xaa, 0xbb, 0xcc, 0xdd];
+            let salt_other = [0x11, 0x22, 0x33, 0x44];
+
+            // The first validated record fixes the salt to aabbccdd and matches
+            // nothing relevant.
+            let reference_hash = base32hex_encode(&nsec3_hash(
+                &Name::new_unchecked("other.example"),
+                &salt_reference,
+                12,
+            ));
+            let reference_rdata =
+                nsec3_rdata_params(&salt_reference, 12, 0, &[0xff; 20], &[AAAA, RRSIG_BIT]);
+            let reference_owner = format!("{reference_hash}.example");
+            let reference_rr = ResourceRecord::new(
+                Name::new_unchecked(&reference_owner).into_owned(),
+                CLASS::IN,
+                3600,
+                RData::NULL(
+                    NSEC3_TYPE_CODE,
+                    simple_dns::rdata::NULL::new(&reference_rdata)
+                        .unwrap()
+                        .into_owned(),
+                ),
+            );
+            let reference_sig = signer.sign(
+                std::slice::from_ref(&reference_rr),
+                NSEC3_TYPE_CODE,
+                &reference_owner,
+                "example",
+            );
+
+            // A record under a different salt that hashes to match a.example. It is
+            // dropped for the salt mismatch, so no record matches the queried name.
+            let match_hash = base32hex_encode(&nsec3_hash(
+                &Name::new_unchecked("a.example"),
+                &salt_other,
+                12,
+            ));
+            let match_rdata =
+                nsec3_rdata_params(&salt_other, 12, 0, &[0xff; 20], &[AAAA, RRSIG_BIT]);
+            let match_owner = format!("{match_hash}.example");
+            let match_rr = ResourceRecord::new(
+                Name::new_unchecked(&match_owner).into_owned(),
+                CLASS::IN,
+                3600,
+                RData::NULL(
+                    NSEC3_TYPE_CODE,
+                    simple_dns::rdata::NULL::new(&match_rdata)
+                        .unwrap()
+                        .into_owned(),
+                ),
+            );
+            let match_sig = signer.sign(
+                std::slice::from_ref(&match_rr),
+                NSEC3_TYPE_CODE,
+                &match_owner,
+                "example",
+            );
+
+            let authority = vec![reference_rr, reference_sig, match_rr, match_sig];
+            let qname = Name::new_unchecked("a.example");
+            assert!(matches!(
+                prove_nodata(&qname, A, &authority, &signer.keys()),
+                Err(DenialError::NoProof { .. })
+            ));
         }
     }
 
