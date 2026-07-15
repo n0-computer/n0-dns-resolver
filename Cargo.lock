@@ -778,6 +778,7 @@ dependencies = [
  "ndk-context",
  "rand",
  "reqwest",
+ "ring",
  "rustls",
  "simple-dns",
  "system-configuration",

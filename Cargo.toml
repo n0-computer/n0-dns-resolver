@@ -27,6 +27,7 @@ n0-error = "1.0.0"
 n0-future = "0.3"
 rand = "0.10"
 reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
+ring = { version = "0.17", optional = true }
 rustls = { version = "0.23.33", default-features = false }
 simple-dns = "0.11"
 tokio = { version = "1", features = ["macros", "sync", "io-util"] }
@@ -50,6 +51,9 @@ cfg_aliases = "0.2.1"
 default = []
 tls-ring = ["rustls/ring"]
 tls-aws-lc-rs = ["rustls/aws-lc-rs"]
+# Basic DNSSEC validation: RRSIG signature checks plus DS delegation-link and
+# key-tag helpers. Pulls in `ring` for the signature and digest primitives.
+dnssec = ["dep:ring"]
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

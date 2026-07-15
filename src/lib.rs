@@ -13,6 +13,11 @@
 //! defaults, or with [`SimpleDnsResolver::builder`] to configure the nameservers
 //! and the fallback behavior. See [`Builder`] for the available settings.
 //!
+//! The optional `dnssec` feature adds a small DNSSEC validation toolkit
+//! (`verify_rrsig`, `verify_ds`, `key_tag`, and `build_dnssec_query`). It
+//! validates individual RRSIG signatures and DS delegation links rather than a
+//! full chain of trust; see its module docs for the exact scope.
+//!
 //! [`simple-dns`]: https://docs.rs/simple-dns
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
@@ -26,6 +31,8 @@ use std::{
 use simple_dns::rdata::{SVCB, SVCParam};
 
 mod config;
+#[cfg(feature = "dnssec")]
+mod dnssec;
 mod error;
 mod resolver;
 mod system_config;
@@ -33,6 +40,13 @@ mod system_config;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "dnssec")]
+pub use simple_dns;
+
+#[cfg(feature = "dnssec")]
+pub use self::dnssec::{
+    DnssecError, ResourceRecord, build_dnssec_query, key_tag, verify_ds, verify_rrsig,
+};
 #[cfg(any(target_os = "android", doc))]
 pub use self::system_config::install_android_jni_context;
 pub use self::{error::Error, resolver::SimpleDnsResolver};
