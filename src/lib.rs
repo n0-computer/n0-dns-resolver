@@ -36,7 +36,6 @@ mod dnssec;
 mod error;
 mod resolver;
 mod system_config;
-
 #[cfg(test)]
 mod tests;
 
