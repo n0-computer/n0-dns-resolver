@@ -1531,7 +1531,9 @@ fn authority_rrset_signed(
     authority: &[ResourceRecord<'_>],
     keys: &[DNSKEY<'_>],
 ) -> bool {
-    let owner_labels = owner.as_bytes().count();
+    // The canonical wire form of the record's own owner name, downcased per RFC
+    // 4034 section 6.1, used below to reject a relabeled wildcard signature.
+    let owner_wire = encode_name(owner.as_bytes(), true);
     let mut checks = 0usize;
     for rr in authority {
         let RData::RRSIG(sig) = &rr.rdata else {
@@ -1540,15 +1542,16 @@ fn authority_rrset_signed(
         if rr.name != *owner || sig.type_covered != type_covered {
             continue;
         }
-        // A denial NSEC or NSEC3 must be signed at its own name, never as a
-        // wildcard expansion. If the RRSIG labels are below the owner's label
-        // count, `canonical_owner` reconstructs `*.zone` and verifies the
-        // signature over that: an attacker could then relabel a genuine
-        // wildcard-node record onto a victim name (labels untouched) and it
-        // would still verify, forging an exact-name match in the proofs
-        // (RFC 4035 section 5.3.2). A wildcard-node NSEC is never needed to prove
-        // denial, so requiring an exact-owner signature loses no valid proof.
-        if sig.labels as usize != owner_labels {
+        // The signature must authenticate this record at its own name.
+        // `canonical_owner` reconstructs the name the RRSIG actually covers: for a
+        // genuine record (including a wildcard node's own `*.zone` NSEC, whose
+        // RRSIG labels omit the leftmost `*`) that equals the record's own owner,
+        // but for a wildcard signature relabeled onto another name it does not
+        // (RFC 4035 section 5.3.2). Rejecting the mismatch stops an attacker from
+        // replaying a wildcard-node record under a victim owner to forge an exact
+        // match, while still letting `prove_wildcard` and `prove_nxdomain` use the
+        // wildcard node's own NSEC as a range cover on the positive path.
+        if !matches!(canonical_owner(&rr.name, sig.labels), Ok(ref w) if *w == owner_wire) {
             continue;
         }
         for key in keys {
@@ -3369,6 +3372,29 @@ mod tests {
             );
             let authority = vec![nsec, rrsig];
             let qname = Name::new_unchecked("host.example.com");
+            assert!(prove_wildcard(&qname, 2, &authority, &signer.keys()).is_ok());
+        }
+
+        #[test]
+        fn wildcard_cover_accepts_the_wildcard_nodes_own_nsec() {
+            // The closer-match cover is the wildcard node's OWN NSEC: owner
+            // *.example.com (3 wire labels) signed with labels=2, exactly what a
+            // real wildcard-node signer emits and what the exact-owner guard must
+            // NOT strip, or every legitimate wildcard positive answer whose cover
+            // is the wildcard node would be rejected. Canonically *.example.com is
+            // the first name after the apex, so its NSEC (wrapping to the apex)
+            // covers foo.example.com.
+            let signer = Signer::new();
+            let nsec = nsec_rr("*.example.com", "example.com", &[A, RRSIG_BIT, NSEC_BIT]);
+            let rrsig = signer.sign_with_labels(
+                std::slice::from_ref(&nsec),
+                NSEC_BIT,
+                "*.example.com",
+                2,
+                "example.com",
+            );
+            let authority = vec![nsec, rrsig];
+            let qname = Name::new_unchecked("foo.example.com");
             assert!(prove_wildcard(&qname, 2, &authority, &signer.keys()).is_ok());
         }
 
