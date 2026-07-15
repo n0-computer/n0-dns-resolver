@@ -571,6 +571,15 @@ impl SimpleDnsResolver {
 
             // No records of the requested type -- follow CNAME if present.
             let Some(target) = query::cname_target(&packet, &current_host) else {
+                // An empty answer (NODATA) carries no record to validate, but
+                // under DNSSEC it must still be authenticated: a forged or
+                // unsigned empty answer for a signed name would otherwise suppress
+                // a real record. Fail-closed if the denial cannot be proven.
+                #[cfg(feature = "dnssec")]
+                if self.validate_dnssec {
+                    self.validate_nodata(&current_host, qtype, &response)
+                        .await?;
+                }
                 return Ok(response);
             };
             debug!(from = %current_host, to = %target, "following CNAME");
@@ -1102,6 +1111,30 @@ mod tests {
             .validate_dnssec()
             .build();
         assert_resolves_ipv4(&resolver, "cloudflare.com").await;
+    }
+
+    /// End to end authentication of a NODATA denial (finding D3). `cloudflare.com`
+    /// is signed and publishes no SRV record at its apex, so an SRV query returns
+    /// an authenticated NODATA. The resolver must prove the denial and return a
+    /// normal empty or NXDOMAIN result, never `DnssecBogus`. A regression that
+    /// failed closed on a valid NSEC or NSEC3 would surface here as Bogus.
+    #[cfg(feature = "dnssec")]
+    #[tokio::test]
+    #[ignore = "requires network access"]
+    async fn validate_dnssec_authenticated_nodata() {
+        let resolver = SimpleDnsResolver::builder()
+            .without_system_defaults()
+            .disable_fallback()
+            .nameserver(CLOUDFLARE_DNS, DnsProtocol::Udp)
+            .validate_dnssec()
+            .build();
+        let result = resolver
+            .lookup_record("cloudflare.com".to_string(), RecordKind::Srv)
+            .await;
+        assert!(
+            !matches!(result, Err(crate::Error::DnssecBogus { .. })),
+            "an authenticated NODATA must not be Bogus, got {result:?}"
+        );
     }
 
     mod search_names {

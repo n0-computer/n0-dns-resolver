@@ -35,10 +35,12 @@ pub enum Error {
     /// DNSSEC validation determined the answer is Bogus, so it was rejected.
     ///
     /// Only returned when the resolver was built with
-    /// [`crate::Builder::validate_dnssec`]. The validator is fail-closed: a
-    /// negative answer, or a delegation whose missing DS cannot be proven absent,
-    /// is reported as Bogus rather than passed through. The `source` carries the
-    /// specific chain or proof failure.
+    /// [`crate::Builder::validate_dnssec`]. The validator is fail-closed: an
+    /// answer whose chain does not validate, a NODATA denial that cannot be
+    /// authenticated, or a delegation whose missing DS cannot be proven absent is
+    /// reported as Bogus rather than passed through. An authenticated NODATA is
+    /// accepted; NXDOMAIN is surfaced as [`Error::NxDomain`] before validation
+    /// runs. The `source` carries the specific chain or proof failure.
     #[cfg(feature = "dnssec")]
     #[error("DNSSEC validation failed: answer is bogus")]
     DnssecBogus { source: AnyError },

@@ -76,8 +76,8 @@ returns an error unless the answer is provably secure.
 Validation is fail-closed. It verifies the RRSIG signatures over the answer
 RRset (RSA/SHA-256 and RSA/SHA-512, ECDSA P-256 and P-384, and Ed25519), walks
 the DS and DNSKEY records up to the root, and uses NSEC and NSEC3 records to
-prove wildcard expansions and insecure, unsigned delegations. Anything it cannot
-prove secure is rejected.
+prove wildcard expansions, insecure unsigned delegations, and NODATA denials.
+Anything it cannot prove secure is rejected.
 
 The validator is deliberately strict and covers the common signed-lookup case
 rather than being a full recursive validator. Its limitations:
@@ -85,8 +85,11 @@ rather than being a full recursive validator. Its limitations:
 - It requires answers to be secure. An unsigned name, or a negative answer it
   cannot authenticate, is rejected rather than returned, so enable validation
   only for names you expect to be signed.
-- Authenticating NXDOMAIN and NODATA answers is not yet wired into the lookup
-  path, though the NSEC and NSEC3 proof code is present and tested.
+- A NODATA answer (the name exists but lacks the queried type) is authenticated
+  against the signing zone's NSEC or NSEC3 and accepted only when the denial is
+  proven. NXDOMAIN is surfaced as an error before validation runs, so it is not
+  authenticated, though the NSEC and NSEC3 proof code for it is present and
+  tested.
 - Only the final answer RRset is validated. CNAME hops are followed but not
   each checked individually.
 - The root trust anchors are compiled in (KSK-2017 and KSK-2024), so a build

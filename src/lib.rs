@@ -227,9 +227,11 @@ impl Builder {
     /// the response also proves, with an NSEC or NSEC3 record, that no closer
     /// non-wildcard match exists. A delegation that publishes no DS is accepted as
     /// Insecure (its zone is unsigned) when the response proves the DS is truly
-    /// absent; otherwise it stays Bogus. A negative answer (NXDOMAIN or NODATA) is
-    /// still rejected rather than proven, since the resolver validates positive
-    /// answers only. Enable this for names you expect to be signed.
+    /// absent; otherwise it stays Bogus. A NODATA answer (the name exists but has
+    /// no record of the queried type) is authenticated against the signing zone's
+    /// NSEC or NSEC3 and accepted only when the denial is proven. NXDOMAIN is
+    /// surfaced as the `NxDomain` error before validation runs, so it is not
+    /// authenticated. Enable this for names you expect to be signed.
     ///
     /// Only the final answer RRset is validated; intermediate CNAME hops in a
     /// chain are followed but not individually validated.

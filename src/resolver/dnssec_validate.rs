@@ -8,19 +8,22 @@
 //!
 //! Validation is fail-closed. An answer with no RRSIG, a zone with no fetchable
 //! DNSKEY or DS RRset, or a chain that does not validate all map to
-//! [`crate::Error::DnssecBogus`]. Two cases lean on the denial-of-existence
+//! [`crate::Error::DnssecBogus`]. Three cases lean on the denial-of-existence
 //! proofs. A wildcard-expanded answer validates only when the authority section
 //! proves no closer match exists. A delegation with no DS is accepted as
 //! Insecure (unsigned) when the authority section proves the DS is truly absent,
-//! rather than being rejected. Only the final answer RRset is validated; CNAME
-//! hops are followed but not individually checked. Authenticating a bare
-//! NODATA or NXDOMAIN answer is not yet wired: the resolver validates positive
-//! answers, so a negative answer still fails closed rather than being proven.
+//! rather than being rejected. A NODATA answer (no record of the queried type
+//! and no CNAME) is authenticated against the signing zone with [`prove_nodata`]:
+//! the SOA owner in the authority section names the zone, and the denial must be
+//! proven or the answer is Bogus. Only the final answer RRset is validated; CNAME
+//! hops are followed but not individually checked. Authenticating an NXDOMAIN
+//! answer is not yet wired, because [`super::query::check_response`] turns it into
+//! [`crate::Error::NxDomain`] before validation runs.
 
 use n0_error::{AnyError, e, stack_error};
 use simple_dns::{
     Name, Packet, TYPE,
-    rdata::{RData, RRSIG},
+    rdata::{DNSKEY, RData, RRSIG},
 };
 use tracing::{debug, warn};
 
@@ -29,7 +32,7 @@ use crate::{
     Error,
     dnssec::{
         ChainError, DelegatedZone, DenialError, ROOT_TRUST_ANCHORS, ResourceRecord, SignedRrset,
-        build_dnssec_query, descend_zone, prove_no_ds, prove_wildcard, trust_root,
+        build_dnssec_query, descend_zone, prove_no_ds, prove_nodata, prove_wildcard, trust_root,
         verify_rrset_with_keys,
     },
 };
@@ -60,6 +63,25 @@ enum ValidateError {
     /// The assembled chain of trust did not validate.
     #[error("chain of trust did not validate")]
     Chain { source: ChainError },
+    /// A NODATA response carried no SOA record, so the signing zone is unknown
+    /// and the denial cannot be authenticated.
+    #[error("NODATA response has no SOA to name the signing zone")]
+    MissingSoa {},
+    /// The queried name in a NODATA response did not parse as a domain name.
+    #[error("NODATA response is for an invalid name {name}")]
+    InvalidQname { name: String },
+    /// The authority section did not prove the queried type is absent (NODATA).
+    #[error("NODATA denial for {name} is not proven")]
+    DenialUnproven { name: String, source: DenialError },
+}
+
+/// The result of building a zone's trusted DNSKEY set.
+enum ZoneTrust {
+    /// The zone is signed; these DNSKEYs are trusted for it.
+    Secure(Vec<DNSKEY<'static>>),
+    /// An ancestor delegation proved no DS, so the zone and everything below the
+    /// cut is unsigned. The caller accepts the answer as-is (Insecure).
+    Insecure,
 }
 
 impl SimpleDnsResolver {
@@ -139,62 +161,17 @@ impl SimpleDnsResolver {
         let wildcard_labels =
             is_wildcard_expansion(signing_rrsig.labels, &owner).then_some(signing_rrsig.labels);
 
-        // The RRSIG signer names the zone that signed the answer. Validate from
-        // the root down through every zone cut between them.
+        // The RRSIG signer names the zone that signed the answer. Build its
+        // trusted DNSKEY set by walking the chain from the root down.
         let signing_zone = signing_rrsig.signer_name.to_string();
         debug!(zone = %signing_zone, "validating answer against DNSSEC chain");
 
-        let root_dnskeys = self
-            .fetch_signed_rrset(".", TYPE::DNSKEY)
-            .await?
-            .ok_or_else(|| {
-                e!(ValidateError::MissingDnskey {
-                    zone: ".".to_string(),
-                })
-            })?;
-        // Anchor the root and carry the trusted DNSKEY set down each zone cut.
-        let mut trusted = trust_root(&root_dnskeys, ROOT_TRUST_ANCHORS)
-            .map_err(|source| e!(ValidateError::Chain, source))?;
-
-        // Discover the real secure zone cuts between the root and the signing
-        // zone. Not every label boundary is a delegation: a zone can hold names
-        // several labels deep, and a delegation may skip labels. Query the DS at
-        // each ancestor and descend on the ones that publish a signed DS RRset.
-        //
-        // When an ancestor has no DS, it is either a non-cut or an insecure
-        // (unsigned) delegation. If the DS response carries an NSEC or NSEC3,
-        // validated against the trusted parent keys, that proves the DS is truly
-        // absent, then everything at or below that cut is unsigned. The answer's
-        // own zone is thereby proven insecure, so we accept it as unsigned rather
-        // than failing (RFC 4035 section 4.3, RFC 5155 section 8.6).
-        //
-        // Without such a proof the ancestor is treated as a non-cut and skipped,
-        // which keeps the walk fail-closed. A stripped DS on a genuinely signed
-        // delegation yields no valid absence proof (the parent's signature cannot
-        // be forged), so the signing zone's keys never enter the trusted set and
-        // the target's RRSIG matches no trusted key, failing the chain as before.
-        for zone in zone_ancestors(&signing_zone) {
-            let ds_response = self.fetch_raw(&zone, TYPE::DS).await?;
-            if let Some(delegation) = parse_signed_rrset(&ds_response, &zone, TYPE::DS) {
-                let dnskeys = self
-                    .fetch_signed_rrset(&zone, TYPE::DNSKEY)
-                    .await?
-                    .ok_or_else(|| e!(ValidateError::MissingDnskey { zone: zone.clone() }))?;
-                let delegated = DelegatedZone {
-                    delegation,
-                    dnskeys,
-                };
-                trusted = descend_zone(&trusted, &delegated)
-                    .map_err(|source| e!(ValidateError::Chain, source))?;
-            } else if let Ok(child) = Name::new(&zone) {
-                let authority = authority_records(&ds_response);
-                if prove_no_ds(&child, &authority, &trusted).is_ok() {
-                    debug!(zone = %zone, "insecure delegation proven; accepting answer as unsigned");
-                    return Ok(());
-                }
-                debug!(zone = %zone, "no signed DS, treating as a non-cut and skipping");
-            }
-        }
+        let trusted = match self.trusted_keys_for_zone(&signing_zone).await? {
+            // A proven-absent DS above the signing zone makes it unsigned, so the
+            // answer is Insecure and accepted as-is (RFC 4035 section 4.3).
+            ZoneTrust::Insecure => return Ok(()),
+            ZoneTrust::Secure(keys) => keys,
+        };
 
         // The signing zone's keys are now trusted. Validate the answer RRset.
         verify_rrset_with_keys(&target, &trusted)
@@ -213,6 +190,121 @@ impl SimpleDnsResolver {
             })?;
         }
         Ok(())
+    }
+
+    /// Authenticates a NODATA denial for `host`/`qtype`, fail-closed.
+    ///
+    /// A response with no record of the queried type and no CNAME to follow is a
+    /// NODATA answer. Under validation it must be authenticated, or an on-path
+    /// attacker could suppress a signed record by returning a forged empty answer.
+    /// Returns `Ok(())` when the authority section proves the type is absent under
+    /// the signing zone, or when that zone is proven insecure (unsigned). Any
+    /// other outcome is fail-closed and surfaces as [`Error::DnssecBogus`].
+    pub(super) async fn validate_nodata(
+        &self,
+        host: &str,
+        qtype: TYPE,
+        response: &[u8],
+    ) -> Result<(), Error> {
+        match self.validate_nodata_inner(host, qtype, response).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                warn!(%err, "DNSSEC validation rejected a NODATA answer");
+                Err(e!(Error::DnssecBogus, AnyError::from_stack(err)))
+            }
+        }
+    }
+
+    /// Proves the NODATA denial for `host`/`qtype` from the authority section.
+    async fn validate_nodata_inner(
+        &self,
+        host: &str,
+        qtype: TYPE,
+        response: &[u8],
+    ) -> Result<(), ValidateError> {
+        let authority = authority_records(response);
+        // The SOA in the authority section names the zone that answered the
+        // denial, and its keys sign the accompanying NSEC or NSEC3 records. With
+        // no SOA the signing zone is unknown, so the denial cannot be
+        // authenticated and stays fail-closed.
+        let zone = soa_zone(&authority).ok_or_else(|| e!(ValidateError::MissingSoa))?;
+        let qname = Name::new(host)
+            .map_err(|_| {
+                e!(ValidateError::InvalidQname {
+                    name: host.to_string(),
+                })
+            })?
+            .into_owned();
+
+        let keys = match self.trusted_keys_for_zone(&zone).await? {
+            ZoneTrust::Insecure => return Ok(()),
+            ZoneTrust::Secure(keys) => keys,
+        };
+
+        prove_nodata(&qname, u16::from(qtype), &authority, &keys).map_err(|source| {
+            e!(ValidateError::DenialUnproven {
+                name: host.to_string(),
+                source,
+            })
+        })
+    }
+
+    /// Builds the trusted DNSKEY set for `zone` by walking the chain of trust
+    /// from the embedded root anchors down to it.
+    ///
+    /// Anchors the root against [`ROOT_TRUST_ANCHORS`], then discovers the real
+    /// secure zone cuts between the root and `zone` and descends each one that
+    /// publishes a signed DS RRset. Not every label boundary is a delegation: a
+    /// zone can hold names several labels deep, and a delegation may skip labels,
+    /// so the DS is queried at each ancestor and only the signed ones are
+    /// descended.
+    ///
+    /// Returns [`ZoneTrust::Insecure`] when an ancestor delegation is proven to
+    /// have no DS, which makes `zone` unsigned (RFC 4035 section 4.3, RFC 5155
+    /// section 8.6). Without such a proof an ancestor with no DS is treated as a
+    /// non-cut and skipped, which keeps the walk fail-closed: a stripped DS on a
+    /// genuinely signed delegation yields no valid absence proof, so the zone's
+    /// keys never enter the trusted set and the answer's RRSIG matches none.
+    async fn trusted_keys_for_zone(&self, zone: &str) -> Result<ZoneTrust, ValidateError> {
+        let root_dnskeys = self
+            .fetch_signed_rrset(".", TYPE::DNSKEY)
+            .await?
+            .ok_or_else(|| {
+                e!(ValidateError::MissingDnskey {
+                    zone: ".".to_string(),
+                })
+            })?;
+        // Anchor the root and carry the trusted DNSKEY set down each zone cut.
+        let mut trusted = trust_root(&root_dnskeys, ROOT_TRUST_ANCHORS)
+            .map_err(|source| e!(ValidateError::Chain, source))?;
+
+        for ancestor in zone_ancestors(zone) {
+            let ds_response = self.fetch_raw(&ancestor, TYPE::DS).await?;
+            if let Some(delegation) = parse_signed_rrset(&ds_response, &ancestor, TYPE::DS) {
+                let dnskeys = self
+                    .fetch_signed_rrset(&ancestor, TYPE::DNSKEY)
+                    .await?
+                    .ok_or_else(|| {
+                        e!(ValidateError::MissingDnskey {
+                            zone: ancestor.clone(),
+                        })
+                    })?;
+                let delegated = DelegatedZone {
+                    delegation,
+                    dnskeys,
+                };
+                trusted = descend_zone(&trusted, &delegated)
+                    .map_err(|source| e!(ValidateError::Chain, source))?;
+            } else if let Ok(child) = Name::new(&ancestor) {
+                let authority = authority_records(&ds_response);
+                if prove_no_ds(&child, &authority, &trusted).is_ok() {
+                    debug!(zone = %ancestor, "insecure delegation proven; zone is unsigned");
+                    return Ok(ZoneTrust::Insecure);
+                }
+                debug!(zone = %ancestor, "no signed DS, treating as a non-cut and skipping");
+            }
+        }
+        Ok(ZoneTrust::Secure(trusted))
     }
 
     /// Queries `name` for `qtype` with the DO bit set and returns the RRset of
@@ -261,6 +353,19 @@ fn authority_records(response: &[u8]) -> Vec<ResourceRecord<'static>> {
                 .collect()
         })
         .unwrap_or_default()
+}
+
+/// Returns the owner name of the SOA record in an authority section, if any.
+///
+/// A NODATA response places the answering zone's SOA in the authority section;
+/// its owner names the zone whose keys sign the accompanying NSEC or NSEC3
+/// records. Returns `None` when no SOA is present, which the caller treats as an
+/// unauthenticated denial (fail-closed).
+fn soa_zone(authority: &[ResourceRecord<'_>]) -> Option<String> {
+    authority.iter().find_map(|rr| match &rr.rdata {
+        RData::SOA(_) => Some(rr.name.to_string()),
+        _ => None,
+    })
 }
 
 /// Returns whether `signer` may sign records owned by `owner`.
@@ -369,10 +474,97 @@ mod tests {
 
     use simple_dns::{
         CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, ResourceRecord,
-        rdata::{A, RData, RRSIG},
+        rdata::{A, RData, RRSIG, SOA},
     };
 
     use super::*;
+
+    /// Builds a NODATA reply for `name`/A: NoError, the question echoed, no answer
+    /// of the queried type, and `soa_owner` placed as a SOA in the authority
+    /// section when given.
+    fn nodata_reply(name: &str, soa_owner: Option<&str>) -> Vec<u8> {
+        let mut packet = Packet::new_reply(1);
+        packet.set_flags(PacketFlag::RESPONSE);
+        packet.questions.push(Question::new(
+            Name::new_unchecked(name),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        if let Some(owner) = soa_owner {
+            packet.name_servers.push(ResourceRecord::new(
+                Name::new_unchecked(owner),
+                CLASS::IN,
+                3600,
+                RData::SOA(SOA {
+                    mname: Name::new_unchecked("ns.example.com"),
+                    rname: Name::new_unchecked("hostmaster.example.com"),
+                    serial: 1,
+                    refresh: 3600,
+                    retry: 600,
+                    expire: 604_800,
+                    minimum: 300,
+                }),
+            ));
+        }
+        packet.build_bytes_vec().unwrap()
+    }
+
+    #[test]
+    fn soa_zone_extracts_the_apex_owner() {
+        let response = nodata_reply("host.example.com", Some("example.com"));
+        let authority = authority_records(&response);
+        assert_eq!(soa_zone(&authority).as_deref(), Some("example.com"));
+    }
+
+    #[test]
+    fn soa_zone_none_without_soa() {
+        let response = nodata_reply("host.example.com", None);
+        let authority = authority_records(&response);
+        assert!(soa_zone(&authority).is_none());
+    }
+
+    /// A NODATA answer with no SOA cannot name a signing zone, so the denial is
+    /// unauthenticated and must fail closed rather than being accepted as "no such
+    /// record" (finding D3). This resolves before any network fetch.
+    #[tokio::test]
+    async fn validate_nodata_fails_closed_without_soa() {
+        let resolver = SimpleDnsResolver::builder()
+            .without_system_defaults()
+            .disable_fallback()
+            .validate_dnssec()
+            .build();
+        let response = nodata_reply("host.example.com", None);
+        let result = resolver
+            .validate_nodata("host.example.com", TYPE::A, &response)
+            .await;
+        assert!(
+            matches!(result, Err(Error::DnssecBogus { .. })),
+            "unauthenticated NODATA must be Bogus, got {result:?}"
+        );
+    }
+
+    /// A NODATA answer with a SOA but no reachable chain (and so no validated
+    /// NSEC or NSEC3) also fails closed: the denial is never proven, so the empty
+    /// answer must not be returned as authoritative (finding D3).
+    #[tokio::test]
+    async fn validate_nodata_fails_closed_without_proof() {
+        let resolver = SimpleDnsResolver::builder()
+            .without_system_defaults()
+            .disable_fallback()
+            .validate_dnssec()
+            .build();
+        // No nameservers, so the chain fetch cannot complete and no NSEC or NSEC3
+        // is validated. The denial stays unproven.
+        let response = nodata_reply("host.example.com", Some("example.com"));
+        let result = resolver
+            .validate_nodata("host.example.com", TYPE::A, &response)
+            .await;
+        assert!(
+            matches!(result, Err(Error::DnssecBogus { .. })),
+            "NODATA with no denial proof must be Bogus, got {result:?}"
+        );
+    }
 
     #[test]
     fn most_specific_signer_prefers_the_deepest_zone() {
