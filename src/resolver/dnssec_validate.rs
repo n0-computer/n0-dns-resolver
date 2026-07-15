@@ -84,30 +84,41 @@ impl SimpleDnsResolver {
         // counts. Without this a response could carry a validly signed RRset for
         // an unrelated name that the attacker controls, pass the chain walk on
         // that RRset, and slip forged records for `host` through alongside it.
-        let target = parse_signed_rrset(response, host, qtype)
+        let mut target = parse_signed_rrset(response, host, qtype)
             .ok_or_else(|| e!(ValidateError::MissingSignature))?;
 
-        // The signer name is attacker-controlled, so it must be checked against
-        // the answer before it is trusted to name the signing zone. Only the
-        // answer's own zone or an ancestor may sign it (RFC 4035 5.3.1);
-        // otherwise the holder of any signed zone could sign records for any
-        // name and the chain to the root would still validate.
+        // The signer names are attacker-controlled, so each must be checked
+        // against the answer before it is trusted to name the signing zone. Only
+        // the answer's own zone or an ancestor may sign it (RFC 4035 5.3.1);
+        // otherwise the holder of any signed zone could sign records for any name
+        // and the chain to the root would still validate. Drop every RRSIG whose
+        // signer is not authoritative and require at least one to remain. All
+        // RRSIGs over a single RRset name the same zone, so the survivors share a
+        // signer.
         let owner = target
             .records
             .first()
             .ok_or_else(|| e!(ValidateError::MissingSignature))?
             .name
             .clone();
-        if !signer_is_authoritative(&target.rrsig.signer_name, &owner) {
+        let rejected_signer = target
+            .rrsigs
+            .iter()
+            .find(|sig| !signer_is_authoritative(&sig.signer_name, &owner))
+            .map(|sig| sig.signer_name.to_string());
+        target
+            .rrsigs
+            .retain(|sig| signer_is_authoritative(&sig.signer_name, &owner));
+        let Some(signing_rrsig) = target.rrsigs.first() else {
             return Err(e!(ValidateError::SignerNotAuthoritative {
-                signer: target.rrsig.signer_name.to_string(),
+                signer: rejected_signer.unwrap_or_default(),
                 owner: owner.to_string(),
             }));
-        }
+        };
 
         // The RRSIG signer names the zone that signed the answer. Validate from
         // the root down through every zone cut between them.
-        let signing_zone = target.rrsig.signer_name.to_string();
+        let signing_zone = signing_rrsig.signer_name.to_string();
         debug!(zone = %signing_zone, "validating answer against DNSSEC chain");
 
         let root_dnskeys = self
@@ -196,14 +207,16 @@ fn zone_ancestors(zone: &str) -> Vec<String> {
         .collect()
 }
 
-/// Extracts the `qtype` RRset owned by `expected_owner` and its RRSIG.
+/// Extracts the `qtype` RRset owned by `expected_owner` and every RRSIG over it.
 ///
-/// Finds the RRSIG in the answer section that is owned by `expected_owner` and
-/// covers `qtype`, then gathers every answer record of `qtype` under that same
-/// owner. Requiring the owner ties the returned RRset to the name that was
+/// Gathers every RRSIG in the answer section owned by `expected_owner` that
+/// covers `qtype`, and every answer record of `qtype` under that same owner. An
+/// RRset can carry several RRSIGs during a key rollover or from separate KSK and
+/// ZSK, so all of them are collected; the chain walk succeeds if any one
+/// validates. Requiring the owner ties the returned RRset to the name that was
 /// queried, so a signed RRset for a different name in the same response cannot
 /// stand in for it. Returns `None` when the response does not parse, the
-/// expected name is invalid, or no such RRSIG or records are present, all of
+/// expected name is invalid, or no matching RRSIG or records are present, all of
 /// which the caller treats as a missing signature.
 fn parse_signed_rrset(
     response: &[u8],
@@ -214,13 +227,19 @@ fn parse_signed_rrset(
     let covered = u16::from(qtype);
     let owner = Name::new(expected_owner).ok()?;
 
-    let rrsig_rr = packet.answers.iter().find(|rr| {
-        rr.name == owner && matches!(&rr.rdata, RData::RRSIG(sig) if sig.type_covered == covered)
-    })?;
-    let RData::RRSIG(rrsig) = &rrsig_rr.rdata else {
+    let rrsigs: Vec<_> = packet
+        .answers
+        .iter()
+        .filter_map(|rr| match &rr.rdata {
+            RData::RRSIG(sig) if rr.name == owner && sig.type_covered == covered => {
+                Some(sig.clone().into_owned())
+            }
+            _ => None,
+        })
+        .collect();
+    if rrsigs.is_empty() {
         return None;
-    };
-    let rrsig = rrsig.clone().into_owned();
+    }
 
     let records: Vec<ResourceRecord<'static>> = packet
         .answers
@@ -231,7 +250,7 @@ fn parse_signed_rrset(
     if records.is_empty() {
         return None;
     }
-    Some(SignedRrset { records, rrsig })
+    Some(SignedRrset { records, rrsigs })
 }
 
 #[cfg(test)]
@@ -334,8 +353,50 @@ mod tests {
         let signed = parse_signed_rrset(&response, "host.example.com", TYPE::A)
             .expect("signed RRset present");
         assert_eq!(signed.records.len(), 1);
-        assert_eq!(signed.rrsig.signer_name.to_string(), "example.com");
-        assert_eq!(signed.rrsig.key_tag, 12345);
+        assert_eq!(signed.rrsigs.len(), 1);
+        assert_eq!(signed.rrsigs[0].signer_name.to_string(), "example.com");
+        assert_eq!(signed.rrsigs[0].key_tag, 12345);
+    }
+
+    #[test]
+    fn parse_signed_rrset_collects_every_rrsig() {
+        // Two RRSIGs cover the same A RRset, as a zone with a separate KSK and
+        // ZSK, or one mid rollover, would publish. Both must be collected so the
+        // chain walk can try each.
+        let mut packet = Packet::new_reply(1);
+        packet.set_flags(PacketFlag::RESPONSE);
+        let name = "host.example.com";
+        packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked(name),
+            CLASS::IN,
+            300,
+            RData::A(A {
+                address: u32::from_be_bytes([192, 0, 2, 7]),
+            }),
+        ));
+        for key_tag in [11111u16, 22222u16] {
+            packet.answers.push(ResourceRecord::new(
+                Name::new_unchecked(name),
+                CLASS::IN,
+                300,
+                RData::RRSIG(RRSIG {
+                    type_covered: u16::from(TYPE::A),
+                    algorithm: 13,
+                    labels: 3,
+                    original_ttl: 300,
+                    signature_expiration: 1_800_000_000,
+                    signature_inception: 1_700_000_000,
+                    key_tag,
+                    signer_name: Name::new_unchecked("example.com"),
+                    signature: Cow::Owned(vec![0xAB; 64]),
+                }),
+            ));
+        }
+        let response = packet.build_bytes_vec().unwrap();
+        let signed = parse_signed_rrset(&response, name, TYPE::A).expect("signed RRset present");
+        assert_eq!(signed.records.len(), 1);
+        let tags: Vec<u16> = signed.rrsigs.iter().map(|sig| sig.key_tag).collect();
+        assert_eq!(tags, vec![11111, 22222]);
     }
 
     #[test]

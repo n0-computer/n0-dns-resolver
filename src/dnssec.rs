@@ -336,18 +336,21 @@ pub fn verify_rrsig(
 /// [`verify_rrsig`].
 pub type ResourceRecord<'a> = simple_dns::ResourceRecord<'a>;
 
-/// An RRset together with the [`RRSIG`] that signs it.
+/// An RRset together with the [`RRSIG`] records that sign it.
 ///
-/// The `records` share one owner name, class, and type, and `rrsig` is the
-/// signature covering them. This is the unit [`verify_chain`] validates at each
-/// level: a DNSKEY RRset self-signed by its zone key, a DS RRset signed by the
-/// parent zone, or a target RRset signed by its zone.
+/// The `records` share one owner name, class, and type, and `rrsigs` holds every
+/// signature covering them. An RRset routinely carries more than one RRSIG: a
+/// DNSKEY RRset signed by both a KSK and a ZSK, or any RRset mid key rollover
+/// where the old and new key both sign. This is the unit [`verify_chain`]
+/// validates at each level, and it succeeds if any one RRSIG validates under a
+/// trusted key.
 #[derive(Debug, Clone)]
 pub struct SignedRrset<'a> {
-    /// The records the signature covers.
+    /// The records the signatures cover.
     pub records: Vec<ResourceRecord<'a>>,
-    /// The signature over `records`.
-    pub rrsig: RRSIG<'a>,
+    /// The signatures over `records`. Validation succeeds if any one of them
+    /// verifies under a trusted key.
+    pub rrsigs: Vec<RRSIG<'a>>,
 }
 
 /// A zone below the root in a [`ChainOfTrust`].
@@ -500,25 +503,32 @@ pub fn verify_chain_with_anchors(
     verify_signed_rrset(&chain.target, &trusted)
 }
 
-/// Verifies a [`SignedRrset`] using whichever trusted key the RRSIG names.
+/// Verifies a [`SignedRrset`] using whichever trusted key one of its RRSIGs names.
 ///
-/// Tries every key in `keys` whose key tag and algorithm match the RRSIG, and
-/// succeeds on the first that validates. Returns [`ChainError::NoSigningKey`]
-/// when no key matches and [`ChainError::Link`] when a matching key fails the
-/// signature check.
+/// Tries every RRSIG in the set against every key in `keys` whose key tag and
+/// algorithm match it, and succeeds on the first pair that validates. Trying
+/// every matching key matters because a key tag is a checksum, not an identifier:
+/// two keys can share a tag, so a tag match alone does not pick the right key
+/// (RFC 4034 appendix B). Returns [`ChainError::NoSigningKey`] when no RRSIG has
+/// a matching key at all, and [`ChainError::Link`] when a matching key was tried
+/// but every signature check failed.
 fn verify_signed_rrset(signed: &SignedRrset<'_>, keys: &[&DNSKEY<'_>]) -> Result<(), ChainError> {
+    let mut matched_any = false;
     let mut last_err = None;
-    for key in keys {
-        if key.algorithm == signed.rrsig.algorithm && key_tag(key) == signed.rrsig.key_tag {
-            match verify_rrsig(&signed.rrsig, &signed.records, key) {
-                Ok(()) => return Ok(()),
-                Err(err) => last_err = Some(err),
+    for rrsig in &signed.rrsigs {
+        for key in keys {
+            if key.algorithm == rrsig.algorithm && key_tag(key) == rrsig.key_tag {
+                matched_any = true;
+                match verify_rrsig(rrsig, &signed.records, key) {
+                    Ok(()) => return Ok(()),
+                    Err(err) => last_err = Some(err),
+                }
             }
         }
     }
     match last_err {
-        Some(err) => Err(e!(ChainError::Link, err)),
-        None => Err(e!(ChainError::NoSigningKey)),
+        Some(err) if matched_any => Err(e!(ChainError::Link, err)),
+        _ => Err(e!(ChainError::NoSigningKey)),
     }
 }
 
@@ -1347,7 +1357,10 @@ mod tests {
                     RData::DNSKEY(self.dnskey.clone()),
                 )];
                 let rrsig = self.sign(&records, 48, &self.name, rng);
-                SignedRrset { records, rrsig }
+                SignedRrset {
+                    records,
+                    rrsigs: vec![rrsig],
+                }
             }
 
             /// A SHA-256 DS record committing to this zone's key.
@@ -1399,13 +1412,13 @@ mod tests {
                 zones: vec![DelegatedZone {
                     delegation: SignedRrset {
                         records: ds_records,
-                        rrsig: ds_rrsig,
+                        rrsigs: vec![ds_rrsig],
                     },
                     dnskeys: child_dnskeys,
                 }],
                 target: SignedRrset {
                     records: target_records,
-                    rrsig: target_rrsig,
+                    rrsigs: vec![target_rrsig],
                 },
             };
             (chain, vec![root.ds()])
@@ -1452,9 +1465,9 @@ mod tests {
         fn rejects_tampered_leaf_signature() {
             let rng = SystemRandom::new();
             let (mut chain, anchors) = good_chain(&rng);
-            let mut sig = chain.target.rrsig.signature.to_vec();
+            let mut sig = chain.target.rrsigs[0].signature.to_vec();
             sig[0] ^= 0xFF;
-            chain.target.rrsig.signature = Cow::Owned(sig);
+            chain.target.rrsigs[0].signature = Cow::Owned(sig);
             assert!(matches!(
                 verify_chain_with_anchors(&chain, &anchors),
                 Err(ChainError::Link { .. })
@@ -1470,6 +1483,30 @@ mod tests {
             assert!(matches!(
                 verify_chain_with_anchors(&chain, &anchors),
                 Err(ChainError::NoDnskeys { .. })
+            ));
+        }
+
+        #[test]
+        fn dnskey_rrset_validates_with_one_good_rrsig_among_bad() {
+            let rng = SystemRandom::new();
+            let (mut chain, anchors) = good_chain(&rng);
+
+            // Prepend an RRSIG from an untrusted stranger key over the child's
+            // DNSKEY RRset, as if an unrelated key had signed alongside the real
+            // one. Its key tag matches no trusted DNSKEY, so validation must fall
+            // through to the genuine self-signature and still succeed.
+            let stranger = Zone::new("", &rng);
+            let records = chain.zones[0].dnskeys.records.clone();
+            let bogus = stranger.sign(&records, 48, "example", &rng);
+            chain.zones[0].dnskeys.rrsigs.insert(0, bogus);
+            assert!(verify_chain_with_anchors(&chain, &anchors).is_ok());
+
+            // Dropping the genuine RRSIG leaves only the untrusted one, which no
+            // trusted key matches, so the chain must now fail closed.
+            chain.zones[0].dnskeys.rrsigs.remove(1);
+            assert!(matches!(
+                verify_chain_with_anchors(&chain, &anchors),
+                Err(ChainError::NoSigningKey { .. })
             ));
         }
 
