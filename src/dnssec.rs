@@ -319,24 +319,28 @@ fn signed_data(rrsig: &RRSIG<'_>, rrset: &[ResourceRecord<'_>]) -> Result<Vec<u8
     signed.extend_from_slice(&rrsig.key_tag.to_be_bytes());
     signed.extend_from_slice(&encode_name(rrsig.signer_name.as_bytes(), false));
 
-    // Each record: owner | type | class | RRSIG original TTL | RDLEN | RDATA,
-    // all in canonical form. Owner, type, class, and TTL are identical across
-    // the RRset, so sorting the full encodings orders the records by RDATA.
-    let mut records = Vec::with_capacity(rrset.len());
+    // RFC 4034 section 6.3 orders the records within the RRset by their
+    // canonical RDATA alone, treated as a left-justified octet sequence. Sort on
+    // just the RDATA, not the full record encoding: the RDLEN field is not part
+    // of the ordering key, and including it would misorder an RRset whose members
+    // have different RDATA lengths (a DNSKEY or DS set, for example), producing
+    // the wrong signed data and a spurious verification failure.
+    let mut rdatas = Vec::with_capacity(rrset.len());
     for rr in rrset {
-        let rdata = canonical_rdata(&rr.rdata)?;
-        let mut encoded = Vec::with_capacity(owner_wire.len() + 10 + rdata.len());
-        encoded.extend_from_slice(&owner_wire);
-        encoded.extend_from_slice(&rrsig.type_covered.to_be_bytes());
-        encoded.extend_from_slice(&(rr.class as u16).to_be_bytes());
-        encoded.extend_from_slice(&rrsig.original_ttl.to_be_bytes());
-        encoded.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
-        encoded.extend_from_slice(&rdata);
-        records.push(encoded);
+        rdatas.push(canonical_rdata(&rr.rdata)?);
     }
-    records.sort_unstable();
-    for encoded in records {
-        signed.extend_from_slice(&encoded);
+    rdatas.sort_unstable();
+
+    // Each record contributes owner | type | class | RRSIG original TTL | RDLEN |
+    // RDATA in canonical form. Owner, type, class, and TTL are identical across
+    // the RRset (checked above), so only the RDATA varies between records.
+    for rdata in rdatas {
+        signed.extend_from_slice(&owner_wire);
+        signed.extend_from_slice(&rrsig.type_covered.to_be_bytes());
+        signed.extend_from_slice(&(first.class as u16).to_be_bytes());
+        signed.extend_from_slice(&rrsig.original_ttl.to_be_bytes());
+        signed.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+        signed.extend_from_slice(&rdata);
     }
 
     Ok(signed)
@@ -592,6 +596,59 @@ mod tests {
             }),
         );
         assert_eq!(signed_data(&rrsig, &[rr]).unwrap(), expected);
+    }
+
+    /// RFC 4034 section 6.3 orders the records in an RRset by their canonical
+    /// RDATA, not by RDATA length. Two DS records whose RDATA sort in the
+    /// opposite order to their lengths must come out in RDATA order.
+    #[test]
+    fn signed_data_orders_rrset_by_rdata_not_length() {
+        let ds_record = |key_tag: u16, digest_type: u8, digest: Vec<u8>| {
+            ResourceRecord::new(
+                Name::new_unchecked("example.com"),
+                CLASS::IN,
+                300,
+                RData::DS(DS {
+                    key_tag,
+                    algorithm: 5,
+                    digest_type,
+                    digest: Cow::Owned(digest),
+                }),
+            )
+        };
+        // Lower key tag but longer RDATA (SHA-256, 32-byte digest): sorts first
+        // by RDATA (leading 0x00), last by length.
+        let ds_low = ds_record(0x0000, 2, vec![0x00; 32]);
+        // Higher key tag but shorter RDATA (SHA-1, 20-byte digest): sorts last by
+        // RDATA (leading 0xFF), first by length.
+        let ds_high = ds_record(0xFFFF, 1, vec![0xFF; 20]);
+
+        let rrsig = RRSIG {
+            type_covered: 43, // DS
+            algorithm: 13,
+            labels: 2,
+            original_ttl: 3600,
+            signature_expiration: 1_700_000_000,
+            signature_inception: 1_600_000_000,
+            key_tag: 12345,
+            signer_name: Name::new_unchecked("example.com"),
+            signature: Cow::Borrowed(&[]),
+        };
+
+        // Pass the records in the opposite of canonical order so the sort must fix it.
+        let out = signed_data(&rrsig, &[ds_high, ds_low]).unwrap();
+
+        let mut low_rdata = vec![0x00, 0x00, 0x05, 0x02];
+        low_rdata.extend_from_slice(&[0x00; 32]);
+        let mut high_rdata = vec![0xFF, 0xFF, 0x05, 0x01];
+        high_rdata.extend_from_slice(&[0xFF; 20]);
+        let position = |needle: &[u8]| out.windows(needle.len()).position(|w| w == needle);
+        let low = position(&low_rdata).expect("ds_low rdata present");
+        let high = position(&high_rdata).expect("ds_high rdata present");
+        assert!(
+            low < high,
+            "records must be ordered by canonical RDATA, not by RDATA length"
+        );
     }
 
     /// Builds an A RRset and an RRSIG over it whose validity period covers now.
