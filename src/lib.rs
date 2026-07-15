@@ -45,8 +45,9 @@ pub use simple_dns;
 
 #[cfg(feature = "dnssec")]
 pub use self::dnssec::{
-    ChainError, ChainOfTrust, DelegatedZone, DnssecError, ROOT_TRUST_ANCHORS, ResourceRecord,
-    SignedRrset, build_dnssec_query, key_tag, verify_chain, verify_chain_with_anchors, verify_ds,
+    ChainError, ChainOfTrust, DelegatedZone, DenialError, DnssecError, ROOT_TRUST_ANCHORS,
+    ResourceRecord, SignedRrset, build_dnssec_query, key_tag, prove_no_ds, prove_nodata,
+    prove_nxdomain, prove_wildcard, verify_chain, verify_chain_with_anchors, verify_ds,
     verify_rrsig,
 };
 #[cfg(any(target_os = "android", doc))]
@@ -222,14 +223,13 @@ impl Builder {
     /// chain. The lookup fails with the `DnssecBogus` error variant when the chain
     /// does not validate.
     ///
-    /// Validation is fail-closed and does not implement NSEC or NSEC3 authenticated
-    /// denial of existence. A name that is not DNSSEC-signed, or a negative answer,
-    /// cannot be proven and is therefore rejected as Bogus rather than passed
-    /// through as insecure. Enable this only when every name you resolve is signed.
-    ///
-    /// The same fail-closed reasoning rejects a wildcard-expanded answer: proving
-    /// that no closer non-wildcard match exists needs an NSEC or NSEC3 record, so
-    /// an answer synthesized from a `*.zone` wildcard is treated as Bogus.
+    /// Validation is fail-closed. A wildcard-expanded answer validates only when
+    /// the response also proves, with an NSEC or NSEC3 record, that no closer
+    /// non-wildcard match exists. A delegation that publishes no DS is accepted as
+    /// Insecure (its zone is unsigned) when the response proves the DS is truly
+    /// absent; otherwise it stays Bogus. A negative answer (NXDOMAIN or NODATA) is
+    /// still rejected rather than proven, since the resolver validates positive
+    /// answers only. Enable this for names you expect to be signed.
     ///
     /// Only the final answer RRset is validated; intermediate CNAME hops in a
     /// chain are followed but not individually validated.

@@ -17,10 +17,15 @@
 //! signature as a validation failure rather than as proof that a name is
 //! unsigned.
 //!
-//! NSEC and NSEC3 authenticated denial of existence is not covered. Because
-//! [`verify_chain`] proves signatures rather than their absence, a legitimately
-//! unsigned delegation or a negative answer is rejected rather than proven, which
-//! is the intended fail-closed behavior.
+//! Authenticated denial of existence is covered by a separate set of proofs
+//! ([`prove_nodata`], [`prove_nxdomain`], [`prove_no_ds`], [`prove_wildcard`]).
+//! Each takes the denial records from a response's authority section together
+//! with the trusted DNSKEY set of the zone that owns them, validates every
+//! record's signature, and evaluates the NSEC or NSEC3 range and bit-map logic.
+//! A proof succeeds only when the denial is authenticated; an unvalidated or
+//! absent record is fail-closed. [`verify_chain`] itself still proves signatures
+//! rather than their absence, so on its own it rejects an unsigned delegation or
+//! a negative answer.
 //!
 //! The supported signature algorithms are RSA/SHA-256 (8, RFC 5702), RSA/SHA-512
 //! (10, RFC 5702), ECDSA P-256 SHA-256 (13, RFC 6605), ECDSA P-384 SHA-384 (14,
@@ -36,6 +41,7 @@
 
 use std::{
     borrow::Cow,
+    cmp::Ordering,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -43,7 +49,7 @@ use n0_error::{AnyError, e, stack_error};
 use ring::{digest, signature};
 use simple_dns::{
     CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, TYPE,
-    rdata::{DNSKEY, DS, OPT, RData, RRSIG},
+    rdata::{DNSKEY, DS, NSEC, NsecTypeBitMap, OPT, RData, RRSIG},
 };
 
 /// EDNS(0) advertised UDP payload size for DNSSEC queries.
@@ -489,10 +495,34 @@ pub fn verify_chain_with_anchors(
     chain: &ChainOfTrust<'_>,
     anchors: &[DS<'_>],
 ) -> Result<(), ChainError> {
-    // Anchor the root: the root DNSKEY RRset must contain a key whose DS matches
-    // an embedded anchor, and the RRset must be self-signed by such a key.
-    let root_keys = dnskeys_of(&chain.root_dnskeys.records)?;
-    let root_owner = owner_of(&chain.root_dnskeys.records)?;
+    // Anchor the root, then carry the trusted DNSKEY set down one zone cut at a
+    // time. After a level validates, the whole child DNSKEY RRset is trusted and
+    // signs the next level (the next DS, or the target).
+    let mut trusted = trust_root(&chain.root_dnskeys, anchors)?;
+    for zone in &chain.zones {
+        trusted = descend_zone(&trusted, zone)?;
+    }
+    // The target RRset is signed by the deepest zone's now-trusted DNSKEY set.
+    verify_rrset_with_keys(&chain.target, &trusted)
+}
+
+/// Anchors the root DNSKEY RRset and returns its trusted keys.
+///
+/// The RRset must contain a key whose DS matches one of `anchors` and must be
+/// self-signed by such a key (RFC 4035 section 5). On success the whole root
+/// DNSKEY set is returned as owned records, which the caller carries down as the
+/// trusted set for the next zone cut.
+///
+/// # Errors
+///
+/// Returns [`ChainError::UntrustedRoot`] when no root key matches an anchor, or a
+/// [`ChainError::Link`] when the self-signature does not verify.
+pub(crate) fn trust_root(
+    root_dnskeys: &SignedRrset<'_>,
+    anchors: &[DS<'_>],
+) -> Result<Vec<DNSKEY<'static>>, ChainError> {
+    let root_keys = dnskeys_of(&root_dnskeys.records)?;
+    let root_owner = owner_of(&root_dnskeys.records)?;
     let anchored: Vec<&DNSKEY<'_>> = root_keys
         .iter()
         .copied()
@@ -505,39 +535,71 @@ pub fn verify_chain_with_anchors(
     if anchored.is_empty() {
         return Err(e!(ChainError::UntrustedRoot));
     }
-    verify_signed_rrset(&chain.root_dnskeys, &anchored)?;
+    verify_signed_rrset(root_dnskeys, &anchored)?;
+    Ok(root_keys
+        .into_iter()
+        .map(|key| key.clone().into_owned())
+        .collect())
+}
 
-    // Walk each delegation, carrying the trusted DNSKEY set down one zone cut at
-    // a time. After a level validates, the whole child DNSKEY RRset is trusted
-    // and signs the next level (the next DS, or the target).
-    let mut trusted = root_keys;
-    for zone in &chain.zones {
-        // The DS RRset is published in, and signed by, the trusted parent zone.
-        verify_signed_rrset(&zone.delegation, &trusted)?;
-        let delegating_ds = ds_records_of(&zone.delegation.records)?;
+/// Descends one zone cut and returns the child zone's trusted keys.
+///
+/// The delegation DS RRset must be signed by `parent_keys`, the child DNSKEY
+/// RRset must contain a key the delegating DS commits to, and that RRset must be
+/// self-signed by such a key (RFC 4035 section 5). On success the whole child
+/// DNSKEY set is returned as owned records for the next descent.
+///
+/// # Errors
+///
+/// Returns [`ChainError::NoMatchingDnskey`] when no child key matches the
+/// delegating DS, [`ChainError::NoDelegation`] when the RRset carries no DS, or a
+/// [`ChainError::Link`] when a signature does not verify.
+pub(crate) fn descend_zone(
+    parent_keys: &[DNSKEY<'_>],
+    zone: &DelegatedZone<'_>,
+) -> Result<Vec<DNSKEY<'static>>, ChainError> {
+    let parent_refs: Vec<&DNSKEY<'_>> = parent_keys.iter().collect();
+    // The DS RRset is published in, and signed by, the trusted parent zone.
+    verify_signed_rrset(&zone.delegation, &parent_refs)?;
+    let delegating_ds = ds_records_of(&zone.delegation.records)?;
 
-        // The child's DNSKEY RRset must contain a key the parent DS commits to,
-        // and must be self-signed by such a key.
-        let child_keys = dnskeys_of(&zone.dnskeys.records)?;
-        let child_owner = owner_of(&zone.dnskeys.records)?;
-        let matched: Vec<&DNSKEY<'_>> = child_keys
-            .iter()
-            .copied()
-            .filter(|key| {
-                delegating_ds
-                    .iter()
-                    .any(|ds| verify_ds(child_owner, key, ds).is_ok())
-            })
-            .collect();
-        if matched.is_empty() {
-            return Err(e!(ChainError::NoMatchingDnskey));
-        }
-        verify_signed_rrset(&zone.dnskeys, &matched)?;
-        trusted = child_keys;
+    let child_keys = dnskeys_of(&zone.dnskeys.records)?;
+    let child_owner = owner_of(&zone.dnskeys.records)?;
+    let matched: Vec<&DNSKEY<'_>> = child_keys
+        .iter()
+        .copied()
+        .filter(|key| {
+            delegating_ds
+                .iter()
+                .any(|ds| verify_ds(child_owner, key, ds).is_ok())
+        })
+        .collect();
+    if matched.is_empty() {
+        return Err(e!(ChainError::NoMatchingDnskey));
     }
+    verify_signed_rrset(&zone.dnskeys, &matched)?;
+    Ok(child_keys
+        .into_iter()
+        .map(|key| key.clone().into_owned())
+        .collect())
+}
 
-    // The target RRset is signed by the deepest zone's now-trusted DNSKEY set.
-    verify_signed_rrset(&chain.target, &trusted)
+/// Verifies a [`SignedRrset`] against an owned set of trusted keys.
+///
+/// A convenience wrapper over the internal signature check for callers that hold
+/// the trusted keys as owned records (the resolver's incremental walk and the
+/// denial-of-existence proofs).
+///
+/// # Errors
+///
+/// Returns [`ChainError::NoSigningKey`] or [`ChainError::Link`] like
+/// [`verify_chain`].
+pub(crate) fn verify_rrset_with_keys(
+    signed: &SignedRrset<'_>,
+    keys: &[DNSKEY<'_>],
+) -> Result<(), ChainError> {
+    let refs: Vec<&DNSKEY<'_>> = keys.iter().collect();
+    verify_signed_rrset(signed, &refs)
 }
 
 /// Verifies a [`SignedRrset`] using whichever trusted key one of its RRSIGs names.
@@ -734,8 +796,10 @@ fn encode_name<'a>(labels: impl Iterator<Item = &'a [u8]>, downcase: bool) -> Ve
 
 /// Serializes the RDATA of a supported record type into canonical wire form.
 ///
-/// The supported types (A, AAAA, DNSKEY, DS) carry no embedded domain names, so
-/// their canonical RDATA is their plain wire RDATA. Other types return
+/// The supported types (A, AAAA, DNSKEY, DS, NSEC, NSEC3) carry no embedded
+/// domain names that DNS compresses, so their canonical RDATA is their plain wire
+/// RDATA. NSEC3 arrives as an unparsed [`RData::NULL`] because [`simple_dns`] does
+/// not model it, so its raw RDATA is used directly. Other types return
 /// [`DnssecError::UnsupportedRecordType`].
 fn canonical_rdata(rdata: &RData<'_>) -> Result<Vec<u8>, DnssecError> {
     match rdata {
@@ -743,10 +807,32 @@ fn canonical_rdata(rdata: &RData<'_>) -> Result<Vec<u8>, DnssecError> {
         RData::AAAA(aaaa) => Ok(aaaa.address.to_be_bytes().to_vec()),
         RData::DNSKEY(dnskey) => Ok(dnskey_rdata(dnskey)),
         RData::DS(ds) => Ok(ds_rdata(ds)),
+        RData::NSEC(nsec) => Ok(nsec_rdata(nsec)),
+        // NSEC3 (type 50) is not modeled by `simple_dns`; it parses as an
+        // unknown record whose raw RDATA is already the canonical form.
+        RData::NULL(NSEC3_TYPE_CODE, null) => Ok(null.get_data().to_vec()),
         other => Err(e!(DnssecError::UnsupportedRecordType {
             type_code: u16::from(other.type_code()),
         })),
     }
+}
+
+/// Serializes NSEC RDATA into wire form (next owner name and the type bit maps).
+///
+/// The next owner name is emitted uncompressed and without downcasing, so the
+/// bytes reproduce what the zone signed (RFC 6840 section 5.1 no longer downcases
+/// names embedded in RDATA). The type bit map windows are emitted in ascending
+/// window order (RFC 4034 section 4.1.2).
+fn nsec_rdata(nsec: &NSEC<'_>) -> Vec<u8> {
+    let mut out = encode_name(nsec.next_name.as_bytes(), false);
+    let mut windows: Vec<&NsecTypeBitMap<'_>> = nsec.type_bit_maps.iter().collect();
+    windows.sort_by_key(|window| window.window_block);
+    for window in windows {
+        out.push(window.window_block);
+        out.push(window.bitmap.len() as u8);
+        out.extend_from_slice(&window.bitmap);
+    }
+    out
 }
 
 /// Serializes DNSKEY RDATA into wire form (flags, protocol, algorithm, key).
@@ -871,6 +957,619 @@ fn split_rsa_public_key(public_key: &[u8]) -> Result<(&[u8], &[u8]), DnssecError
     rest.split_at_checked(exp_len)
         .filter(|(_, modulus)| !modulus.is_empty())
         .ok_or_else(|| e!(DnssecError::InvalidKey))
+}
+
+// ============================================================================
+// Authenticated denial of existence (NSEC and NSEC3)
+// ============================================================================
+//
+// The proofs below take the denial records from a response's authority section
+// together with the trusted DNSKEY set of the zone that owns them, validate each
+// record's signature, and evaluate the RFC 4034, RFC 4035, and RFC 5155 denial
+// logic. The caller establishes the trusted keys through the chain of trust; the
+// proofs never treat an unvalidated or absent record as proof, so every failure
+// is fail-closed (Bogus). NSEC3 arrives as an unparsed record because
+// `simple_dns` does not model it, so its RDATA is parsed here per RFC 5155.
+
+/// The NSEC record type code (RFC 4034 section 4).
+const NSEC_TYPE_CODE: u16 = 47;
+/// The NSEC3 record type code (RFC 5155 section 3).
+const NSEC3_TYPE_CODE: u16 = 50;
+/// The NS record type code (RFC 1035).
+const NS_TYPE_CODE: u16 = 2;
+/// The SOA record type code (RFC 1035).
+const SOA_TYPE_CODE: u16 = 6;
+/// The CNAME record type code (RFC 1035).
+const CNAME_TYPE_CODE: u16 = 5;
+/// The DS record type code (RFC 4034 section 5).
+const DS_TYPE_CODE: u16 = 43;
+
+/// The NSEC3 Opt-Out flag (RFC 5155 section 3.1.2.1).
+///
+/// When set on an NSEC3 that covers a name, an unsigned (insecure) delegation may
+/// exist in the covered range without its own matching NSEC3.
+const NSEC3_FLAG_OPT_OUT: u8 = 0x01;
+
+/// The only defined NSEC3 hash algorithm, SHA-1 (RFC 5155 section 5).
+const NSEC3_HASH_SHA1: u8 = 1;
+
+/// The largest NSEC3 iteration count a proof will honor (RFC 9276).
+///
+/// RFC 9276 recommends treating a high iteration count as insecure rather than
+/// doing the work. A record above this cap cannot contribute to a proof and is
+/// skipped, so a response cannot force unbounded SHA-1 hashing. The cap matches
+/// the value hickory-dns and the `domain` crate use for the insecure threshold.
+const MAX_NSEC3_ITERATIONS: u16 = 100;
+
+/// A reason a denial-of-existence proof did not hold.
+///
+/// Every variant means the denial is not proven, so the caller stays fail-closed
+/// (Bogus). The proofs return success only when the denial is authenticated.
+#[allow(missing_docs)]
+#[stack_error(derive, add_meta, std_sources)]
+#[non_exhaustive]
+pub enum DenialError {
+    /// No validated NSEC or NSEC3 record establishes the denial.
+    #[error("no NSEC or NSEC3 record proves the denial")]
+    NoProof {},
+    /// A matching record shows the queried type is present, so it is not absent.
+    #[error("the queried type is present, so its absence is not proven")]
+    TypePresent {},
+    /// No validated record covers the queried name in the canonical ordering.
+    #[error("no NSEC or NSEC3 covers the queried name")]
+    NotCovered {},
+    /// A DS record is present at the delegation, so it is signed, not insecure.
+    #[error("the delegation carries a DS, so it is secure not insecure")]
+    SecureDelegation {},
+}
+
+/// A parsed NSEC3 record (RFC 5155 section 3).
+///
+/// `simple_dns` does not model NSEC3, so it surfaces as an unknown record whose
+/// RDATA this type parses. The `next_hashed_owner` and the owner name's first
+/// label are unpadded lowercase base32hex hashes over the canonical owner name.
+#[derive(Debug, Clone)]
+struct Nsec3 {
+    hash_algorithm: u8,
+    flags: u8,
+    iterations: u16,
+    salt: Vec<u8>,
+    next_hashed_owner: Vec<u8>,
+    /// The type bit map windows, each `(window_block, bitmap)` (RFC 4034 4.1.2).
+    type_bit_maps: Vec<(u8, Vec<u8>)>,
+}
+
+impl Nsec3 {
+    /// Parses NSEC3 RDATA (RFC 5155 section 3.2), returning `None` if truncated.
+    fn parse(rdata: &[u8]) -> Option<Self> {
+        let hash_algorithm = *rdata.first()?;
+        let flags = *rdata.get(1)?;
+        let iterations = u16::from_be_bytes([*rdata.get(2)?, *rdata.get(3)?]);
+        let salt_len = *rdata.get(4)? as usize;
+        let salt_end = 5 + salt_len;
+        let salt = rdata.get(5..salt_end)?.to_vec();
+        let hash_len = *rdata.get(salt_end)? as usize;
+        let hash_start = salt_end + 1;
+        let hash_end = hash_start + hash_len;
+        let next_hashed_owner = rdata.get(hash_start..hash_end)?.to_vec();
+
+        let mut type_bit_maps = Vec::new();
+        let mut rest = rdata.get(hash_end..)?;
+        while !rest.is_empty() {
+            let window = *rest.first()?;
+            let len = *rest.get(1)? as usize;
+            let bitmap = rest.get(2..2 + len)?.to_vec();
+            type_bit_maps.push((window, bitmap));
+            rest = rest.get(2 + len..)?;
+        }
+
+        Some(Self {
+            hash_algorithm,
+            flags,
+            iterations,
+            salt,
+            next_hashed_owner,
+            type_bit_maps,
+        })
+    }
+}
+
+/// Proves that `qname` exists but has no records of type `qtype` (NODATA).
+///
+/// A validated NSEC that matches `qname` with the `qtype` bit clear, or the NSEC3
+/// equivalent, proves the type is absent (RFC 4035 section 5.4, RFC 5155 section
+/// 8.5). A matching record that also carries a CNAME bit is rejected for any
+/// query other than CNAME, since a CNAME would answer through aliasing.
+///
+/// # Errors
+///
+/// Returns [`DenialError::TypePresent`] when a matching record shows `qtype` (or
+/// a CNAME) is present, and [`DenialError::NoProof`] when no validated record
+/// matches `qname`.
+pub fn prove_nodata(
+    qname: &Name<'_>,
+    qtype: u16,
+    authority: &[ResourceRecord<'_>],
+    keys: &[DNSKEY<'_>],
+) -> Result<(), DenialError> {
+    for (owner, nsec) in validated_nsecs(authority, keys) {
+        if canonical_name_cmp(&owner, qname) == Ordering::Equal {
+            return nodata_from_bits(|type_code| nsec_type_present(&nsec, type_code), qtype);
+        }
+    }
+    for (owner, nsec3) in validated_nsec3s(authority, keys) {
+        if nsec3_owner_matches(&owner, qname, &nsec3) {
+            return nodata_from_bits(|type_code| nsec3_type_present(&nsec3, type_code), qtype);
+        }
+    }
+    Err(e!(DenialError::NoProof))
+}
+
+/// Applies the NODATA type-bit rules given a way to test a type's presence.
+fn nodata_from_bits(present: impl Fn(u16) -> bool, qtype: u16) -> Result<(), DenialError> {
+    if present(qtype) {
+        return Err(e!(DenialError::TypePresent));
+    }
+    // A CNAME at the name answers any type through aliasing, so NODATA for a
+    // non-CNAME type is only valid when no CNAME is present (RFC 4035 5.4).
+    if qtype != CNAME_TYPE_CODE && present(CNAME_TYPE_CODE) {
+        return Err(e!(DenialError::TypePresent));
+    }
+    Ok(())
+}
+
+/// Proves that `qname` does not exist at all (NXDOMAIN).
+///
+/// For NSEC this requires a validated NSEC covering `qname` and a validated NSEC
+/// covering the wildcard at the closest encloser (RFC 4035 section 5.4). For
+/// NSEC3 this runs the closest-encloser proof: a match for the closest encloser,
+/// a record covering the next closer name, and a record covering the wildcard
+/// (RFC 5155 section 8.4).
+///
+/// # Errors
+///
+/// Returns [`DenialError::NotCovered`] when no record covers `qname`, and
+/// [`DenialError::NoProof`] when the wildcard or closest-encloser part is
+/// missing.
+pub fn prove_nxdomain(
+    qname: &Name<'_>,
+    authority: &[ResourceRecord<'_>],
+    keys: &[DNSKEY<'_>],
+) -> Result<(), DenialError> {
+    let nsecs = validated_nsecs(authority, keys);
+    if !nsecs.is_empty() {
+        let Some((owner, nsec)) = nsecs
+            .iter()
+            .find(|(owner, nsec)| nsec_covers(owner, &nsec.next_name, qname))
+        else {
+            return Err(e!(DenialError::NotCovered));
+        };
+        // The closest encloser is the deepest ancestor of `qname` that the
+        // covering NSEC proves to exist. Its wildcard must also be covered, or a
+        // wildcard could have synthesized the name.
+        let closest = closest_encloser(qname, owner, &nsec.next_name);
+        let wildcard = prepend_wildcard(&closest);
+        if nsecs
+            .iter()
+            .any(|(owner, nsec)| nsec_covers(owner, &nsec.next_name, &wildcard))
+        {
+            return Ok(());
+        }
+        return Err(e!(DenialError::NoProof));
+    }
+
+    prove_nxdomain_nsec3(qname, &validated_nsec3s(authority, keys))
+}
+
+/// Runs the NSEC3 closest-encloser proof for NXDOMAIN (RFC 5155 section 8.4).
+fn prove_nxdomain_nsec3(
+    qname: &Name<'_>,
+    nsec3s: &[(Name<'static>, Nsec3)],
+) -> Result<(), DenialError> {
+    let Some((_, first)) = nsec3s.first() else {
+        return Err(e!(DenialError::NoProof));
+    };
+    let salt = first.salt.clone();
+    let iterations = first.iterations;
+    let hash = |name: &Name<'_>| base32hex_encode(&nsec3_hash(name, &salt, iterations));
+
+    let labels = qname.as_bytes().count();
+    // Try each ancestor of `qname` as the closest encloser, deepest first.
+    for encloser_labels in (0..labels).rev() {
+        let encloser = suffix_name(qname, encloser_labels);
+        let encloser_hash = hash(&encloser);
+        let matched = nsec3s
+            .iter()
+            .any(|(owner, _)| nsec3_owner_hash(owner).as_deref() == Some(encloser_hash.as_str()));
+        if !matched {
+            continue;
+        }
+        let next_closer = suffix_name(qname, encloser_labels + 1);
+        if !nsec3s_cover(nsec3s, &hash(&next_closer)) {
+            continue;
+        }
+        let wildcard = prepend_wildcard(&encloser);
+        if nsec3s_cover(nsec3s, &hash(&wildcard)) {
+            return Ok(());
+        }
+    }
+    Err(e!(DenialError::NoProof))
+}
+
+/// Proves that the delegation at `child` is insecure: it has an NS record but no
+/// DS, so the child zone is unsigned (RFC 4035 section 5.2, RFC 5155 section 8.6).
+///
+/// For NSEC a matching record with the NS bit set, the DS bit clear, and the SOA
+/// bit clear proves the delegation is unsigned. For NSEC3 the same match works,
+/// and an Opt-Out record covering the name also proves it (RFC 5155 section 6).
+///
+/// # Errors
+///
+/// Returns [`DenialError::SecureDelegation`] when a matching record carries a DS,
+/// and [`DenialError::NoProof`] when nothing proves the delegation is insecure.
+pub fn prove_no_ds(
+    child: &Name<'_>,
+    authority: &[ResourceRecord<'_>],
+    keys: &[DNSKEY<'_>],
+) -> Result<(), DenialError> {
+    for (owner, nsec) in validated_nsecs(authority, keys) {
+        if canonical_name_cmp(&owner, child) == Ordering::Equal {
+            if nsec_type_present(&nsec, DS_TYPE_CODE) {
+                return Err(e!(DenialError::SecureDelegation));
+            }
+            if nsec_type_present(&nsec, NS_TYPE_CODE) && !nsec_type_present(&nsec, SOA_TYPE_CODE) {
+                return Ok(());
+            }
+        }
+    }
+
+    let nsec3s = validated_nsec3s(authority, keys);
+    for (owner, nsec3) in &nsec3s {
+        if nsec3_owner_matches(owner, child, nsec3) {
+            if nsec3_type_present(nsec3, DS_TYPE_CODE) {
+                return Err(e!(DenialError::SecureDelegation));
+            }
+            if nsec3_type_present(nsec3, NS_TYPE_CODE) && !nsec3_type_present(nsec3, SOA_TYPE_CODE)
+            {
+                return Ok(());
+            }
+        }
+    }
+    // Opt-Out: a covering NSEC3 with the flag set spans unsigned delegations.
+    let child_hash =
+        |nsec3: &Nsec3| base32hex_encode(&nsec3_hash(child, &nsec3.salt, nsec3.iterations));
+    for (owner, nsec3) in &nsec3s {
+        if nsec3.flags & NSEC3_FLAG_OPT_OUT == 0 {
+            continue;
+        }
+        if let Some(owner_hash) = nsec3_owner_hash(owner) {
+            let next_hash = base32hex_encode(&nsec3.next_hashed_owner);
+            if nsec3_covers(&owner_hash, &next_hash, &child_hash(nsec3)) {
+                return Ok(());
+            }
+        }
+    }
+    Err(e!(DenialError::NoProof))
+}
+
+/// Proves a wildcard-expanded answer for `qname` has no closer match.
+///
+/// The answer was synthesized from `*.<encloser>` where the encloser is the last
+/// `wildcard_labels` labels of `qname`. The proof shows the next closer name
+/// (`qname` truncated to `wildcard_labels + 1` labels) does not exist, so no name
+/// between the encloser and `qname` could have answered instead (RFC 4035 section
+/// 5.3.4, RFC 5155 section 8.8).
+///
+/// # Errors
+///
+/// Returns [`DenialError::NoProof`] when no validated record covers the next
+/// closer name.
+pub fn prove_wildcard(
+    qname: &Name<'_>,
+    wildcard_labels: u8,
+    authority: &[ResourceRecord<'_>],
+    keys: &[DNSKEY<'_>],
+) -> Result<(), DenialError> {
+    let qlabels = qname.as_bytes().count();
+    let next_closer_len = (wildcard_labels as usize).saturating_add(1);
+    if next_closer_len > qlabels {
+        return Err(e!(DenialError::NoProof));
+    }
+    let next_closer = suffix_name(qname, next_closer_len);
+
+    for (owner, nsec) in validated_nsecs(authority, keys) {
+        if nsec_covers(&owner, &nsec.next_name, &next_closer) {
+            return Ok(());
+        }
+    }
+    for (owner, nsec3) in validated_nsec3s(authority, keys) {
+        if let Some(owner_hash) = nsec3_owner_hash(&owner) {
+            let next_hash = base32hex_encode(&nsec3.next_hashed_owner);
+            let target = base32hex_encode(&nsec3_hash(&next_closer, &nsec3.salt, nsec3.iterations));
+            if nsec3_covers(&owner_hash, &next_hash, &target) {
+                return Ok(());
+            }
+        }
+    }
+    Err(e!(DenialError::NoProof))
+}
+
+/// Collects the validated NSEC records from an authority section.
+///
+/// Each NSEC is kept only if one of the RRSIGs over it, in the same section,
+/// verifies under `keys`. That ties the record to the zone whose keys are
+/// trusted, so a record from an unrelated zone cannot slip in.
+fn validated_nsecs<'a>(
+    authority: &'a [ResourceRecord<'a>],
+    keys: &[DNSKEY<'_>],
+) -> Vec<(Name<'static>, NSEC<'static>)> {
+    let mut out = Vec::new();
+    for rr in authority {
+        let RData::NSEC(nsec) = &rr.rdata else {
+            continue;
+        };
+        let records = [rr.clone()];
+        if authority_rrset_signed(&records, &rr.name, NSEC_TYPE_CODE, authority, keys) {
+            out.push((rr.name.clone().into_owned(), nsec.clone().into_owned()));
+        }
+    }
+    out
+}
+
+/// Collects the validated NSEC3 records from an authority section.
+///
+/// Records whose hash algorithm is not SHA-1 or whose iteration count exceeds
+/// [`MAX_NSEC3_ITERATIONS`] are dropped, and each survivor must carry a valid
+/// signature under `keys`.
+fn validated_nsec3s<'a>(
+    authority: &'a [ResourceRecord<'a>],
+    keys: &[DNSKEY<'_>],
+) -> Vec<(Name<'static>, Nsec3)> {
+    let mut out = Vec::new();
+    for rr in authority {
+        let RData::NULL(NSEC3_TYPE_CODE, null) = &rr.rdata else {
+            continue;
+        };
+        let Some(nsec3) = Nsec3::parse(null.get_data()) else {
+            continue;
+        };
+        if nsec3.hash_algorithm != NSEC3_HASH_SHA1 || nsec3.iterations > MAX_NSEC3_ITERATIONS {
+            continue;
+        }
+        let records = [rr.clone()];
+        if authority_rrset_signed(&records, &rr.name, NSEC3_TYPE_CODE, authority, keys) {
+            out.push((rr.name.clone().into_owned(), nsec3));
+        }
+    }
+    out
+}
+
+/// Returns whether one of the RRSIGs over `records` in `authority` verifies.
+///
+/// Matches every RRSIG that covers `type_covered` and shares `owner` against each
+/// key whose tag and algorithm fit, capping the number of signature checks at
+/// [`MAX_SIGNATURE_CHECKS`] to bound the work a response can force.
+fn authority_rrset_signed(
+    records: &[ResourceRecord<'_>],
+    owner: &Name<'_>,
+    type_covered: u16,
+    authority: &[ResourceRecord<'_>],
+    keys: &[DNSKEY<'_>],
+) -> bool {
+    let mut checks = 0usize;
+    for rr in authority {
+        let RData::RRSIG(sig) = &rr.rdata else {
+            continue;
+        };
+        if rr.name != *owner || sig.type_covered != type_covered {
+            continue;
+        }
+        for key in keys {
+            if key.algorithm == sig.algorithm && key_tag(key) == sig.key_tag {
+                if verify_rrsig(sig, records, key).is_ok() {
+                    return true;
+                }
+                checks += 1;
+                if checks >= MAX_SIGNATURE_CHECKS {
+                    return false;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Returns whether any NSEC3 in `nsec3s` covers the hash `target`.
+fn nsec3s_cover(nsec3s: &[(Name<'static>, Nsec3)], target: &str) -> bool {
+    nsec3s.iter().any(|(owner, nsec3)| {
+        nsec3_owner_hash(owner).is_some_and(|owner_hash| {
+            let next_hash = base32hex_encode(&nsec3.next_hashed_owner);
+            nsec3_covers(&owner_hash, &next_hash, target)
+        })
+    })
+}
+
+/// Returns whether an NSEC3 owner matches the hash of `name`.
+fn nsec3_owner_matches(owner: &Name<'_>, name: &Name<'_>, nsec3: &Nsec3) -> bool {
+    let target = base32hex_encode(&nsec3_hash(name, &nsec3.salt, nsec3.iterations));
+    nsec3_owner_hash(owner).as_deref() == Some(target.as_str())
+}
+
+/// Returns the NSEC3 owner hash: the lowercase first label of the owner name.
+fn nsec3_owner_hash(owner: &Name<'_>) -> Option<String> {
+    owner
+        .as_bytes()
+        .next()
+        .map(|label| String::from_utf8_lossy(&label.to_ascii_lowercase()).into_owned())
+}
+
+/// Compares two domain names in canonical DNS order (RFC 4034 section 6.1).
+///
+/// Names sort by their labels from the least significant (rightmost) first, each
+/// label compared as a left-justified case-insensitive octet sequence. A name
+/// with fewer labels sorts before a longer name that shares its suffix.
+fn canonical_name_cmp(a: &Name<'_>, b: &Name<'_>) -> Ordering {
+    let a_labels: Vec<Vec<u8>> = a.as_bytes().map(<[u8]>::to_ascii_lowercase).collect();
+    let b_labels: Vec<Vec<u8>> = b.as_bytes().map(<[u8]>::to_ascii_lowercase).collect();
+    for (label_a, label_b) in a_labels.iter().rev().zip(b_labels.iter().rev()) {
+        match label_a.cmp(label_b) {
+            Ordering::Equal => {}
+            ordering => return ordering,
+        }
+    }
+    a_labels.len().cmp(&b_labels.len())
+}
+
+/// Returns whether the NSEC gap `(owner, next)` covers `target`.
+///
+/// `target` is covered when it sorts strictly after `owner` and strictly before
+/// `next`. The last NSEC in a zone wraps: its `next` is the apex, which sorts
+/// first, so a name after `owner` or before `next` is covered.
+fn nsec_covers(owner: &Name<'_>, next: &Name<'_>, target: &Name<'_>) -> bool {
+    if canonical_name_cmp(owner, next) == Ordering::Less {
+        canonical_name_cmp(owner, target) == Ordering::Less
+            && canonical_name_cmp(target, next) == Ordering::Less
+    } else {
+        canonical_name_cmp(owner, target) == Ordering::Less
+            || canonical_name_cmp(target, next) == Ordering::Less
+    }
+}
+
+/// Returns whether the NSEC3 hash gap `(owner_hash, next_hash)` covers `target`.
+///
+/// The hashes are order-preserving base32hex strings, so string comparison
+/// matches the canonical hashed-owner order. The last NSEC3 wraps like NSEC.
+fn nsec3_covers(owner_hash: &str, next_hash: &str, target: &str) -> bool {
+    if owner_hash < next_hash {
+        owner_hash < target && target < next_hash
+    } else {
+        owner_hash < target || target < next_hash
+    }
+}
+
+/// Returns the closest encloser of `qname` implied by a covering NSEC.
+///
+/// The closest encloser is the deepest ancestor of `qname` shown to exist by the
+/// covering NSEC. It is the longer of the ancestors that `qname` shares with the
+/// NSEC's owner name and with its next name (RFC 4035 section 5.3.2).
+fn closest_encloser(qname: &Name<'_>, owner: &Name<'_>, next: &Name<'_>) -> Name<'static> {
+    let by_owner = common_suffix_len(qname, owner);
+    let by_next = common_suffix_len(qname, next);
+    suffix_name(qname, by_owner.max(by_next))
+}
+
+/// Returns the number of trailing labels `a` and `b` share (case-insensitive).
+fn common_suffix_len(a: &Name<'_>, b: &Name<'_>) -> usize {
+    let a_labels: Vec<Vec<u8>> = a.as_bytes().map(<[u8]>::to_ascii_lowercase).collect();
+    let b_labels: Vec<Vec<u8>> = b.as_bytes().map(<[u8]>::to_ascii_lowercase).collect();
+    a_labels
+        .iter()
+        .rev()
+        .zip(b_labels.iter().rev())
+        .take_while(|(label_a, label_b)| label_a == label_b)
+        .count()
+}
+
+/// Returns the name formed by the last `keep` labels of `name`.
+///
+/// A `keep` of zero yields the root. Used to derive an ancestor (closest
+/// encloser or next closer) of a queried name.
+fn suffix_name(name: &Name<'_>, keep: usize) -> Name<'static> {
+    let labels: Vec<String> = name
+        .as_bytes()
+        .map(|label| String::from_utf8_lossy(label).into_owned())
+        .collect();
+    let start = labels.len().saturating_sub(keep);
+    Name::new_unchecked(&labels[start..].join(".")).into_owned()
+}
+
+/// Returns `name` with a leading `*` wildcard label.
+fn prepend_wildcard(name: &Name<'_>) -> Name<'static> {
+    let base = name.to_string();
+    let wildcard = if base.is_empty() {
+        "*".to_string()
+    } else {
+        format!("*.{base}")
+    };
+    Name::new_unchecked(&wildcard).into_owned()
+}
+
+/// Computes the NSEC3 hash of `name` (RFC 5155 section 5).
+///
+/// The hash is `iterations` extra rounds of SHA-1 over the previous digest and
+/// the salt, starting from the canonical (lowercased) wire form of `name` and the
+/// salt.
+fn nsec3_hash(name: &Name<'_>, salt: &[u8], iterations: u16) -> Vec<u8> {
+    let mut input = encode_name(name.as_bytes(), true);
+    input.extend_from_slice(salt);
+    let mut digest = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &input);
+    for _ in 0..iterations {
+        let mut next = digest.as_ref().to_vec();
+        next.extend_from_slice(salt);
+        digest = digest::digest(&digest::SHA1_FOR_LEGACY_USE_ONLY, &next);
+    }
+    digest.as_ref().to_vec()
+}
+
+/// Encodes bytes as unpadded lowercase base32hex (RFC 4648 section 7).
+fn base32hex_encode(data: &[u8]) -> String {
+    const ALPHABET: &[u8; 32] = b"0123456789abcdefghijklmnopqrstuv";
+    let mut out = String::with_capacity(data.len() * 8 / 5 + 1);
+    let mut buffer = 0u32;
+    let mut bits = 0u32;
+    for &byte in data {
+        buffer = (buffer << 8) | u32::from(byte);
+        bits += 8;
+        while bits >= 5 {
+            bits -= 5;
+            out.push(ALPHABET[((buffer >> bits) & 0x1f) as usize] as char);
+        }
+    }
+    if bits > 0 {
+        out.push(ALPHABET[((buffer << (5 - bits)) & 0x1f) as usize] as char);
+    }
+    out
+}
+
+/// Returns whether the NSEC type bit map marks `type_code` as present.
+fn nsec_type_present(nsec: &NSEC<'_>, type_code: u16) -> bool {
+    type_bit_present(
+        nsec.type_bit_maps
+            .iter()
+            .map(|window| (window.window_block, window.bitmap.as_ref())),
+        type_code,
+    )
+}
+
+/// Returns whether the NSEC3 type bit map marks `type_code` as present.
+fn nsec3_type_present(nsec3: &Nsec3, type_code: u16) -> bool {
+    type_bit_present(
+        nsec3
+            .type_bit_maps
+            .iter()
+            .map(|(window, bitmap)| (*window, bitmap.as_slice())),
+        type_code,
+    )
+}
+
+/// Returns whether a type bit map has the bit for `type_code` set.
+///
+/// The type is located by its high octet (the window block) and its low octet
+/// (the bit offset within the window), most significant bit first (RFC 4034
+/// section 4.1.2).
+fn type_bit_present<'a>(windows: impl Iterator<Item = (u8, &'a [u8])>, type_code: u16) -> bool {
+    let target_window = (type_code >> 8) as u8;
+    let offset = (type_code & 0xff) as usize;
+    let byte_index = offset / 8;
+    let bit = 7 - (offset % 8);
+    for (window, bitmap) in windows {
+        if window == target_window {
+            return bitmap
+                .get(byte_index)
+                .is_some_and(|byte| byte & (1 << bit) != 0);
+        }
+    }
+    false
 }
 
 #[cfg(test)]
@@ -1697,6 +2396,543 @@ mod tests {
                 assert_eq!(ds.digest_type, 2);
                 assert_eq!(ds.digest.len(), 32);
             }
+        }
+    }
+
+    mod denial {
+        use simple_dns::rdata::NSEC;
+
+        use super::*;
+
+        /// Type codes the denial tests set in NSEC and NSEC3 bit maps.
+        const A: u16 = 1;
+        const AAAA: u16 = 28;
+        const NS: u16 = 2;
+        const SOA: u16 = 6;
+        const DS: u16 = 43;
+        const RRSIG_BIT: u16 = 46;
+        const NSEC_BIT: u16 = 47;
+
+        fn now() -> u32 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as u32
+        }
+
+        fn label_count(name: &str) -> u8 {
+            name.split('.').filter(|label| !label.is_empty()).count() as u8
+        }
+
+        /// A single-key ECDSA P-256 zone that can sign denial records.
+        struct Signer {
+            key_pair: EcdsaKeyPair,
+            dnskey: DNSKEY<'static>,
+        }
+
+        impl Signer {
+            fn new() -> Self {
+                let rng = SystemRandom::new();
+                let pkcs8 =
+                    EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+                let key_pair = EcdsaKeyPair::from_pkcs8(
+                    &ECDSA_P256_SHA256_FIXED_SIGNING,
+                    pkcs8.as_ref(),
+                    &rng,
+                )
+                .unwrap();
+                let public_key = key_pair.public_key().as_ref()[1..].to_vec();
+                let dnskey = DNSKEY {
+                    flags: 257,
+                    protocol: 3,
+                    algorithm: 13,
+                    public_key: Cow::Owned(public_key),
+                };
+                Self { key_pair, dnskey }
+            }
+
+            fn keys(&self) -> Vec<DNSKEY<'static>> {
+                vec![self.dnskey.clone()]
+            }
+
+            /// Signs `records` and returns the RRSIG resource record over them.
+            fn sign(
+                &self,
+                records: &[ResourceRecord<'static>],
+                type_covered: u16,
+                owner: &str,
+                signer: &str,
+            ) -> ResourceRecord<'static> {
+                let rng = SystemRandom::new();
+                let now = now();
+                let mut rrsig = RRSIG {
+                    type_covered,
+                    algorithm: 13,
+                    labels: label_count(owner),
+                    original_ttl: 3600,
+                    signature_expiration: now + 3600,
+                    signature_inception: now - 3600,
+                    key_tag: key_tag(&self.dnskey),
+                    signer_name: Name::new_unchecked(signer).into_owned(),
+                    signature: Cow::Owned(Vec::new()),
+                };
+                let signed = signed_data(&rrsig, records).unwrap();
+                let sig = self.key_pair.sign(&rng, &signed).unwrap();
+                rrsig.signature = Cow::Owned(sig.as_ref().to_vec());
+                ResourceRecord::new(
+                    Name::new_unchecked(owner).into_owned(),
+                    CLASS::IN,
+                    3600,
+                    RData::RRSIG(rrsig),
+                )
+            }
+        }
+
+        /// Builds a single-window (types below 256) type bit map.
+        fn bitmap(types: &[u16]) -> Vec<u8> {
+            let max = types.iter().copied().max().unwrap_or(0) as usize;
+            let mut bytes = vec![0u8; max / 8 + 1];
+            for &type_code in types {
+                let offset = (type_code & 0xff) as usize;
+                bytes[offset / 8] |= 1 << (7 - (offset % 8));
+            }
+            bytes
+        }
+
+        /// An NSEC resource record for `owner` pointing at `next` with `types`.
+        fn nsec_rr(owner: &str, next: &str, types: &[u16]) -> ResourceRecord<'static> {
+            let nsec = NSEC {
+                next_name: Name::new_unchecked(next).into_owned(),
+                type_bit_maps: vec![NsecTypeBitMap {
+                    window_block: 0,
+                    bitmap: Cow::Owned(bitmap(types)),
+                }],
+            };
+            ResourceRecord::new(
+                Name::new_unchecked(owner).into_owned(),
+                CLASS::IN,
+                3600,
+                RData::NSEC(nsec),
+            )
+        }
+
+        /// Raw NSEC3 RDATA with salt `aabbccdd` and 12 iterations (RFC 5155 B).
+        fn nsec3_rdata(flags: u8, next_hash: &[u8], types: &[u16]) -> Vec<u8> {
+            let salt = [0xaa, 0xbb, 0xcc, 0xdd];
+            let mut out = vec![1u8, flags];
+            out.extend_from_slice(&12u16.to_be_bytes());
+            out.push(salt.len() as u8);
+            out.extend_from_slice(&salt);
+            out.push(next_hash.len() as u8);
+            out.extend_from_slice(next_hash);
+            let bits = bitmap(types);
+            out.push(0);
+            out.push(bits.len() as u8);
+            out.extend_from_slice(&bits);
+            out
+        }
+
+        /// An NSEC3 resource record whose owner is `owner_hash` under `zone`.
+        fn nsec3_rr(
+            zone: &str,
+            owner_hash: &str,
+            flags: u8,
+            next_hash: &[u8],
+            types: &[u16],
+        ) -> ResourceRecord<'static> {
+            let owner = format!("{owner_hash}.{zone}");
+            let rdata = nsec3_rdata(flags, next_hash, types);
+            ResourceRecord::new(
+                Name::new_unchecked(&owner).into_owned(),
+                CLASS::IN,
+                3600,
+                RData::NULL(
+                    NSEC3_TYPE_CODE,
+                    simple_dns::rdata::NULL::new(&rdata).unwrap().into_owned(),
+                ),
+            )
+        }
+
+        /// The base32hex hash of `name` with the RFC 5155 Appendix B parameters.
+        fn hash(name: &str) -> String {
+            base32hex_encode(&nsec3_hash(
+                &Name::new_unchecked(name),
+                &[0xaa, 0xbb, 0xcc, 0xdd],
+                12,
+            ))
+        }
+
+        #[test]
+        fn nsec3_hash_matches_rfc5155_appendix_b() {
+            // Known-answer vectors from RFC 5155 Appendix B (salt aabbccdd, 12
+            // iterations, SHA-1).
+            let cases = [
+                ("example", "0p9mhaveqvm6t7vbl5lop2u3t2rp3tom"),
+                ("a.example", "35mthgpgcu1qg68fab165klnsnk3dpvl"),
+                ("ns1.example", "2t7b4g4vsa5smi47k61mv5bv1a22bojr"),
+                ("*.w.example", "r53bq7cc2uvmubfu5ocmm6pers9tk9en"),
+                (
+                    "2t7b4g4vsa5smi47k61mv5bv1a22bojr.example",
+                    "kohar7mbb8dc2ce8a9qvl8hon4k53uhi",
+                ),
+            ];
+            for (name, expected) in cases {
+                assert_eq!(hash(name), expected, "hash mismatch for {name}");
+            }
+        }
+
+        #[test]
+        fn base32hex_encode_matches_rfc4648() {
+            assert_eq!(base32hex_encode(b""), "");
+            assert_eq!(base32hex_encode(b"f"), "co");
+            assert_eq!(base32hex_encode(b"foobar"), "cpnmuoj1e8");
+        }
+
+        #[test]
+        fn canonical_name_cmp_orders_by_rightmost_label() {
+            let cmp = |a: &str, b: &str| {
+                canonical_name_cmp(&Name::new_unchecked(a), &Name::new_unchecked(b))
+            };
+            // A shorter name sorts before a longer one sharing its suffix.
+            assert_eq!(cmp("example.com", "a.example.com"), Ordering::Less);
+            // Comparison is by the rightmost label first, so the TLD dominates.
+            assert_eq!(cmp("z.example.com", "a.example.org"), Ordering::Less);
+            // The wildcard label sorts before ordinary labels.
+            assert_eq!(cmp("*.example.com", "a.example.com"), Ordering::Less);
+            // Case does not matter.
+            assert_eq!(cmp("Example.COM", "example.com"), Ordering::Equal);
+        }
+
+        #[test]
+        fn nsec_covers_handles_the_apex_wrap() {
+            let covers = |owner: &str, next: &str, target: &str| {
+                nsec_covers(
+                    &Name::new_unchecked(owner),
+                    &Name::new_unchecked(next),
+                    &Name::new_unchecked(target),
+                )
+            };
+            assert!(covers("a.example.com", "c.example.com", "b.example.com"));
+            assert!(!covers("a.example.com", "c.example.com", "d.example.com"));
+            // The last NSEC wraps back to the apex: names after the last owner are
+            // covered even though the next name sorts earlier.
+            assert!(covers("z.example.com", "example.com", "zz.example.com"));
+        }
+
+        #[test]
+        fn nodata_nsec_proves_absent_type() {
+            let signer = Signer::new();
+            let nsec = nsec_rr(
+                "host.example.com",
+                "z.example.com",
+                &[AAAA, RRSIG_BIT, NSEC_BIT],
+            );
+            let rrsig = signer.sign(
+                std::slice::from_ref(&nsec),
+                NSEC_BIT,
+                "host.example.com",
+                "example.com",
+            );
+            let authority = vec![nsec, rrsig];
+            let qname = Name::new_unchecked("host.example.com");
+            assert!(prove_nodata(&qname, A, &authority, &signer.keys()).is_ok());
+        }
+
+        #[test]
+        fn nodata_nsec_rejects_present_type() {
+            let signer = Signer::new();
+            // The bit map now lists A, so A is not absent.
+            let nsec = nsec_rr(
+                "host.example.com",
+                "z.example.com",
+                &[A, AAAA, RRSIG_BIT, NSEC_BIT],
+            );
+            let rrsig = signer.sign(
+                std::slice::from_ref(&nsec),
+                NSEC_BIT,
+                "host.example.com",
+                "example.com",
+            );
+            let authority = vec![nsec, rrsig];
+            let qname = Name::new_unchecked("host.example.com");
+            assert!(matches!(
+                prove_nodata(&qname, A, &authority, &signer.keys()),
+                Err(DenialError::TypePresent { .. })
+            ));
+        }
+
+        #[test]
+        fn nodata_nsec_fails_closed_without_signature() {
+            let signer = Signer::new();
+            let nsec = nsec_rr(
+                "host.example.com",
+                "z.example.com",
+                &[AAAA, RRSIG_BIT, NSEC_BIT],
+            );
+            // No RRSIG accompanies the NSEC, so nothing is validated.
+            let authority = vec![nsec];
+            let qname = Name::new_unchecked("host.example.com");
+            assert!(matches!(
+                prove_nodata(&qname, A, &authority, &signer.keys()),
+                Err(DenialError::NoProof { .. })
+            ));
+        }
+
+        #[test]
+        fn nodata_nsec_fails_closed_under_wrong_key() {
+            let signer = Signer::new();
+            let stranger = Signer::new();
+            let nsec = nsec_rr(
+                "host.example.com",
+                "z.example.com",
+                &[AAAA, RRSIG_BIT, NSEC_BIT],
+            );
+            let rrsig = signer.sign(
+                std::slice::from_ref(&nsec),
+                NSEC_BIT,
+                "host.example.com",
+                "example.com",
+            );
+            let authority = vec![nsec, rrsig];
+            let qname = Name::new_unchecked("host.example.com");
+            // Validated against an unrelated zone's key, the NSEC does not verify.
+            assert!(matches!(
+                prove_nodata(&qname, A, &authority, &stranger.keys()),
+                Err(DenialError::NoProof { .. })
+            ));
+        }
+
+        #[test]
+        fn nxdomain_nsec_covers_name_and_wildcard() {
+            let signer = Signer::new();
+            // One NSEC from the apex to z.example.com covers both nx.example.com
+            // and the wildcard *.example.com.
+            let nsec = nsec_rr(
+                "example.com",
+                "z.example.com",
+                &[A, SOA, NS, RRSIG_BIT, NSEC_BIT],
+            );
+            let rrsig = signer.sign(
+                std::slice::from_ref(&nsec),
+                NSEC_BIT,
+                "example.com",
+                "example.com",
+            );
+            let authority = vec![nsec, rrsig];
+            let qname = Name::new_unchecked("nx.example.com");
+            assert!(prove_nxdomain(&qname, &authority, &signer.keys()).is_ok());
+        }
+
+        #[test]
+        fn nxdomain_nsec_rejects_uncovered_name() {
+            let signer = Signer::new();
+            // The gap ends before nx.example.com, so it does not cover the name.
+            let nsec = nsec_rr(
+                "example.com",
+                "a.example.com",
+                &[A, SOA, NS, RRSIG_BIT, NSEC_BIT],
+            );
+            let rrsig = signer.sign(
+                std::slice::from_ref(&nsec),
+                NSEC_BIT,
+                "example.com",
+                "example.com",
+            );
+            let authority = vec![nsec, rrsig];
+            let qname = Name::new_unchecked("nx.example.com");
+            assert!(matches!(
+                prove_nxdomain(&qname, &authority, &signer.keys()),
+                Err(DenialError::NotCovered { .. })
+            ));
+        }
+
+        #[test]
+        fn no_ds_nsec_proves_insecure_delegation() {
+            let parent = Signer::new();
+            // The child has an NS record but no DS: an insecure delegation.
+            let nsec = nsec_rr(
+                "sub.example.com",
+                "z.example.com",
+                &[NS, RRSIG_BIT, NSEC_BIT],
+            );
+            let rrsig = parent.sign(
+                std::slice::from_ref(&nsec),
+                NSEC_BIT,
+                "sub.example.com",
+                "example.com",
+            );
+            let authority = vec![nsec, rrsig];
+            let child = Name::new_unchecked("sub.example.com");
+            assert!(prove_no_ds(&child, &authority, &parent.keys()).is_ok());
+        }
+
+        #[test]
+        fn no_ds_nsec_rejects_present_ds() {
+            let parent = Signer::new();
+            // A DS bit means the delegation is signed, not insecure.
+            let nsec = nsec_rr(
+                "sub.example.com",
+                "z.example.com",
+                &[NS, DS, RRSIG_BIT, NSEC_BIT],
+            );
+            let rrsig = parent.sign(
+                std::slice::from_ref(&nsec),
+                NSEC_BIT,
+                "sub.example.com",
+                "example.com",
+            );
+            let authority = vec![nsec, rrsig];
+            let child = Name::new_unchecked("sub.example.com");
+            assert!(matches!(
+                prove_no_ds(&child, &authority, &parent.keys()),
+                Err(DenialError::SecureDelegation { .. })
+            ));
+        }
+
+        #[test]
+        fn wildcard_nsec_proves_no_closer_match() {
+            let signer = Signer::new();
+            // The answer came from *.example.com (2 labels). The next closer name
+            // is host.example.com, which this NSEC covers.
+            let nsec = nsec_rr(
+                "example.com",
+                "z.example.com",
+                &[A, SOA, NS, RRSIG_BIT, NSEC_BIT],
+            );
+            let rrsig = signer.sign(
+                std::slice::from_ref(&nsec),
+                NSEC_BIT,
+                "example.com",
+                "example.com",
+            );
+            let authority = vec![nsec, rrsig];
+            let qname = Name::new_unchecked("host.example.com");
+            assert!(prove_wildcard(&qname, 2, &authority, &signer.keys()).is_ok());
+        }
+
+        #[test]
+        fn wildcard_nsec_rejects_uncovered_next_closer() {
+            let signer = Signer::new();
+            // This NSEC does not cover host.example.com, so no closer-match proof.
+            let nsec = nsec_rr("z.example.com", "zz.example.com", &[A, RRSIG_BIT, NSEC_BIT]);
+            let rrsig = signer.sign(
+                std::slice::from_ref(&nsec),
+                NSEC_BIT,
+                "z.example.com",
+                "example.com",
+            );
+            let authority = vec![nsec, rrsig];
+            let qname = Name::new_unchecked("host.example.com");
+            assert!(matches!(
+                prove_wildcard(&qname, 2, &authority, &signer.keys()),
+                Err(DenialError::NoProof { .. })
+            ));
+        }
+
+        #[test]
+        fn nodata_nsec3_matches_hashed_owner() {
+            let signer = Signer::new();
+            let owner_hash = hash("a.example");
+            let next = nsec3_hash(
+                &Name::new_unchecked("z.example"),
+                &[0xaa, 0xbb, 0xcc, 0xdd],
+                12,
+            );
+            let nsec3 = nsec3_rr("example", &owner_hash, 0, &next, &[AAAA, RRSIG_BIT]);
+            let owner = format!("{owner_hash}.example");
+            let rrsig = signer.sign(
+                std::slice::from_ref(&nsec3),
+                NSEC3_TYPE_CODE,
+                &owner,
+                "example",
+            );
+            let authority = vec![nsec3, rrsig];
+            let qname = Name::new_unchecked("a.example");
+            assert!(prove_nodata(&qname, A, &authority, &signer.keys()).is_ok());
+        }
+
+        #[test]
+        fn no_ds_nsec3_optout_proves_insecure_delegation() {
+            let parent = Signer::new();
+            let child = Name::new_unchecked("sub.example");
+            let target = hash("sub.example");
+            // An Opt-Out NSEC3 whose gap covers the child hash proves the child is
+            // an unsigned delegation (RFC 5155 section 6). Bound the gap around it.
+            let owner_hash = "0".repeat(target.len());
+            let next = [0xffu8; 20];
+            let nsec3 = nsec3_rr("example", &owner_hash, NSEC3_FLAG_OPT_OUT, &next, &[NS]);
+            let owner = format!("{owner_hash}.example");
+            let rrsig = parent.sign(
+                std::slice::from_ref(&nsec3),
+                NSEC3_TYPE_CODE,
+                &owner,
+                "example",
+            );
+            let authority = vec![nsec3, rrsig];
+            assert!(target.as_str() > owner_hash.as_str());
+            assert!(prove_no_ds(&child, &authority, &parent.keys()).is_ok());
+        }
+
+        #[test]
+        fn nxdomain_nsec3_closest_encloser_proof() {
+            let signer = Signer::new();
+            // Prove x.a.example does not exist: a.example is the closest encloser,
+            // x.a.example is the next closer, and *.a.example is the wildcard.
+            let all_high = [0xffu8; 20];
+            let low = "0".repeat(32);
+
+            // Matches the closest encloser a.example.
+            let encloser_hash = hash("a.example");
+            let matcher = nsec3_rr("example", &encloser_hash, 0, &all_high, &[A, NS]);
+            let matcher_owner = format!("{encloser_hash}.example");
+            let matcher_sig = signer.sign(
+                std::slice::from_ref(&matcher),
+                NSEC3_TYPE_CODE,
+                &matcher_owner,
+                "example",
+            );
+
+            // A wide gap that covers both the next closer and the wildcard hashes.
+            let cover = nsec3_rr("example", &low, 0, &all_high, &[]);
+            let cover_owner = format!("{low}.example");
+            let cover_sig = signer.sign(
+                std::slice::from_ref(&cover),
+                NSEC3_TYPE_CODE,
+                &cover_owner,
+                "example",
+            );
+
+            let authority = vec![matcher, matcher_sig, cover, cover_sig];
+            let qname = Name::new_unchecked("x.a.example");
+            assert!(prove_nxdomain(&qname, &authority, &signer.keys()).is_ok());
+        }
+
+        #[test]
+        fn nsec3_iteration_cap_is_enforced() {
+            // A record above the iteration cap is skipped, so no proof survives.
+            let signer = Signer::new();
+            let mut rdata = nsec3_rdata(0, &[0u8; 20], &[AAAA]);
+            // Overwrite the iteration field (bytes 2..4) with a value above the cap.
+            rdata[2..4].copy_from_slice(&(MAX_NSEC3_ITERATIONS + 1).to_be_bytes());
+            let owner = format!("{}.example", hash("a.example"));
+            let record = ResourceRecord::new(
+                Name::new_unchecked(&owner).into_owned(),
+                CLASS::IN,
+                3600,
+                RData::NULL(
+                    NSEC3_TYPE_CODE,
+                    simple_dns::rdata::NULL::new(&rdata).unwrap().into_owned(),
+                ),
+            );
+            let rrsig = signer.sign(
+                std::slice::from_ref(&record),
+                NSEC3_TYPE_CODE,
+                &owner,
+                "example",
+            );
+            let authority = vec![record, rrsig];
+            let qname = Name::new_unchecked("a.example");
+            assert!(prove_nodata(&qname, A, &authority, &signer.keys()).is_err());
         }
     }
 

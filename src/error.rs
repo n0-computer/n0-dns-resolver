@@ -35,10 +35,10 @@ pub enum Error {
     /// DNSSEC validation determined the answer is Bogus, so it was rejected.
     ///
     /// Only returned when the resolver was built with
-    /// [`crate::Builder::validate_dnssec`]. Because the validator is fail-closed
-    /// and does not implement NSEC or NSEC3, an unsigned name or a negative
-    /// answer is reported as Bogus rather than proven insecure. The `source`
-    /// carries the specific chain failure.
+    /// [`crate::Builder::validate_dnssec`]. The validator is fail-closed: a
+    /// negative answer, or a delegation whose missing DS cannot be proven absent,
+    /// is reported as Bogus rather than passed through. The `source` carries the
+    /// specific chain or proof failure.
     #[cfg(feature = "dnssec")]
     #[error("DNSSEC validation failed: answer is bogus")]
     DnssecBogus { source: AnyError },

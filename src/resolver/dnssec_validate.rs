@@ -2,15 +2,20 @@
 //!
 //! [`SimpleDnsResolver::validate_answer`] is the entry point the lookup path
 //! calls when [`crate::Builder::validate_dnssec`] is set. It extracts the answer
-//! RRset and its RRSIG, fetches the signing zone's DNSKEY RRset and the DS chain
-//! up to the root, and hands the assembled [`ChainOfTrust`] to [`verify_chain`].
+//! RRset and its RRSIG, then walks the chain of trust from the embedded root
+//! anchors down to the signing zone, fetching each zone's DNSKEY RRset and the
+//! delegating DS along the way.
 //!
 //! Validation is fail-closed. An answer with no RRSIG, a zone with no fetchable
 //! DNSKEY or DS RRset, or a chain that does not validate all map to
-//! [`crate::Error::DnssecBogus`]. Denial of existence (NSEC and NSEC3) is not
-//! implemented, so unsigned names and negative answers are rejected rather than
-//! proven, which is the intended fail-closed behavior. Only the final answer
-//! RRset is validated; CNAME hops are followed but not individually checked.
+//! [`crate::Error::DnssecBogus`]. Two cases lean on the denial-of-existence
+//! proofs. A wildcard-expanded answer validates only when the authority section
+//! proves no closer match exists. A delegation with no DS is accepted as
+//! Insecure (unsigned) when the authority section proves the DS is truly absent,
+//! rather than being rejected. Only the final answer RRset is validated; CNAME
+//! hops are followed but not individually checked. Authenticating a bare
+//! NODATA or NXDOMAIN answer is not yet wired: the resolver validates positive
+//! answers, so a negative answer still fails closed rather than being proven.
 
 use n0_error::{AnyError, e, stack_error};
 use simple_dns::{
@@ -23,8 +28,9 @@ use super::SimpleDnsResolver;
 use crate::{
     Error,
     dnssec::{
-        ChainError, ChainOfTrust, DelegatedZone, ResourceRecord, SignedRrset, build_dnssec_query,
-        verify_chain,
+        ChainError, DelegatedZone, DenialError, ROOT_TRUST_ANCHORS, ResourceRecord, SignedRrset,
+        build_dnssec_query, descend_zone, prove_no_ds, prove_wildcard, trust_root,
+        verify_rrset_with_keys,
     },
 };
 
@@ -41,10 +47,10 @@ enum ValidateError {
     /// of it, so the signing zone is not authoritative for the answer.
     #[error("RRSIG signer {signer} is not authoritative for {owner}")]
     SignerNotAuthoritative { signer: String, owner: String },
-    /// The answer was synthesized from a wildcard, which cannot be proven secure
-    /// without NSEC or NSEC3 denial of existence.
-    #[error("wildcard-expanded answer for {owner} cannot be proven without NSEC")]
-    WildcardUnproven { owner: String },
+    /// The answer was synthesized from a wildcard, but the authority section did
+    /// not prove that no closer non-wildcard match exists.
+    #[error("wildcard-expanded answer for {owner} has no closer-match proof")]
+    WildcardUnproven { owner: String, source: DenialError },
     /// No DNSKEY RRset with its signature could be fetched for a zone.
     #[error("no signed DNSKEY RRset for zone {zone}")]
     MissingDnskey { zone: String },
@@ -126,15 +132,12 @@ impl SimpleDnsResolver {
         };
 
         // A wildcard-expanded answer (RRSIG labels below the owner's label count)
-        // is a valid signature over `*.zone`, but proving it applies to this name
-        // needs an NSEC or NSEC3 record showing no closer match exists (RFC 4035
-        // section 5.3.4). Without denial of existence we cannot prove that, so we
-        // reject rather than accept the answer unproven, staying fail-closed.
-        if is_wildcard_expansion(signing_rrsig.labels, &owner) {
-            return Err(e!(ValidateError::WildcardUnproven {
-                owner: owner.to_string(),
-            }));
-        }
+        // is a valid signature over `*.zone`. Proving it applies to this name
+        // needs an authority-section NSEC or NSEC3 showing no closer match exists
+        // (RFC 4035 section 5.3.4); that proof runs after the chain validates the
+        // signing zone's keys.
+        let wildcard_labels =
+            is_wildcard_expansion(signing_rrsig.labels, &owner).then_some(signing_rrsig.labels);
 
         // The RRSIG signer names the zone that signed the answer. Validate from
         // the root down through every zone cut between them.
@@ -149,42 +152,67 @@ impl SimpleDnsResolver {
                     zone: ".".to_string(),
                 })
             })?;
+        // Anchor the root and carry the trusted DNSKEY set down each zone cut.
+        let mut trusted = trust_root(&root_dnskeys, ROOT_TRUST_ANCHORS)
+            .map_err(|source| e!(ValidateError::Chain, source))?;
 
         // Discover the real secure zone cuts between the root and the signing
         // zone. Not every label boundary is a delegation: a zone can hold names
         // several labels deep, and a delegation may skip labels. Query the DS at
-        // each ancestor and treat the ancestor as a cut only when it publishes a
-        // signed DS RRset; skip the ones that do not rather than failing on a
-        // spurious "missing DS".
+        // each ancestor and descend on the ones that publish a signed DS RRset.
         //
-        // This stays fail-closed for the target. If the signing zone's own DS is
-        // stripped, its DNSKEY set never enters the trusted set, so the answer's
-        // RRSIG matches no trusted key and the chain fails. If an intermediate DS
-        // is stripped, the next present zone's delegating DS is no longer signed
-        // by the trusted parent, so that link fails. Skipping a genuinely
-        // stripped DS cannot turn a Bogus answer into a valid one.
-        let mut zones = Vec::new();
+        // When an ancestor has no DS, it is either a non-cut or an insecure
+        // (unsigned) delegation. If the DS response carries an NSEC or NSEC3,
+        // validated against the trusted parent keys, that proves the DS is truly
+        // absent, then everything at or below that cut is unsigned. The answer's
+        // own zone is thereby proven insecure, so we accept it as unsigned rather
+        // than failing (RFC 4035 section 4.3, RFC 5155 section 8.6).
+        //
+        // Without such a proof the ancestor is treated as a non-cut and skipped,
+        // which keeps the walk fail-closed. A stripped DS on a genuinely signed
+        // delegation yields no valid absence proof (the parent's signature cannot
+        // be forged), so the signing zone's keys never enter the trusted set and
+        // the target's RRSIG matches no trusted key, failing the chain as before.
         for zone in zone_ancestors(&signing_zone) {
-            let Some(delegation) = self.fetch_signed_rrset(&zone, TYPE::DS).await? else {
+            let ds_response = self.fetch_raw(&zone, TYPE::DS).await?;
+            if let Some(delegation) = parse_signed_rrset(&ds_response, &zone, TYPE::DS) {
+                let dnskeys = self
+                    .fetch_signed_rrset(&zone, TYPE::DNSKEY)
+                    .await?
+                    .ok_or_else(|| e!(ValidateError::MissingDnskey { zone: zone.clone() }))?;
+                let delegated = DelegatedZone {
+                    delegation,
+                    dnskeys,
+                };
+                trusted = descend_zone(&trusted, &delegated)
+                    .map_err(|source| e!(ValidateError::Chain, source))?;
+            } else if let Ok(child) = Name::new(&zone) {
+                let authority = authority_records(&ds_response);
+                if prove_no_ds(&child, &authority, &trusted).is_ok() {
+                    debug!(zone = %zone, "insecure delegation proven; accepting answer as unsigned");
+                    return Ok(());
+                }
                 debug!(zone = %zone, "no signed DS, treating as a non-cut and skipping");
-                continue;
-            };
-            let dnskeys = self
-                .fetch_signed_rrset(&zone, TYPE::DNSKEY)
-                .await?
-                .ok_or_else(|| e!(ValidateError::MissingDnskey { zone: zone.clone() }))?;
-            zones.push(DelegatedZone {
-                delegation,
-                dnskeys,
-            });
+            }
         }
 
-        let chain = ChainOfTrust {
-            root_dnskeys,
-            zones,
-            target,
-        };
-        verify_chain(&chain).map_err(|source| e!(ValidateError::Chain, source))
+        // The signing zone's keys are now trusted. Validate the answer RRset.
+        verify_rrset_with_keys(&target, &trusted)
+            .map_err(|source| e!(ValidateError::Chain, source))?;
+
+        // Finally, a wildcard-expanded answer needs its closer-match proof from
+        // the same response's authority section, validated against the signing
+        // zone keys we just trusted.
+        if let Some(labels) = wildcard_labels {
+            let authority = authority_records(response);
+            prove_wildcard(&owner, labels, &authority, &trusted).map_err(|source| {
+                e!(ValidateError::WildcardUnproven {
+                    owner: owner.to_string(),
+                    source,
+                })
+            })?;
+        }
+        Ok(())
     }
 
     /// Queries `name` for `qtype` with the DO bit set and returns the RRset of
@@ -198,14 +226,41 @@ impl SimpleDnsResolver {
         name: &str,
         qtype: TYPE,
     ) -> Result<Option<SignedRrset<'static>>, ValidateError> {
-        let (_id, query) = build_dnssec_query(name, qtype)
-            .map_err(|err| e!(ValidateError::Fetch, AnyError::from_stack(err)))?;
-        let response = self
-            .send_query(&query)
-            .await
-            .map_err(|err| e!(ValidateError::Fetch, AnyError::from_stack(err)))?;
+        let response = self.fetch_raw(name, qtype).await?;
         Ok(parse_signed_rrset(&response, name, qtype))
     }
+
+    /// Queries `name` for `qtype` with the DO bit set and returns the raw
+    /// response bytes.
+    ///
+    /// The caller inspects both the answer and the authority section, so the full
+    /// response is returned rather than a parsed RRset. Returns
+    /// [`ValidateError::Fetch`] for a query-layer failure.
+    async fn fetch_raw(&self, name: &str, qtype: TYPE) -> Result<Vec<u8>, ValidateError> {
+        let (_id, query) = build_dnssec_query(name, qtype)
+            .map_err(|err| e!(ValidateError::Fetch, AnyError::from_stack(err)))?;
+        self.send_query(&query)
+            .await
+            .map_err(|err| e!(ValidateError::Fetch, AnyError::from_stack(err)))
+    }
+}
+
+/// Parses a response and returns its authority section records, owned.
+///
+/// Denial-of-existence records (NSEC, NSEC3, and their RRSIGs) live in the
+/// authority section, which `simple_dns` exposes as `name_servers`. A response
+/// that does not parse yields an empty section, which the proofs treat as no
+/// proof (fail-closed).
+fn authority_records(response: &[u8]) -> Vec<ResourceRecord<'static>> {
+    Packet::parse(response)
+        .map(|packet| {
+            packet
+                .name_servers
+                .iter()
+                .map(|rr| rr.clone().into_owned())
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Returns whether `signer` may sign records owned by `owner`.
