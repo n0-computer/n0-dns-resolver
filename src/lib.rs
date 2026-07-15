@@ -45,7 +45,9 @@ pub use simple_dns;
 
 #[cfg(feature = "dnssec")]
 pub use self::dnssec::{
-    DnssecError, ResourceRecord, build_dnssec_query, key_tag, verify_ds, verify_rrsig,
+    ChainError, ChainOfTrust, DelegatedZone, DnssecError, ROOT_TRUST_ANCHORS, ResourceRecord,
+    SignedRrset, build_dnssec_query, key_tag, verify_chain, verify_chain_with_anchors, verify_ds,
+    verify_rrsig,
 };
 #[cfg(any(target_os = "android", doc))]
 pub use self::system_config::install_android_jni_context;

@@ -34,7 +34,10 @@
 //! The record types come from [`simple_dns`], which this crate re-exports under
 //! the `dnssec` feature so callers can name them without a second dependency.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    borrow::Cow,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use n0_error::{AnyError, e, stack_error};
 use ring::{digest, signature};
@@ -58,6 +61,42 @@ const DNSKEY_ZONE_FLAG: u16 = 0x0100;
 
 /// The protocol value every DNSKEY must carry (RFC 4034 section 2.1.2).
 const DNSKEY_PROTOCOL: u8 = 3;
+
+/// SHA-256 digest of the root KSK-2017, key tag 20326 (IANA anchor `Klajeyz`).
+const ROOT_KSK_2017_DIGEST: [u8; 32] = [
+    0xE0, 0x6D, 0x44, 0xB8, 0x0B, 0x8F, 0x1D, 0x39, 0xA9, 0x5C, 0x0B, 0x0D, 0x7C, 0x65, 0xD0, 0x84,
+    0x58, 0xE8, 0x80, 0x40, 0x9B, 0xBC, 0x68, 0x34, 0x57, 0x10, 0x42, 0x37, 0xC7, 0xF8, 0xEC, 0x8D,
+];
+
+/// SHA-256 digest of the root KSK-2024, key tag 38696 (IANA anchor `Kmyv6jo`).
+const ROOT_KSK_2024_DIGEST: [u8; 32] = [
+    0x68, 0x3D, 0x2D, 0x0A, 0xCB, 0x8C, 0x9B, 0x71, 0x2A, 0x19, 0x48, 0xB2, 0x7F, 0x74, 0x12, 0x19,
+    0x29, 0x8D, 0x0A, 0x45, 0x0D, 0x61, 0x2C, 0x48, 0x3A, 0xF4, 0x44, 0xA4, 0xC0, 0xFB, 0x2B, 0x16,
+];
+
+/// The IANA root zone trust anchors, as DS records over the root KSK.
+///
+/// These are the currently valid entries from the IANA root anchors file at
+/// <https://data.iana.org/root-anchors/root-anchors.xml>: KSK-2017 (key tag
+/// 20326) and KSK-2024 (key tag 38696), both RSA/SHA-256 (algorithm 8) with a
+/// SHA-256 digest (digest type 2). A validating chain is trusted only if its root
+/// DNSKEY RRset matches one of these anchors, so operators must update this list
+/// on a root KSK rollover. For a private root or a pending rollover, pass a
+/// custom anchor set to [`verify_chain_with_anchors`] instead.
+pub const ROOT_TRUST_ANCHORS: &[DS<'static>] = &[
+    DS {
+        key_tag: 20326,
+        algorithm: 8,
+        digest_type: 2,
+        digest: Cow::Borrowed(&ROOT_KSK_2017_DIGEST),
+    },
+    DS {
+        key_tag: 38696,
+        algorithm: 8,
+        digest_type: 2,
+        digest: Cow::Borrowed(&ROOT_KSK_2024_DIGEST),
+    },
+];
 
 /// An error returned while validating DNSSEC records.
 #[allow(missing_docs)]
@@ -296,6 +335,240 @@ pub fn verify_rrsig(
 /// A parsed DNS resource record, re-exported from [`simple_dns`] for use with
 /// [`verify_rrsig`].
 pub type ResourceRecord<'a> = simple_dns::ResourceRecord<'a>;
+
+/// An RRset together with the [`RRSIG`] that signs it.
+///
+/// The `records` share one owner name, class, and type, and `rrsig` is the
+/// signature covering them. This is the unit [`verify_chain`] validates at each
+/// level: a DNSKEY RRset self-signed by its zone key, a DS RRset signed by the
+/// parent zone, or a target RRset signed by its zone.
+#[derive(Debug, Clone)]
+pub struct SignedRrset<'a> {
+    /// The records the signature covers.
+    pub records: Vec<ResourceRecord<'a>>,
+    /// The signature over `records`.
+    pub rrsig: RRSIG<'a>,
+}
+
+/// A zone below the root in a [`ChainOfTrust`].
+///
+/// It pairs the DS RRset that delegates to the zone (published in and signed by
+/// the parent) with the zone's own DNSKEY RRset (self-signed by the zone key
+/// the DS commits to).
+#[derive(Debug, Clone)]
+pub struct DelegatedZone<'a> {
+    /// The DS RRset in the parent zone, and the parent's signature over it.
+    pub delegation: SignedRrset<'a>,
+    /// This zone's DNSKEY RRset, and its self-signature.
+    pub dnskeys: SignedRrset<'a>,
+}
+
+/// A chain of trust from the root zone down to a target RRset.
+///
+/// [`verify_chain`] walks it from `root_dnskeys` (anchored against the embedded
+/// [`ROOT_TRUST_ANCHORS`]) through each entry of `zones` (parent to child) to
+/// `target`, requiring every link to validate. Build one per name to validate:
+/// `zones` lists every zone cut from just below the root down to the target's
+/// signing zone, and `target` is the answer RRset with its RRSIG.
+#[derive(Debug, Clone)]
+pub struct ChainOfTrust<'a> {
+    /// The root zone DNSKEY RRset and its self-signature.
+    pub root_dnskeys: SignedRrset<'a>,
+    /// Each delegated zone from just below the root to the signing zone, ordered
+    /// parent to child. Empty when the target is signed directly by the root.
+    pub zones: Vec<DelegatedZone<'a>>,
+    /// The target RRset and the signature over it.
+    pub target: SignedRrset<'a>,
+}
+
+/// An error returned while walking a DNSSEC chain of trust.
+///
+/// Every variant means the chain is Bogus: validation failed and the answer must
+/// be rejected. The walk is fail-closed, so a missing DS, an absent record, or an
+/// unmatched key produces one of these errors rather than an "insecure" result.
+#[allow(missing_docs)]
+#[stack_error(derive, add_meta, std_sources)]
+#[non_exhaustive]
+pub enum ChainError {
+    /// A DNSKEY, DS, or target RRset in the chain was empty.
+    #[error("empty RRset in chain")]
+    EmptyRrset {},
+    /// A DNSKEY RRset contained no DNSKEY records.
+    #[error("no DNSKEY records in RRset")]
+    NoDnskeys {},
+    /// A delegation RRset contained no DS records.
+    #[error("no DS records in delegation")]
+    NoDelegation {},
+    /// The root DNSKEY RRset matched none of the trust anchors.
+    #[error("root DNSKEY does not match any trust anchor")]
+    UntrustedRoot {},
+    /// A zone's DNSKEY RRset contained no key committed to by the parent DS.
+    #[error("no DNSKEY matches the delegating DS")]
+    NoMatchingDnskey {},
+    /// No key in the trusted set matched the RRSIG's key tag and algorithm.
+    #[error("no trusted key matches the signature")]
+    NoSigningKey {},
+    /// A signature or delegation link failed cryptographic validation.
+    #[error("chain link failed validation")]
+    Link { source: DnssecError },
+}
+
+/// Validates a chain of trust from the embedded root anchors down to a target.
+///
+/// This is [`verify_chain_with_anchors`] using the built-in [`ROOT_TRUST_ANCHORS`].
+/// It is the fail-closed core of an offline DNSSEC validator: it returns `Ok`
+/// (Secure) only if every link validates from an embedded root anchor to the
+/// target signature. A missing DS, a broken signature, or an absent record is a
+/// [`ChainError`] (Bogus), never treated as "insecure".
+///
+/// It proves signatures, not their absence: without NSEC or NSEC3 support a
+/// legitimately unsigned delegation or a negative answer cannot be proven and is
+/// rejected, which is the intended fail-closed behavior.
+///
+/// # Errors
+///
+/// Returns a [`ChainError`] identifying the first link that failed: an untrusted
+/// root, a DS that no DNSKEY matches, an RRset with no signing key, or a failed
+/// signature or delegation check.
+pub fn verify_chain(chain: &ChainOfTrust<'_>) -> Result<(), ChainError> {
+    verify_chain_with_anchors(chain, ROOT_TRUST_ANCHORS)
+}
+
+/// Validates a chain of trust against a caller-supplied set of trust anchors.
+///
+/// Behaves like [`verify_chain`] but anchors the root DNSKEY RRset against
+/// `anchors` (DS records over the root KSK) rather than the built-in set. Use
+/// this to pin a pending root KSK during a rollover, to validate against a
+/// private root, or to test a chain whose root is not the IANA root.
+///
+/// # Errors
+///
+/// Returns the same [`ChainError`] variants as [`verify_chain`]; in particular
+/// [`ChainError::UntrustedRoot`] when the root DNSKEY RRset matches no anchor.
+pub fn verify_chain_with_anchors(
+    chain: &ChainOfTrust<'_>,
+    anchors: &[DS<'_>],
+) -> Result<(), ChainError> {
+    // Anchor the root: the root DNSKEY RRset must contain a key whose DS matches
+    // an embedded anchor, and the RRset must be self-signed by such a key.
+    let root_keys = dnskeys_of(&chain.root_dnskeys.records)?;
+    let root_owner = owner_of(&chain.root_dnskeys.records)?;
+    let anchored: Vec<&DNSKEY<'_>> = root_keys
+        .iter()
+        .copied()
+        .filter(|key| {
+            anchors
+                .iter()
+                .any(|anchor| verify_ds(root_owner, key, anchor).is_ok())
+        })
+        .collect();
+    if anchored.is_empty() {
+        return Err(e!(ChainError::UntrustedRoot));
+    }
+    verify_signed_rrset(&chain.root_dnskeys, &anchored)?;
+
+    // Walk each delegation, carrying the trusted DNSKEY set down one zone cut at
+    // a time. After a level validates, the whole child DNSKEY RRset is trusted
+    // and signs the next level (the next DS, or the target).
+    let mut trusted = root_keys;
+    for zone in &chain.zones {
+        // The DS RRset is published in, and signed by, the trusted parent zone.
+        verify_signed_rrset(&zone.delegation, &trusted)?;
+        let delegating_ds = ds_records_of(&zone.delegation.records)?;
+
+        // The child's DNSKEY RRset must contain a key the parent DS commits to,
+        // and must be self-signed by such a key.
+        let child_keys = dnskeys_of(&zone.dnskeys.records)?;
+        let child_owner = owner_of(&zone.dnskeys.records)?;
+        let matched: Vec<&DNSKEY<'_>> = child_keys
+            .iter()
+            .copied()
+            .filter(|key| {
+                delegating_ds
+                    .iter()
+                    .any(|ds| verify_ds(child_owner, key, ds).is_ok())
+            })
+            .collect();
+        if matched.is_empty() {
+            return Err(e!(ChainError::NoMatchingDnskey));
+        }
+        verify_signed_rrset(&zone.dnskeys, &matched)?;
+        trusted = child_keys;
+    }
+
+    // The target RRset is signed by the deepest zone's now-trusted DNSKEY set.
+    verify_signed_rrset(&chain.target, &trusted)
+}
+
+/// Verifies a [`SignedRrset`] using whichever trusted key the RRSIG names.
+///
+/// Tries every key in `keys` whose key tag and algorithm match the RRSIG, and
+/// succeeds on the first that validates. Returns [`ChainError::NoSigningKey`]
+/// when no key matches and [`ChainError::Link`] when a matching key fails the
+/// signature check.
+fn verify_signed_rrset(signed: &SignedRrset<'_>, keys: &[&DNSKEY<'_>]) -> Result<(), ChainError> {
+    let mut last_err = None;
+    for key in keys {
+        if key.algorithm == signed.rrsig.algorithm && key_tag(key) == signed.rrsig.key_tag {
+            match verify_rrsig(&signed.rrsig, &signed.records, key) {
+                Ok(()) => return Ok(()),
+                Err(err) => last_err = Some(err),
+            }
+        }
+    }
+    match last_err {
+        Some(err) => Err(e!(ChainError::Link, err)),
+        None => Err(e!(ChainError::NoSigningKey)),
+    }
+}
+
+/// Collects references to the DNSKEY records in an RRset.
+///
+/// Returns [`ChainError::NoDnskeys`] when the RRset holds no DNSKEY record.
+fn dnskeys_of<'a, 'b>(
+    records: &'b [ResourceRecord<'a>],
+) -> Result<Vec<&'b DNSKEY<'a>>, ChainError> {
+    let keys: Vec<&DNSKEY<'_>> = records
+        .iter()
+        .filter_map(|rr| match &rr.rdata {
+            RData::DNSKEY(dnskey) => Some(dnskey),
+            _ => None,
+        })
+        .collect();
+    if keys.is_empty() {
+        Err(e!(ChainError::NoDnskeys))
+    } else {
+        Ok(keys)
+    }
+}
+
+/// Collects references to the DS records in an RRset.
+///
+/// Returns [`ChainError::NoDelegation`] when the RRset holds no DS record.
+fn ds_records_of<'a, 'b>(records: &'b [ResourceRecord<'a>]) -> Result<Vec<&'b DS<'a>>, ChainError> {
+    let ds: Vec<&DS<'_>> = records
+        .iter()
+        .filter_map(|rr| match &rr.rdata {
+            RData::DS(ds) => Some(ds),
+            _ => None,
+        })
+        .collect();
+    if ds.is_empty() {
+        Err(e!(ChainError::NoDelegation))
+    } else {
+        Ok(ds)
+    }
+}
+
+/// Returns the owner name shared by an RRset, taken from its first record.
+///
+/// Returns [`ChainError::EmptyRrset`] when the RRset is empty.
+fn owner_of<'a, 'b>(records: &'b [ResourceRecord<'a>]) -> Result<&'b Name<'a>, ChainError> {
+    records
+        .first()
+        .map(|rr| &rr.name)
+        .ok_or_else(|| e!(ChainError::EmptyRrset))
+}
 
 /// Reconstructs the signed data for an RRSIG in canonical form.
 ///
@@ -986,6 +1259,230 @@ mod tests {
         assert!(packet.opt().is_some(), "query must carry an OPT record");
         let flags_hi = bytes[bytes.len() - 4];
         assert_eq!(flags_hi & 0x80, 0x80, "DO bit must be set");
+    }
+
+    mod chain {
+        use super::*;
+
+        fn now() -> u32 {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as u32
+        }
+
+        /// Counts the labels in `name`, treating the empty string as the root.
+        fn label_count(name: &str) -> u8 {
+            name.split('.').filter(|l| !l.is_empty()).count() as u8
+        }
+
+        /// A test zone whose single ECDSA P-256 key acts as both its KSK and ZSK.
+        struct Zone {
+            name: String,
+            key_pair: EcdsaKeyPair,
+            dnskey: DNSKEY<'static>,
+            tag: u16,
+        }
+
+        impl Zone {
+            fn new(name: &str, rng: &SystemRandom) -> Self {
+                let pkcs8 =
+                    EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, rng).unwrap();
+                let key_pair =
+                    EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), rng)
+                        .unwrap();
+                let public_key = key_pair.public_key().as_ref()[1..].to_vec();
+                // Flags 257: zone key plus secure entry point (a KSK).
+                let dnskey = DNSKEY {
+                    flags: 257,
+                    protocol: 3,
+                    algorithm: 13,
+                    public_key: Cow::Owned(public_key),
+                };
+                let tag = key_tag(&dnskey);
+                Self {
+                    name: name.to_string(),
+                    key_pair,
+                    dnskey,
+                    tag,
+                }
+            }
+
+            fn owner(&self) -> Name<'static> {
+                Name::new_unchecked(&self.name).into_owned()
+            }
+
+            /// Signs `records` (owner `owner`, covered type `type_covered`).
+            fn sign(
+                &self,
+                records: &[ResourceRecord<'static>],
+                type_covered: u16,
+                owner: &str,
+                rng: &SystemRandom,
+            ) -> RRSIG<'static> {
+                let now = now();
+                let mut rrsig = RRSIG {
+                    type_covered,
+                    algorithm: 13,
+                    labels: label_count(owner),
+                    original_ttl: 3600,
+                    signature_expiration: now + 3600,
+                    signature_inception: now - 3600,
+                    key_tag: self.tag,
+                    signer_name: self.owner(),
+                    signature: Cow::Owned(Vec::new()),
+                };
+                let signed = signed_data(&rrsig, records).unwrap();
+                let sig = self.key_pair.sign(rng, &signed).unwrap();
+                rrsig.signature = Cow::Owned(sig.as_ref().to_vec());
+                rrsig
+            }
+
+            /// The self-signed DNSKEY RRset for this zone.
+            fn signed_dnskeys(&self, rng: &SystemRandom) -> SignedRrset<'static> {
+                let records = vec![ResourceRecord::new(
+                    self.owner(),
+                    CLASS::IN,
+                    3600,
+                    RData::DNSKEY(self.dnskey.clone()),
+                )];
+                let rrsig = self.sign(&records, 48, &self.name, rng);
+                SignedRrset { records, rrsig }
+            }
+
+            /// A SHA-256 DS record committing to this zone's key.
+            fn ds(&self) -> DS<'static> {
+                let owner = self.owner();
+                let mut data = encode_name(owner.as_bytes(), true);
+                data.extend_from_slice(&dnskey_rdata(&self.dnskey));
+                let digest = digest::digest(&digest::SHA256, &data);
+                DS {
+                    key_tag: self.tag,
+                    algorithm: self.dnskey.algorithm,
+                    digest_type: 2,
+                    digest: Cow::Owned(digest.as_ref().to_vec()),
+                }
+            }
+        }
+
+        /// Builds a signed root -> `example` -> `host.example` A chain, plus the
+        /// trust anchor over the root key.
+        fn good_chain(rng: &SystemRandom) -> (ChainOfTrust<'static>, Vec<DS<'static>>) {
+            let root = Zone::new("", rng);
+            let child = Zone::new("example", rng);
+
+            let root_dnskeys = root.signed_dnskeys(rng);
+
+            // DS(example) is published in the root and signed by the root key.
+            let ds_records = vec![ResourceRecord::new(
+                Name::new_unchecked("example").into_owned(),
+                CLASS::IN,
+                3600,
+                RData::DS(child.ds()),
+            )];
+            let ds_rrsig = root.sign(&ds_records, 43, "example", rng);
+
+            let child_dnskeys = child.signed_dnskeys(rng);
+
+            let target_records = vec![ResourceRecord::new(
+                Name::new_unchecked("host.example").into_owned(),
+                CLASS::IN,
+                3600,
+                RData::A(A {
+                    address: u32::from_be_bytes([192, 0, 2, 1]),
+                }),
+            )];
+            let target_rrsig = child.sign(&target_records, 1, "host.example", rng);
+
+            let chain = ChainOfTrust {
+                root_dnskeys,
+                zones: vec![DelegatedZone {
+                    delegation: SignedRrset {
+                        records: ds_records,
+                        rrsig: ds_rrsig,
+                    },
+                    dnskeys: child_dnskeys,
+                }],
+                target: SignedRrset {
+                    records: target_records,
+                    rrsig: target_rrsig,
+                },
+            };
+            (chain, vec![root.ds()])
+        }
+
+        #[test]
+        fn accepts_a_good_chain() {
+            let rng = SystemRandom::new();
+            let (chain, anchors) = good_chain(&rng);
+            assert!(verify_chain_with_anchors(&chain, &anchors).is_ok());
+        }
+
+        #[test]
+        fn rejects_untrusted_root() {
+            let rng = SystemRandom::new();
+            let (chain, _) = good_chain(&rng);
+            // A DS over an unrelated key does not anchor this root.
+            let stranger = Zone::new("", &rng);
+            assert!(matches!(
+                verify_chain_with_anchors(&chain, &[stranger.ds()]),
+                Err(ChainError::UntrustedRoot { .. })
+            ));
+        }
+
+        #[test]
+        fn rejects_wrong_ds_digest() {
+            let rng = SystemRandom::new();
+            let (mut chain, anchors) = good_chain(&rng);
+            // Corrupt the DS digest that delegates to the child zone.
+            let RData::DS(ds) = &mut chain.zones[0].delegation.records[0].rdata else {
+                panic!("delegation record must be a DS");
+            };
+            let mut digest = ds.digest.to_vec();
+            digest[0] ^= 0xFF;
+            ds.digest = Cow::Owned(digest);
+            // The DS RRSIG no longer matches, so the delegation link fails first.
+            assert!(matches!(
+                verify_chain_with_anchors(&chain, &anchors),
+                Err(ChainError::Link { .. } | ChainError::NoMatchingDnskey { .. })
+            ));
+        }
+
+        #[test]
+        fn rejects_tampered_leaf_signature() {
+            let rng = SystemRandom::new();
+            let (mut chain, anchors) = good_chain(&rng);
+            let mut sig = chain.target.rrsig.signature.to_vec();
+            sig[0] ^= 0xFF;
+            chain.target.rrsig.signature = Cow::Owned(sig);
+            assert!(matches!(
+                verify_chain_with_anchors(&chain, &anchors),
+                Err(ChainError::Link { .. })
+            ));
+        }
+
+        #[test]
+        fn rejects_missing_child_dnskey() {
+            let rng = SystemRandom::new();
+            let (mut chain, anchors) = good_chain(&rng);
+            // Drop the child's DNSKEY records: the delegating DS matches nothing.
+            chain.zones[0].dnskeys.records.clear();
+            assert!(matches!(
+                verify_chain_with_anchors(&chain, &anchors),
+                Err(ChainError::NoDnskeys { .. })
+            ));
+        }
+
+        #[test]
+        fn embedded_anchors_have_expected_tags() {
+            let tags: Vec<u16> = ROOT_TRUST_ANCHORS.iter().map(|ds| ds.key_tag).collect();
+            assert_eq!(tags, vec![20326, 38696]);
+            for ds in ROOT_TRUST_ANCHORS {
+                assert_eq!(ds.algorithm, 8);
+                assert_eq!(ds.digest_type, 2);
+                assert_eq!(ds.digest.len(), 32);
+            }
+        }
     }
 
     // Fixed RSA-2048 PKCS#8 DER private key, generated once for this test.
