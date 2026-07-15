@@ -705,9 +705,11 @@ fn signed_data(rrsig: &RRSIG<'_>, rrset: &[ResourceRecord<'_>]) -> Result<Vec<u8
 
     let owner_wire = canonical_owner(owner, rrsig.labels)?;
 
-    // RRSIG RDATA without the trailing signature field. The signer name is used
-    // exactly as it appears in the RRSIG (uncompressed, not downcased) so the
-    // bytes match what the signer signed.
+    // RRSIG RDATA without the trailing signature field. RFC 4035 section 5.3.2
+    // requires the signer name here to be in canonical form, which per RFC 4034
+    // section 6.1 (and the RRSIG entry in the section 6.2 downcase list) means
+    // lowercased. A signer whose on-wire name carries uppercase letters signed
+    // over the lowercased form, so we must lowercase it to match.
     let mut signed = Vec::new();
     signed.extend_from_slice(&rrsig.type_covered.to_be_bytes());
     signed.push(rrsig.algorithm);
@@ -716,7 +718,7 @@ fn signed_data(rrsig: &RRSIG<'_>, rrset: &[ResourceRecord<'_>]) -> Result<Vec<u8
     signed.extend_from_slice(&rrsig.signature_expiration.to_be_bytes());
     signed.extend_from_slice(&rrsig.signature_inception.to_be_bytes());
     signed.extend_from_slice(&rrsig.key_tag.to_be_bytes());
-    signed.extend_from_slice(&encode_name(rrsig.signer_name.as_bytes(), false));
+    signed.extend_from_slice(&encode_name(rrsig.signer_name.as_bytes(), true));
 
     // RFC 4034 section 6.3 orders the records within the RRset by their
     // canonical RDATA alone, treated as a left-justified octet sequence. Sort on
@@ -1769,6 +1771,35 @@ mod tests {
             signature: Cow::Owned(Vec::new()),
         };
         (rrset, rrsig)
+    }
+
+    #[test]
+    fn verify_rrsig_signer_name_is_case_insensitive() {
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
+        let key_pair =
+            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+                .unwrap();
+        let public_key = key_pair.public_key().as_ref()[1..].to_vec();
+        let dnskey = DNSKEY {
+            flags: 256,
+            protocol: 3,
+            algorithm: 13,
+            public_key: Cow::Owned(public_key),
+        };
+        let tag = key_tag(&dnskey);
+
+        let (rrset, mut rrsig) = a_rrset_and_rrsig(13, tag);
+        // The signer signs over the canonical (lowercased) signer name.
+        let signed = signed_data(&rrsig, &rrset).unwrap();
+        let signature = key_pair.sign(&rng, &signed).unwrap();
+        rrsig.signature = Cow::Owned(signature.as_ref().to_vec());
+        // The record arrives with an uppercase signer name (RFC 4035 5.3.2 lets
+        // the wire form differ from the canonical form). Validation must
+        // canonicalize before verifying, so this still accepts.
+        rrsig.signer_name = Name::new_unchecked("Example.COM");
+
+        assert!(verify_rrsig(&rrsig, &rrset, &dnskey).is_ok());
     }
 
     #[test]
