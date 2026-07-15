@@ -1109,6 +1109,21 @@ const NSEC3_HASH_SHA1: u8 = 1;
 /// the value hickory-dns and the `domain` crate use for the insecure threshold.
 const MAX_NSEC3_ITERATIONS: u16 = 100;
 
+/// The largest number of NSEC or NSEC3 records one denial proof will validate.
+///
+/// [`MAX_SIGNATURE_CHECKS`] bounds the signature checks per record, but
+/// [`validated_nsecs`] and [`validated_nsec3s`] run that check for every record
+/// in the authority section, so without a second bound the total scales with the
+/// section length (up to roughly a thousand records over TCP). An attacker who
+/// queries a genuinely signed zone could pad the authority section with NSEC3
+/// records carrying tag- and algorithm-matching but bogus RRSIGs and force
+/// thousands of failed RSA or ECDSA verifications per response. Capping the
+/// number of denial records each collector will verify keeps the work bounded.
+/// A legitimate denial uses only a handful of records (fewer than five even for
+/// the NSEC3 closest-encloser proof), so this generous cap never affects a real
+/// proof; surplus records are ignored, which stays fail-closed.
+const MAX_DENIAL_RECORDS: usize = 16;
+
 /// A reason a denial-of-existence proof did not hold.
 ///
 /// Every variant means the denial is not proven, so the caller stays fail-closed
@@ -1406,16 +1421,24 @@ pub fn prove_wildcard(
 ///
 /// Each NSEC is kept only if one of the RRSIGs over it, in the same section,
 /// verifies under `keys`. That ties the record to the zone whose keys are
-/// trusted, so a record from an unrelated zone cannot slip in.
+/// trusted, so a record from an unrelated zone cannot slip in. At most
+/// [`MAX_DENIAL_RECORDS`] records are verified, bounding the signature work a
+/// padded authority section can force.
 fn validated_nsecs<'a>(
     authority: &'a [ResourceRecord<'a>],
     keys: &[DNSKEY<'_>],
 ) -> Vec<(Name<'static>, NSEC<'static>)> {
     let mut out = Vec::new();
+    let mut considered = 0usize;
     for rr in authority {
         let RData::NSEC(nsec) = &rr.rdata else {
             continue;
         };
+        // Cap the records whose signature is checked (see [`MAX_DENIAL_RECORDS`]).
+        considered += 1;
+        if considered > MAX_DENIAL_RECORDS {
+            break;
+        }
         let records = [rr.clone()];
         if authority_rrset_signed(&records, &rr.name, NSEC_TYPE_CODE, authority, keys) {
             out.push((rr.name.clone().into_owned(), nsec.clone().into_owned()));
@@ -1442,6 +1465,7 @@ fn validated_nsec3s<'a>(
     // match. Set only after a signature check so an unsigned record cannot fix the
     // reference parameters and evict the real ones.
     let mut params: Option<(u8, u16, Vec<u8>)> = None;
+    let mut considered = 0usize;
     for rr in authority {
         let RData::NULL(NSEC3_TYPE_CODE, null) = &rr.rdata else {
             continue;
@@ -1462,6 +1486,11 @@ fn validated_nsec3s<'a>(
             {
                 continue;
             }
+        }
+        // Cap the records whose signature is checked (see [`MAX_DENIAL_RECORDS`]).
+        considered += 1;
+        if considered > MAX_DENIAL_RECORDS {
+            break;
         }
         let records = [rr.clone()];
         if authority_rrset_signed(&records, &rr.name, NSEC3_TYPE_CODE, authority, keys) {
@@ -3491,6 +3520,89 @@ mod tests {
                 prove_nodata(&qname, A, &authority, &signer.keys()),
                 Err(DenialError::NoProof { .. })
             ));
+        }
+
+        /// A bogus NSEC3 record with an RRSIG whose key tag and algorithm match
+        /// `signer` but whose signature is invalid, so it forces a failed
+        /// signature check but never validates. Used to pad the authority section.
+        fn bogus_nsec3(signer: &Signer, owner_hash: &str) -> Vec<ResourceRecord<'static>> {
+            let nsec3 = nsec3_rr("example", owner_hash, 0, &[0xffu8; 20], &[AAAA]);
+            let owner = format!("{owner_hash}.example");
+            let rrsig = RRSIG {
+                type_covered: NSEC3_TYPE_CODE,
+                algorithm: 13,
+                labels: label_count(&owner),
+                original_ttl: 3600,
+                signature_expiration: now() + 3600,
+                signature_inception: now() - 3600,
+                key_tag: key_tag(&signer.dnskey),
+                signer_name: Name::new_unchecked("example").into_owned(),
+                signature: Cow::Owned(vec![0u8; 64]),
+            };
+            let sig = ResourceRecord::new(
+                Name::new_unchecked(&owner).into_owned(),
+                CLASS::IN,
+                3600,
+                RData::RRSIG(rrsig),
+            );
+            vec![nsec3, sig]
+        }
+
+        /// A genuinely signed NSEC3 that matches `a.example` and proves NODATA.
+        fn signed_nodata_nsec3(signer: &Signer) -> Vec<ResourceRecord<'static>> {
+            let owner_hash = hash("a.example");
+            let next = nsec3_hash(
+                &Name::new_unchecked("z.example"),
+                &[0xaa, 0xbb, 0xcc, 0xdd],
+                12,
+            );
+            let nsec3 = nsec3_rr("example", &owner_hash, 0, &next, &[AAAA, RRSIG_BIT]);
+            let owner = format!("{owner_hash}.example");
+            let rrsig = signer.sign(
+                std::slice::from_ref(&nsec3),
+                NSEC3_TYPE_CODE,
+                &owner,
+                "example",
+            );
+            vec![nsec3, rrsig]
+        }
+
+        #[test]
+        fn nsec3_denial_record_cap_bounds_processing() {
+            // Pad the authority section with more than the cap's worth of NSEC3
+            // records, each carrying a tag- and algorithm-matching but bogus
+            // RRSIG, then append a genuinely signed record that would prove the
+            // NODATA. The cap stops before the real record is reached, so the
+            // denial stays unproven (fail-closed) rather than driving unbounded
+            // signature checks (finding H3).
+            let signer = Signer::new();
+            let mut authority = Vec::new();
+            for i in 0..(MAX_DENIAL_RECORDS + 4) {
+                authority.extend(bogus_nsec3(&signer, &format!("{i:032}")));
+            }
+            authority.extend(signed_nodata_nsec3(&signer));
+
+            let qname = Name::new_unchecked("a.example");
+            assert!(matches!(
+                prove_nodata(&qname, A, &authority, &signer.keys()),
+                Err(DenialError::NoProof { .. })
+            ));
+        }
+
+        #[test]
+        fn nsec3_denial_proof_survives_small_padding() {
+            // A few pad records ahead of the real record stay within the cap, so a
+            // legitimate proof still passes: the generous bound does not affect a
+            // real denial (finding H3).
+            let signer = Signer::new();
+            let mut authority = Vec::new();
+            for i in 0..3 {
+                authority.extend(bogus_nsec3(&signer, &format!("{i:032}")));
+            }
+            authority.extend(signed_nodata_nsec3(&signer));
+
+            let qname = Name::new_unchecked("a.example");
+            assert!(prove_nodata(&qname, A, &authority, &signer.keys()).is_ok());
         }
     }
 
