@@ -1511,6 +1511,68 @@ mod tests {
         }
 
         #[test]
+        fn validates_target_deep_below_zone_apex() {
+            // A target several labels below the signing zone apex, where none of
+            // the intermediate labels is a zone cut, so `zones` lists only the
+            // signing zone. This mirrors the resolver skipping non-cut ancestors:
+            // the chain must still validate.
+            let rng = SystemRandom::new();
+            let root = Zone::new("", &rng);
+            let child = Zone::new("example", &rng);
+
+            let root_dnskeys = root.signed_dnskeys(&rng);
+            let ds_records = vec![ResourceRecord::new(
+                Name::new_unchecked("example").into_owned(),
+                CLASS::IN,
+                3600,
+                RData::DS(child.ds()),
+            )];
+            let ds_rrsig = root.sign(&ds_records, 43, "example", &rng);
+            let child_dnskeys = child.signed_dnskeys(&rng);
+
+            let target_records = vec![ResourceRecord::new(
+                Name::new_unchecked("a.b.c.example").into_owned(),
+                CLASS::IN,
+                3600,
+                RData::A(A {
+                    address: u32::from_be_bytes([192, 0, 2, 9]),
+                }),
+            )];
+            let target_rrsig = child.sign(&target_records, 1, "a.b.c.example", &rng);
+
+            let chain = ChainOfTrust {
+                root_dnskeys,
+                zones: vec![DelegatedZone {
+                    delegation: SignedRrset {
+                        records: ds_records,
+                        rrsigs: vec![ds_rrsig],
+                    },
+                    dnskeys: child_dnskeys,
+                }],
+                target: SignedRrset {
+                    records: target_records,
+                    rrsigs: vec![target_rrsig],
+                },
+            };
+            assert!(verify_chain_with_anchors(&chain, &[root.ds()]).is_ok());
+        }
+
+        #[test]
+        fn fails_when_signing_zone_is_not_reached() {
+            // If the signing zone's DS were stripped, the resolver would skip it
+            // as a non-cut and it would never enter `zones`. The target, still
+            // signed by that zone's key, must then fail to validate against the
+            // only remaining trusted set (the root), keeping the walk fail-closed.
+            let rng = SystemRandom::new();
+            let (mut chain, anchors) = good_chain(&rng);
+            chain.zones.clear();
+            assert!(matches!(
+                verify_chain_with_anchors(&chain, &anchors),
+                Err(ChainError::NoSigningKey { .. })
+            ));
+        }
+
+        #[test]
         fn embedded_anchors_have_expected_tags() {
             let tags: Vec<u16> = ROOT_TRUST_ANCHORS.iter().map(|ds| ds.key_tag).collect();
             assert_eq!(tags, vec![20326, 38696]);

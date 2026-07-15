@@ -41,9 +41,6 @@ enum ValidateError {
     /// No DNSKEY RRset with its signature could be fetched for a zone.
     #[error("no signed DNSKEY RRset for zone {zone}")]
     MissingDnskey { zone: String },
-    /// No DS RRset with its signature could be fetched for a zone.
-    #[error("no signed DS RRset for zone {zone}")]
-    MissingDs { zone: String },
     /// Fetching the DNSKEY or DS records failed at the query layer.
     #[error("failed to fetch DNSSEC records")]
     Fetch { source: AnyError },
@@ -130,12 +127,25 @@ impl SimpleDnsResolver {
                 })
             })?;
 
+        // Discover the real secure zone cuts between the root and the signing
+        // zone. Not every label boundary is a delegation: a zone can hold names
+        // several labels deep, and a delegation may skip labels. Query the DS at
+        // each ancestor and treat the ancestor as a cut only when it publishes a
+        // signed DS RRset; skip the ones that do not rather than failing on a
+        // spurious "missing DS".
+        //
+        // This stays fail-closed for the target. If the signing zone's own DS is
+        // stripped, its DNSKEY set never enters the trusted set, so the answer's
+        // RRSIG matches no trusted key and the chain fails. If an intermediate DS
+        // is stripped, the next present zone's delegating DS is no longer signed
+        // by the trusted parent, so that link fails. Skipping a genuinely
+        // stripped DS cannot turn a Bogus answer into a valid one.
         let mut zones = Vec::new();
         for zone in zone_ancestors(&signing_zone) {
-            let delegation = self
-                .fetch_signed_rrset(&zone, TYPE::DS)
-                .await?
-                .ok_or_else(|| e!(ValidateError::MissingDs { zone: zone.clone() }))?;
+            let Some(delegation) = self.fetch_signed_rrset(&zone, TYPE::DS).await? else {
+                debug!(zone = %zone, "no signed DS, treating as a non-cut and skipping");
+                continue;
+            };
             let dnskeys = self
                 .fetch_signed_rrset(&zone, TYPE::DNSKEY)
                 .await?
