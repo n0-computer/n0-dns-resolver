@@ -142,6 +142,11 @@ pub struct SimpleDnsResolver {
     /// before it is returned. See [`Builder::validate_dnssec`].
     #[cfg(feature = "dnssec")]
     validate_dnssec: bool,
+    /// Caches validated per-zone trust results so repeated validations and
+    /// shared ancestors do not re-fetch the whole chain. See
+    /// [`Self::trusted_keys_for_zone`].
+    #[cfg(feature = "dnssec")]
+    dnssec_cache: dnssec_validate::DnssecCache,
     /// The settings this resolver was built from, kept so [`Self::reset`] can
     /// rebuild against a changed network.
     builder: Builder,
@@ -253,6 +258,8 @@ impl SimpleDnsResolver {
             hosts,
             #[cfg(feature = "dnssec")]
             validate_dnssec: builder.validate_dnssec,
+            #[cfg(feature = "dnssec")]
+            dnssec_cache: dnssec_validate::DnssecCache::new(),
             builder,
         }
     }

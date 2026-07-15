@@ -20,6 +20,12 @@
 //! answer is not yet wired, because [`super::query::check_response`] turns it into
 //! [`crate::Error::NxDomain`] before validation runs.
 
+use std::{
+    sync::{Arc, Mutex},
+    time::{Duration, Instant},
+};
+
+use lru::LruCache;
 use n0_error::{AnyError, e, stack_error};
 use simple_dns::{
     Name, Packet, TYPE,
@@ -36,6 +42,25 @@ use crate::{
         verify_rrset_with_keys,
     },
 };
+
+/// The deepest signing zone the chain walk will fetch keys for.
+///
+/// [`SimpleDnsResolver::trusted_keys_for_zone`] walks every ancestor zone cut of
+/// the signing zone, issuing DS and DNSKEY queries at each. A [`Name`] may hold
+/// up to roughly 127 labels, which would be around 250 outbound queries for a
+/// single lookup. Real signing zones are only a few labels deep, so a zone with
+/// more ancestor cuts than this fails closed rather than fetching unboundedly.
+const MAX_ZONE_DEPTH: usize = 16;
+
+/// Maximum number of zones whose trust result is cached at once.
+const MAX_TRUSTED_ZONE_ENTRIES: usize = 64;
+
+/// How long a cached zone-trust result stays valid.
+///
+/// Short so a DNSKEY rollover or a DS change is picked up within a minute, while
+/// still sparing repeated validations of the same signing zone (and shared
+/// ancestors like the root and `com`) a fresh chain fetch each time.
+const TRUSTED_ZONE_TTL: Duration = Duration::from_secs(60);
 
 /// A reason answer validation could not complete or did not pass.
 ///
@@ -77,15 +102,73 @@ enum ValidateError {
     /// The authority section did not prove the queried type is absent (NODATA).
     #[error("NODATA denial for {name} is not proven")]
     DenialUnproven { name: String, source: DenialError },
+    /// The signing zone is nested deeper than [`MAX_ZONE_DEPTH`] allows, so the
+    /// chain walk would issue an unbounded number of queries.
+    #[error("signing zone {zone} is too deep ({depth} labels) to validate")]
+    ZoneTooDeep { zone: String, depth: usize },
 }
 
 /// The result of building a zone's trusted DNSKEY set.
+#[derive(Debug, Clone)]
 enum ZoneTrust {
     /// The zone is signed; these DNSKEYs are trusted for it.
     Secure(Vec<DNSKEY<'static>>),
     /// An ancestor delegation proved no DS, so the zone and everything below the
     /// cut is unsigned. The caller accepts the answer as-is (Insecure).
     Insecure,
+}
+
+/// A cache of validated per-zone trust results, keyed by zone name.
+///
+/// Only validated conclusions are stored: a Secure zone's trusted DNSKEY set or
+/// a proven-insecure delegation. Entries expire after [`TRUSTED_ZONE_TTL`], so a
+/// key rollover is picked up promptly. Cloning shares the underlying map, so a
+/// resolver rebuilt on a network change keeps one cache across its clones.
+#[derive(Debug, Clone)]
+pub(super) struct DnssecCache {
+    inner: Arc<Mutex<LruCache<String, CachedTrust>>>,
+}
+
+/// A cached zone-trust result together with its expiry deadline.
+#[derive(Debug, Clone)]
+struct CachedTrust {
+    trust: ZoneTrust,
+    expires_at: Instant,
+}
+
+impl DnssecCache {
+    /// Creates an empty cache.
+    pub(super) fn new() -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(LruCache::new(
+                std::num::NonZeroUsize::new(MAX_TRUSTED_ZONE_ENTRIES).expect("non-zero"),
+            ))),
+        }
+    }
+
+    /// Returns the cached trust for `zone`, or `None` when it is absent or has
+    /// expired.
+    fn get(&self, zone: &str) -> Option<ZoneTrust> {
+        let mut inner = self.inner.lock().expect("poisoned");
+        let entry = inner.get(zone)?;
+        if Instant::now() >= entry.expires_at {
+            inner.pop(zone);
+            return None;
+        }
+        Some(entry.trust.clone())
+    }
+
+    /// Stores a validated trust result for `zone`.
+    fn insert(&self, zone: &str, trust: ZoneTrust) {
+        let entry = CachedTrust {
+            trust,
+            expires_at: Instant::now() + TRUSTED_ZONE_TTL,
+        };
+        self.inner
+            .lock()
+            .expect("poisoned")
+            .put(zone.to_string(), entry);
+    }
 }
 
 impl SimpleDnsResolver {
@@ -286,6 +369,25 @@ impl SimpleDnsResolver {
     /// genuinely signed delegation yields no valid absence proof, so the zone's
     /// keys never enter the trusted set and the answer's RRSIG matches none.
     async fn trusted_keys_for_zone(&self, zone: &str) -> Result<ZoneTrust, ValidateError> {
+        // Bound the walk before any fetch. Each ancestor zone cut costs uncached
+        // DS and DNSKEY queries, so a deep name could drive hundreds of outbound
+        // queries per lookup. Real signing zones are shallow, so a zone with more
+        // ancestor cuts than the cap fails closed (Bogus) rather than fetching
+        // unboundedly.
+        let ancestors = zone_ancestors(zone);
+        if ancestors.len() > MAX_ZONE_DEPTH {
+            return Err(e!(ValidateError::ZoneTooDeep {
+                zone: zone.to_string(),
+                depth: ancestors.len(),
+            }));
+        }
+
+        // A validated trust result for this zone may already be cached from an
+        // earlier lookup, sparing the whole chain fetch.
+        if let Some(trust) = self.dnssec_cache.get(zone) {
+            return Ok(trust);
+        }
+
         let root_dnskeys = self
             .fetch_signed_rrset(".", TYPE::DNSKEY)
             .await?
@@ -298,7 +400,7 @@ impl SimpleDnsResolver {
         let mut trusted = trust_root(&root_dnskeys, ROOT_TRUST_ANCHORS)
             .map_err(|source| e!(ValidateError::Chain, source))?;
 
-        for ancestor in zone_ancestors(zone) {
+        for ancestor in ancestors {
             let ds_response = self.fetch_raw(&ancestor, TYPE::DS).await?;
             if let Some(delegation) = parse_signed_rrset(&ds_response, &ancestor, TYPE::DS) {
                 let dnskeys = self
@@ -319,12 +421,15 @@ impl SimpleDnsResolver {
                 let authority = authority_records(&ds_response);
                 if prove_no_ds(&child, &authority, &trusted).is_ok() {
                     debug!(zone = %ancestor, "insecure delegation proven; zone is unsigned");
+                    self.dnssec_cache.insert(zone, ZoneTrust::Insecure);
                     return Ok(ZoneTrust::Insecure);
                 }
                 debug!(zone = %ancestor, "no signed DS, treating as a non-cut and skipping");
             }
         }
-        Ok(ZoneTrust::Secure(trusted))
+        let trust = ZoneTrust::Secure(trusted);
+        self.dnssec_cache.insert(zone, trust.clone());
+        Ok(trust)
     }
 
     /// Queries `name` for `qtype` with the DO bit set and returns the RRset of
@@ -821,5 +926,39 @@ mod tests {
         // queried name is host.example.com.
         let response = reply_with_signed_a("host.attacker.com");
         assert!(parse_signed_rrset(&response, "host.example.com", TYPE::A).is_none());
+    }
+
+    /// A signing zone nested deeper than [`MAX_ZONE_DEPTH`] must fail closed
+    /// before any fetch, rather than walking an unbounded chain of zone cuts
+    /// (finding H4). The check runs ahead of the root DNSKEY fetch, so a resolver
+    /// with no nameservers still reaches it.
+    #[tokio::test]
+    async fn trusted_keys_for_zone_rejects_a_too_deep_zone() {
+        let resolver = SimpleDnsResolver::builder()
+            .without_system_defaults()
+            .disable_fallback()
+            .validate_dnssec()
+            .build();
+        let deep = vec!["a"; MAX_ZONE_DEPTH + 1].join(".");
+        let result = resolver.trusted_keys_for_zone(&deep).await;
+        assert!(
+            matches!(result, Err(ValidateError::ZoneTooDeep { .. })),
+            "a too-deep zone must be rejected, got {result:?}"
+        );
+    }
+
+    /// The zone-trust cache stores and returns a validated result and reports a
+    /// miss for an unknown zone (finding H4).
+    #[test]
+    fn dnssec_cache_round_trips_a_trust_result() {
+        let cache = DnssecCache::new();
+        assert!(cache.get("example.com").is_none());
+        cache.insert("example.com", ZoneTrust::Insecure);
+        assert!(matches!(
+            cache.get("example.com"),
+            Some(ZoneTrust::Insecure)
+        ));
+        // A different zone name is a miss.
+        assert!(cache.get("example.net").is_none());
     }
 }
