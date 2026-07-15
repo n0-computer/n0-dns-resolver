@@ -13,7 +13,7 @@
 //! RRset is validated; CNAME hops are followed but not individually checked.
 
 use n0_error::{AnyError, e, stack_error};
-use simple_dns::{Packet, TYPE, rdata::RData};
+use simple_dns::{Name, Packet, TYPE, rdata::RData};
 use tracing::{debug, warn};
 
 use super::SimpleDnsResolver;
@@ -34,6 +34,10 @@ enum ValidateError {
     /// The answer carried no RRSIG covering the queried type.
     #[error("answer carried no RRSIG for the queried type")]
     MissingSignature {},
+    /// The RRSIG signer name is neither the answer's owner name nor an ancestor
+    /// of it, so the signing zone is not authoritative for the answer.
+    #[error("RRSIG signer {signer} is not authoritative for {owner}")]
+    SignerNotAuthoritative { signer: String, owner: String },
     /// No DNSKEY RRset with its signature could be fetched for a zone.
     #[error("no signed DNSKEY RRset for zone {zone}")]
     MissingDnskey { zone: String },
@@ -68,6 +72,24 @@ impl SimpleDnsResolver {
     async fn validate_inner(&self, qtype: TYPE, response: &[u8]) -> Result<(), ValidateError> {
         let target = parse_signed_rrset(response, qtype)
             .ok_or_else(|| e!(ValidateError::MissingSignature))?;
+
+        // The signer name is attacker-controlled, so it must be checked against
+        // the answer before it is trusted to name the signing zone. Only the
+        // answer's own zone or an ancestor may sign it (RFC 4035 5.3.1);
+        // otherwise the holder of any signed zone could sign records for any
+        // name and the chain to the root would still validate.
+        let owner = target
+            .records
+            .first()
+            .ok_or_else(|| e!(ValidateError::MissingSignature))?
+            .name
+            .clone();
+        if !signer_is_authoritative(&target.rrsig.signer_name, &owner) {
+            return Err(e!(ValidateError::SignerNotAuthoritative {
+                signer: target.rrsig.signer_name.to_string(),
+                owner: owner.to_string(),
+            }));
+        }
 
         // The RRSIG signer names the zone that signed the answer. Validate from
         // the root down through every zone cut between them.
@@ -126,6 +148,20 @@ impl SimpleDnsResolver {
             .map_err(|err| e!(ValidateError::Fetch, AnyError::from_stack(err)))?;
         Ok(parse_signed_rrset(&response, qtype))
     }
+}
+
+/// Returns whether `signer` may sign records owned by `owner`.
+///
+/// A zone signs only the names at or below its apex, so the signer must equal
+/// `owner` or be an ancestor of it: its labels must be a suffix of `owner`'s,
+/// compared case-insensitively. This rejects an RRSIG whose signer is an
+/// unrelated (but validly signed) zone, which would otherwise chain to the root
+/// and validate.
+fn signer_is_authoritative(signer: &Name<'_>, owner: &Name<'_>) -> bool {
+    let signer_labels: Vec<Vec<u8>> = signer.as_bytes().map(<[u8]>::to_ascii_lowercase).collect();
+    let owner_labels: Vec<Vec<u8>> = owner.as_bytes().map(<[u8]>::to_ascii_lowercase).collect();
+    signer_labels.len() <= owner_labels.len()
+        && owner_labels[owner_labels.len() - signer_labels.len()..] == signer_labels[..]
 }
 
 /// Splits a zone name into its ancestor zones, from the top-level domain down to
@@ -188,6 +224,40 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn signer_must_be_owner_or_ancestor() {
+        let owner = Name::new_unchecked("host.example.com");
+        // The owning zone and its ancestors may sign.
+        assert!(signer_is_authoritative(
+            &Name::new_unchecked("example.com"),
+            &owner
+        ));
+        assert!(signer_is_authoritative(
+            &Name::new_unchecked("host.example.com"),
+            &owner
+        ));
+        assert!(signer_is_authoritative(&Name::new_unchecked("com"), &owner));
+        // Case does not matter.
+        assert!(signer_is_authoritative(
+            &Name::new_unchecked("Example.COM"),
+            &owner
+        ));
+        // An unrelated but validly signed zone must not sign for this name.
+        assert!(!signer_is_authoritative(
+            &Name::new_unchecked("attacker.com"),
+            &owner
+        ));
+        assert!(!signer_is_authoritative(
+            &Name::new_unchecked("example.org"),
+            &owner
+        ));
+        // A name longer than the owner cannot be an ancestor.
+        assert!(!signer_is_authoritative(
+            &Name::new_unchecked("a.host.example.com"),
+            &owner
+        ));
+    }
 
     #[test]
     fn zone_ancestors_orders_parent_to_child() {
