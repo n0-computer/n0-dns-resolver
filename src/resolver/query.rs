@@ -9,7 +9,8 @@ use simple_dns::{
 };
 
 use crate::{
-    CaaRecordData, MxRecordData, Record, RecordKind, SrvRecordData, SvcbRecordData, TxtRecordData,
+    CaaRecordData, HttpsRecord, MxRecordData, Record, RecordKind, SrvRecordData, SvcbRecordData,
+    TxtRecordData,
 };
 
 /// Errors that can occur while building a query packet or parsing a response.
@@ -187,7 +188,7 @@ pub(super) fn check_response(
 /// records and the minimum TTL across them.
 fn parse_response<T>(
     data: &[u8],
-    extract: impl Fn(&RData<'_>) -> Option<T>,
+    extract: impl Fn(&Name<'_>, &RData<'_>) -> Option<T>,
 ) -> Result<(Vec<T>, u32), QueryError> {
     let packet =
         Packet::parse(data).map_err(|e| e!(QueryError::Malformed, AnyError::from_std(e)))?;
@@ -214,7 +215,7 @@ fn parse_response<T>(
         // final response here, so those intermediate CNAME TTLs are not folded.
         if matches!(rr.rdata, RData::CNAME(_)) {
             min_ttl = min_ttl.min(rr.ttl);
-        } else if let Some(val) = extract(&rr.rdata) {
+        } else if let Some(val) = extract(&rr.name, &rr.rdata) {
             results.push(val);
             min_ttl = min_ttl.min(rr.ttl);
         }
@@ -235,23 +236,23 @@ pub(super) fn parse_records(
     kind: RecordKind,
 ) -> Result<(Vec<Record>, u32), QueryError> {
     match kind {
-        RecordKind::A => parse_response(data, |rdata| match rdata {
+        RecordKind::A => parse_response(data, |_, rdata| match rdata {
             RData::A(A { address }) => Some(Record::A(Ipv4Addr::from(*address))),
             _ => None,
         }),
-        RecordKind::Aaaa => parse_response(data, |rdata| match rdata {
+        RecordKind::Aaaa => parse_response(data, |_, rdata| match rdata {
             RData::AAAA(AAAA { address }) => Some(Record::Aaaa(Ipv6Addr::from(*address))),
             _ => None,
         }),
-        RecordKind::Txt => parse_response(data, |rdata| match rdata {
+        RecordKind::Txt => parse_response(data, |_, rdata| match rdata {
             RData::TXT(txt) => Some(Record::Txt(extract_txt_record_data(txt))),
             _ => None,
         }),
-        RecordKind::Ns => parse_response(data, |rdata| match rdata {
+        RecordKind::Ns => parse_response(data, |_, rdata| match rdata {
             RData::NS(ns) => Some(Record::Ns(ns.0.to_string())),
             _ => None,
         }),
-        RecordKind::Srv => parse_response(data, |rdata| match rdata {
+        RecordKind::Srv => parse_response(data, |_, rdata| match rdata {
             RData::SRV(srv) => Some(Record::Srv(SrvRecordData {
                 priority: srv.priority,
                 weight: srv.weight,
@@ -260,14 +261,14 @@ pub(super) fn parse_records(
             })),
             _ => None,
         }),
-        RecordKind::Mx => parse_response(data, |rdata| match rdata {
+        RecordKind::Mx => parse_response(data, |_, rdata| match rdata {
             RData::MX(mx) => Some(Record::Mx(MxRecordData {
                 preference: mx.preference,
                 exchange: mx.exchange.to_string(),
             })),
             _ => None,
         }),
-        RecordKind::Caa => parse_response(data, |rdata| match rdata {
+        RecordKind::Caa => parse_response(data, |_, rdata| match rdata {
             RData::CAA(caa) => Some(Record::Caa(CaaRecordData {
                 flag: caa.flag,
                 tag: caa.tag.to_string(),
@@ -275,12 +276,15 @@ pub(super) fn parse_records(
             })),
             _ => None,
         }),
-        RecordKind::Svcb => parse_response(data, |rdata| match rdata {
+        RecordKind::Svcb => parse_response(data, |_, rdata| match rdata {
             RData::SVCB(svcb) => Some(Record::Svcb(extract_svcb(svcb))),
             _ => None,
         }),
-        RecordKind::Https => parse_response(data, |rdata| match rdata {
-            RData::HTTPS(https) => Some(Record::Https(extract_svcb(&https.0))),
+        RecordKind::Https => parse_response(data, |name, rdata| match rdata {
+            RData::HTTPS(https) => Some(Record::Https(HttpsRecord::new(
+                name.to_string(),
+                extract_svcb(&https.0),
+            ))),
             _ => None,
         }),
     }
@@ -724,10 +728,47 @@ mod tests {
             RData::HTTPS(sample_svcb().into()),
         );
         let (records, _) = parse_records(&resp, RecordKind::Https).unwrap();
-        let [Record::Https(svcb)] = records.as_slice() else {
+        let [Record::Https(https)] = records.as_slice() else {
             panic!("expected one HTTPS record, got {records:?}");
         };
-        assert_sample_svcb(svcb);
+        assert_sample_svcb(https.svcb());
+    }
+
+    /// The [`HttpsRecord`] helpers apply the RFC 9460 rules a raw parameter read
+    /// would miss: AliasMode vs ServiceMode, the root-target-uses-owner rule
+    /// (Section 2.5.2), and the default `http/1.1` ALPN (Sections 7.1.1 and 9.5).
+    #[test]
+    fn https_record_helpers() {
+        // Parse one HTTPS record from raw rdata; the owner is EXAMPLE_WIRE.
+        fn https(rdata: &[u8]) -> HttpsRecord {
+            let resp = raw_response(TYPE_HTTPS, EXAMPLE_WIRE, EXAMPLE_WIRE, TYPE_HTTPS, rdata);
+            let (records, _) = parse_records(&resp, RecordKind::Https).expect("vector parses");
+            match records.as_slice() {
+                [Record::Https(https)] => https.clone(),
+                other => panic!("expected one HTTPS record, got {other:?}"),
+            }
+        }
+
+        // ServiceMode (priority 1), root target, alpn=[h2]: the default http/1.1
+        // is appended, and the root target resolves to the owner name.
+        let svc = https(b"\x00\x01\x00\x00\x01\x00\x03\x02h2");
+        assert!(svc.is_service() && !svc.is_alias());
+        assert_eq!(svc.alpn(), ["h2"]);
+        assert_eq!(svc.alpn_protocols(), ["h2", "http/1.1"]);
+        assert!(svc.supports_http2());
+        assert!(!svc.supports_http3());
+        assert_eq!(svc.effective_target(), "example.com");
+
+        // no-default-alpn suppresses the http/1.1 default.
+        let no_default = https(b"\x00\x01\x00\x00\x01\x00\x03\x02h2\x00\x02\x00\x00");
+        assert!(no_default.no_default_alpn());
+        assert_eq!(no_default.alpn_protocols(), ["h2"]);
+
+        // AliasMode (priority 0): no endpoint, so no ALPN; the target is used as-is.
+        let alias = https(b"\x00\x00\x03svc\x07example\x03com\x00");
+        assert!(alias.is_alias());
+        assert!(alias.alpn_protocols().is_empty());
+        assert_eq!(alias.effective_target(), "svc.example.com");
     }
 
     /// The header-peek helpers run on raw, unvalidated bytes before the response
@@ -825,7 +866,8 @@ mod tests {
         let resp = raw_response(rtype, EXAMPLE_WIRE, EXAMPLE_WIRE, rtype, rdata);
         let (records, _) = parse_records(&resp, kind).expect("vector should parse");
         match records.as_slice() {
-            [Record::Svcb(svcb)] | [Record::Https(svcb)] => svcb.clone(),
+            [Record::Svcb(svcb)] => svcb.clone(),
+            [Record::Https(https)] => https.svcb().clone(),
             other => panic!("expected one SVCB/HTTPS record, got {other:?}"),
         }
     }

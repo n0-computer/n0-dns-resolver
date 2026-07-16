@@ -18,8 +18,8 @@ use simple_dns::TYPE;
 use tracing::{debug, trace, warn};
 
 use crate::{
-    Builder, DnsProtocol, Error, FallbackMode, MxRecordData, Nameserver, Record, RecordKind,
-    SrvRecordData, SvcbRecordData, TxtRecordData,
+    Builder, DnsProtocol, Error, FallbackMode, HttpsRecord, MxRecordData, Nameserver, Record,
+    RecordKind, SrvRecordData, SvcbRecordData, TxtRecordData,
     config::DnsConfig,
     system_config::{self, Hosts},
 };
@@ -811,11 +811,15 @@ impl SimpleDnsResolver {
     }
 
     /// Looks up the HTTPS service binding records for `host`.
+    ///
+    /// Returns [`HttpsRecord`]s, which layer HTTPS-specific helpers (the
+    /// AliasMode/ServiceMode distinction, the effective target name, and the
+    /// default `http/1.1` ALPN) over the raw service binding.
     pub async fn lookup_https(
         &self,
         host: String,
-    ) -> Result<impl Iterator<Item = SvcbRecordData> + use<>, Error> {
-        let records: Vec<SvcbRecordData> = self
+    ) -> Result<impl Iterator<Item = HttpsRecord> + use<>, Error> {
+        let records: Vec<HttpsRecord> = self
             .lookup_record(host, RecordKind::Https)
             .await?
             .into_iter()

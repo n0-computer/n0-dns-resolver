@@ -358,7 +358,7 @@ pub enum Record {
     /// The service binding of an SVCB record.
     Svcb(SvcbRecordData),
     /// The service binding of an HTTPS record.
-    Https(SvcbRecordData),
+    Https(HttpsRecord),
 }
 
 /// Record data for an SRV record, as defined in [RFC 2782].
@@ -509,6 +509,148 @@ impl SvcbRecordData {
         self.0
             .iter_params()
             .any(|param| matches!(param, SVCParam::NoDefaultAlpn))
+    }
+}
+
+/// A parsed HTTPS record ([RFC 9460] type 65), with helpers for using the service
+/// binding.
+///
+/// HTTPS records share the SVCB wire format but add HTTP-scheme semantics, so this
+/// wraps the underlying [`SvcbRecordData`] (reachable through [`Self::svcb`] for
+/// the raw parameters) together with the record's owner name, and layers on the
+/// HTTPS-specific rules: the AliasMode/ServiceMode distinction (RFC 9460 Section
+/// 2.4), the `"."` target rule (Section 2.5), and the default `http/1.1` ALPN
+/// (Section 7.1.1 and Section 9.5). It is what [`SimpleDnsResolver::lookup_https`]
+/// returns.
+///
+/// [RFC 9460]: https://datatracker.ietf.org/doc/html/rfc9460
+#[derive(Debug, Clone)]
+pub struct HttpsRecord {
+    /// The record's owner name, needed to resolve a `"."` target (RFC 9460
+    /// Section 2.5.2).
+    owner: String,
+    data: SvcbRecordData,
+}
+
+impl HttpsRecord {
+    /// Wraps `data` with the `owner` name the record was found at.
+    pub(crate) fn new(owner: String, data: SvcbRecordData) -> Self {
+        Self { owner, data }
+    }
+
+    /// The underlying SVCB-format record data, for the raw parameter accessors.
+    pub fn svcb(&self) -> &SvcbRecordData {
+        &self.data
+    }
+
+    /// The `SvcPriority`. A value of 0 marks AliasMode, any other value marks
+    /// ServiceMode (RFC 9460 Section 2.4).
+    pub fn priority(&self) -> u16 {
+        self.data.priority()
+    }
+
+    /// Whether this record is in AliasMode (`SvcPriority == 0`), pointing at
+    /// another name to resolve rather than describing an endpoint (RFC 9460
+    /// Section 2.4.2). This resolver does not chase the alias; read where it
+    /// points with [`Self::effective_target`].
+    pub fn is_alias(&self) -> bool {
+        self.priority() == 0
+    }
+
+    /// Whether this record is in ServiceMode (`SvcPriority != 0`), describing an
+    /// endpoint and its parameters (RFC 9460 Section 2.4.3).
+    pub fn is_service(&self) -> bool {
+        self.priority() != 0
+    }
+
+    /// The `TargetName` as it appears in the record. The root target (`.`) is
+    /// reported as an empty string; see [`Self::effective_target`].
+    pub fn target(&self) -> String {
+        self.data.target()
+    }
+
+    /// The effective target name to connect to.
+    ///
+    /// A root `TargetName` (`.`, the empty string here) means "use this record's
+    /// own owner name" in ServiceMode (RFC 9460 Section 2.5.2), so this returns
+    /// the owner in that case and the target otherwise. In AliasMode a root target
+    /// instead signals that the service does not exist (Section 2.5.1), so check
+    /// [`Self::is_alias`] first when that distinction matters.
+    pub fn effective_target(&self) -> String {
+        let target = self.data.target();
+        if target.is_empty() {
+            self.owner.clone()
+        } else {
+            target
+        }
+    }
+
+    /// The ALPN protocol identifiers from the `alpn` parameter, exactly as the
+    /// record carries them (empty when absent). See [`Self::alpn_protocols`] for
+    /// the set with the HTTPS default applied.
+    pub fn alpn(&self) -> Vec<String> {
+        self.data.alpn()
+    }
+
+    /// The effective set of ALPN protocol identifiers for this endpoint.
+    ///
+    /// This is the `alpn` list plus the HTTPS scheme default of `http/1.1`, unless
+    /// the record sets `no-default-alpn` (RFC 9460 Section 7.1.1 for the
+    /// mechanism, Section 9.5 for the `http/1.1` default); the default is not added
+    /// when `http/1.1` is already listed. An AliasMode record describes no
+    /// endpoint, so this is empty for it.
+    pub fn alpn_protocols(&self) -> Vec<String> {
+        if self.is_alias() {
+            return Vec::new();
+        }
+        let mut protocols = self.data.alpn();
+        if !self.data.no_default_alpn() && !protocols.iter().any(|p| p == "http/1.1") {
+            protocols.push("http/1.1".to_string());
+        }
+        protocols
+    }
+
+    /// Whether this endpoint advertises HTTP/2 (ALPN `h2`), accounting for the
+    /// HTTPS default ALPN.
+    pub fn supports_http2(&self) -> bool {
+        self.alpn_protocols().iter().any(|p| p == "h2")
+    }
+
+    /// Whether this endpoint advertises HTTP/3 (ALPN `h3`), accounting for the
+    /// HTTPS default ALPN.
+    pub fn supports_http3(&self) -> bool {
+        self.alpn_protocols().iter().any(|p| p == "h3")
+    }
+
+    /// The port from the `port` parameter, if present.
+    pub fn port(&self) -> Option<u16> {
+        self.data.port()
+    }
+
+    /// The IPv4 address hints from the `ipv4hint` parameter.
+    pub fn ipv4hint(&self) -> Vec<Ipv4Addr> {
+        self.data.ipv4hint()
+    }
+
+    /// The IPv6 address hints from the `ipv6hint` parameter.
+    pub fn ipv6hint(&self) -> Vec<Ipv6Addr> {
+        self.data.ipv6hint()
+    }
+
+    /// The Encrypted ClientHello config list from the `ech` parameter, if present.
+    pub fn ech(&self) -> Option<Vec<u8>> {
+        self.data.ech()
+    }
+
+    /// The SvcParamKeys the `mandatory` parameter marks as required (RFC 9460
+    /// Section 8).
+    pub fn mandatory(&self) -> Vec<u16> {
+        self.data.mandatory()
+    }
+
+    /// Whether the `no-default-alpn` parameter is set.
+    pub fn no_default_alpn(&self) -> bool {
+        self.data.no_default_alpn()
     }
 }
 
