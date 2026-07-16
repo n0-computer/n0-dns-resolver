@@ -36,8 +36,13 @@
 //! The canonical forms follow RFC 4034 section 6, and the signature input
 //! follows RFC 4035 section 5.3.
 //!
-//! The record types come from [`simple_dns`], which this crate re-exports under
-//! the `dnssec` feature so callers can name them without a second dependency.
+//! The record types come from [`simple_dns`]. This module is internal to the
+//! resolver's DNSSEC validation and is not part of the crate's public API.
+
+// The chain-of-trust walk and the NXDOMAIN proofs are a self-contained toolkit
+// the resolver's runtime path does not call but the tests exercise. Allow that in
+// non-test builds; test builds still flag anything genuinely unused.
+#![cfg_attr(not(test), allow(dead_code))]
 
 use std::{
     borrow::Cow,
@@ -500,6 +505,9 @@ pub enum ChainError {
 /// Returns a [`ChainError`] identifying the first link that failed: an untrusted
 /// root, a DS that no DNSKEY matches, an RRset with no signing key, or a failed
 /// signature or delegation check.
+// Verifies against the real IANA root anchors, which the offline tests cannot
+// exercise (they use their own generated anchors via `verify_chain_with_anchors`).
+#[allow(dead_code)]
 pub fn verify_chain(chain: &ChainOfTrust<'_>) -> Result<(), ChainError> {
     verify_chain_with_anchors(chain, ROOT_TRUST_ANCHORS)
 }
@@ -1495,13 +1503,12 @@ fn validated_nsec3s<'a>(
         if nsec3.flags & !NSEC3_FLAG_OPT_OUT != 0 {
             continue;
         }
-        if let Some((algorithm, iterations, salt)) = &params {
-            if nsec3.hash_algorithm != *algorithm
+        if let Some((algorithm, iterations, salt)) = &params
+            && (nsec3.hash_algorithm != *algorithm
                 || nsec3.iterations != *iterations
-                || nsec3.salt != *salt
-            {
-                continue;
-            }
+                || nsec3.salt != *salt)
+        {
+            continue;
         }
         // Cap the records whose signature is checked (see [`MAX_DENIAL_RECORDS`]).
         considered += 1;

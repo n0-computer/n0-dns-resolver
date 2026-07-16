@@ -27,7 +27,7 @@ use simple_dns::{
     rdata::{A, DNSKEY, DS, NSEC, NULL, NsecTypeBitMap, RData, RRSIG},
 };
 
-use crate::{
+use crate::dnssec::{
     ChainError, ChainOfTrust, DelegatedZone, DenialError, DnssecError, ROOT_TRUST_ANCHORS,
     SignedRrset, TrustAnchor, key_tag, prove_nodata, prove_nxdomain, verify_chain_with_anchors,
     verify_chain_with_trust_anchors, verify_ds, verify_rrsig,
