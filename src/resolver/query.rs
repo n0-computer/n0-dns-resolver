@@ -336,6 +336,7 @@ fn extract_txt_record_data(txt: &simple_dns::rdata::TXT<'_>) -> TxtRecordData {
 /// Reads only the header flags, so it works even on a truncated packet whose
 /// body fails to parse. A buffer too short to hold a header is treated as not
 /// truncated; it will fail to parse downstream.
+#[cfg(transport_udp)]
 pub(super) fn is_truncated(data: &[u8]) -> bool {
     // As in `server_failure_rcode`, guard against a short buffer: this runs on
     // the raw UDP datagram before any validation, and `header_buffer::has_flags`
@@ -777,6 +778,7 @@ mod tests {
     fn header_helpers_do_not_panic_on_short_input() {
         for data in [&[][..], &[0][..], &[0, 0][..], &[0, 0, 0][..]] {
             assert_eq!(server_failure_rcode(data), None);
+            #[cfg(transport_udp)]
             assert!(!is_truncated(data));
         }
     }

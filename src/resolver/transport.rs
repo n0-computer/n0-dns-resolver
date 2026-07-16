@@ -1,45 +1,58 @@
 //! DNS transport implementations: UDP, TCP, TLS, and HTTPS.
 
-#[cfg(with_crypto_provider)]
+#[cfg(any(transport_udp, transport_tcp, transport_tls))]
+use std::io;
+#[cfg(any(transport_udp, transport_tcp, transport_tls, transport_https))]
+use std::net::SocketAddr;
+#[cfg(with_rustls)]
 use std::sync::Arc;
-use std::{io, net::SocketAddr};
 
-#[cfg(with_crypto_provider)]
+#[cfg(with_rustls)]
 use n0_error::AnyError;
+#[cfg(any(transport_udp, transport_tcp, transport_tls, transport_https))]
 use n0_error::{e, stack_error};
+#[cfg(any(transport_tcp, transport_tls))]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+#[cfg(any(transport_tcp, transport_tls))]
 use super::pool::ConnPool;
 
 /// Errors that can occur while sending a query to a single nameserver and
 /// reading its response.
 ///
 /// Mapped to [`crate::Error::Transport`] by the resolver layer.
+///
+/// Only compiled when at least one transport is enabled; with no transport the
+/// resolver never reaches a nameserver, so there is no transport error to map.
+#[cfg(any(transport_udp, transport_tcp, transport_tls, transport_https))]
 #[allow(missing_docs)]
 #[stack_error(derive, add_meta, std_sources)]
 pub(super) enum TransportError {
+    #[cfg(any(transport_udp, transport_tcp, transport_tls))]
     #[error("transport I/O failed")]
     Io {
         #[error(from)]
         source: io::Error,
     },
+    #[cfg(transport_udp)]
     #[error("response from unexpected source {actual}, expected {expected}")]
     UnexpectedSource {
         expected: SocketAddr,
         actual: SocketAddr,
     },
+    #[cfg(any(transport_tcp, transport_tls))]
     #[error("query too large for TCP framing")]
     QueryTooLarge {},
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_tls)]
     #[error("invalid TLS server name")]
     InvalidServerName { source: AnyError },
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     #[error("DNS-over-HTTPS request failed")]
     Http {
         #[error(from)]
         source: reqwest::Error,
     },
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     #[error("failed to build HTTPS client")]
     BuildClient { source: AnyError },
 }
@@ -57,6 +70,7 @@ pub(super) enum TransportError {
 /// server's UDP response always fits and a larger answer arrives with the DNS TC
 /// bit set (handled by retrying over TCP). A datagram that fills this buffer is
 /// treated as possibly truncated and also retried over TCP.
+#[cfg(transport_udp)]
 const UDP_RECV_BUFFER: usize = 4096;
 
 /// Sends a DNS query over UDP and reads the response.
@@ -65,6 +79,7 @@ const UDP_RECV_BUFFER: usize = 4096;
 /// prevent cache poisoning. The response source address is validated against
 /// the target nameserver. The returned flag is set when the datagram filled the
 /// receive buffer and may be truncated, so the caller can retry over TCP.
+#[cfg(transport_udp)]
 pub(super) async fn udp_query(
     addr: SocketAddr,
     query: &[u8],
@@ -99,6 +114,7 @@ pub(super) async fn udp_query(
 ///
 /// Uses the 2-byte length prefix framing from RFC 1035 Section 4.2.2. Shared by
 /// TCP and DoT.
+#[cfg(any(transport_tcp, transport_tls))]
 async fn framed_query<S>(stream: &mut S, query: &[u8]) -> Result<Vec<u8>, TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -121,6 +137,7 @@ where
 /// A pooled connection may have been closed by the server while idle; that only
 /// surfaces on the first read/write, so on failure we dial a fresh connection
 /// and retry the query once.
+#[cfg(transport_tcp)]
 pub(super) async fn tcp_query(
     pool: &ConnPool,
     addr: SocketAddr,
@@ -148,7 +165,7 @@ pub(super) async fn tcp_query(
 ///
 /// Reuses a pooled connection when one is available, retrying once on a fresh
 /// connection if a pooled one turns out to have been closed while idle.
-#[cfg(with_crypto_provider)]
+#[cfg(transport_tls)]
 pub(super) async fn tls_query(
     pool: &ConnPool,
     addr: SocketAddr,
@@ -183,7 +200,7 @@ pub(super) async fn tls_query(
 ///
 /// `resolves` pins each named DoH host to a fixed address, so a hostname-based
 /// DoH URL connects to that IP instead of being resolved recursively.
-#[cfg(with_crypto_provider)]
+#[cfg(transport_https)]
 pub(super) fn build_https_client(
     tls_config: Option<&Arc<rustls::ClientConfig>>,
     resolves: &[(String, SocketAddr)],
@@ -206,7 +223,7 @@ pub(super) fn build_https_client(
 /// `addr`); without it the URL is addressed by IP (e.g.
 /// `https://1.1.1.1/dns-query`), which works only for providers whose
 /// certificates include the IP address.
-#[cfg(with_crypto_provider)]
+#[cfg(transport_https)]
 pub(super) async fn https_query(
     addr: SocketAddr,
     server_name: Option<&str>,
@@ -231,7 +248,7 @@ pub(super) async fn https_query(
     Ok(bytes.to_vec())
 }
 
-#[cfg(test)]
+#[cfg(all(test, any(transport_udp, transport_tcp)))]
 mod tests {
     use std::net::Ipv4Addr;
 
@@ -284,6 +301,7 @@ mod tests {
     }
 
     /// Spawn a mock UDP server that echoes back an A response for any query.
+    #[cfg(transport_udp)]
     async fn mock_udp_server(addrs: &[Ipv4Addr]) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -301,6 +319,7 @@ mod tests {
     }
 
     /// Spawn a mock TCP server that echoes back an A response for any query.
+    #[cfg(transport_tcp)]
     async fn mock_tcp_server(addrs: &[Ipv4Addr]) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();
@@ -326,6 +345,7 @@ mod tests {
         super::super::query::build_query("example.com", TYPE::A).unwrap()
     }
 
+    #[cfg(transport_udp)]
     #[tokio::test]
     async fn test_udp_query() {
         let (addr, handle) = mock_udp_server(&[Ipv4Addr::new(93, 184, 216, 34)]).await;
@@ -335,6 +355,7 @@ mod tests {
         handle.await.unwrap();
     }
 
+    #[cfg(transport_tcp)]
     #[tokio::test]
     async fn test_tcp_query() {
         let (addr, handle) = mock_tcp_server(&[Ipv4Addr::new(93, 184, 216, 34)]).await;
@@ -345,6 +366,7 @@ mod tests {
         handle.await.unwrap();
     }
 
+    #[cfg(transport_udp)]
     #[tokio::test]
     async fn test_udp_multiple_records() {
         let expected = [
@@ -360,6 +382,7 @@ mod tests {
         handle.await.unwrap();
     }
 
+    #[cfg(transport_tcp)]
     #[tokio::test]
     async fn test_tcp_large_response() {
         let expected: Vec<Ipv4Addr> = (0..50).map(|i| Ipv4Addr::new(10, 0, 0, i)).collect();
@@ -373,6 +396,7 @@ mod tests {
 
     /// A datagram that exactly fills the receive buffer is flagged as possibly
     /// truncated, so the caller can retry over TCP.
+    #[cfg(transport_udp)]
     #[tokio::test]
     async fn udp_query_flags_full_buffer_as_maybe_truncated() {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();

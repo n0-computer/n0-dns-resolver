@@ -30,7 +30,26 @@ mod error;
 mod resolver;
 mod system_config;
 
-#[cfg(test)]
+// DoT and DoH are built on rustls, which needs a crypto provider to run. Require
+// one explicitly rather than compiling the transport away for lack of a provider.
+#[cfg(all(
+    feature = "transport-tls",
+    not(any(feature = "tls-ring", feature = "tls-aws-lc-rs"))
+))]
+compile_error!(
+    "feature `transport-tls` requires a crypto provider; also enable `tls-ring` or `tls-aws-lc-rs`"
+);
+#[cfg(all(
+    feature = "transport-https",
+    not(any(feature = "tls-ring", feature = "tls-aws-lc-rs"))
+))]
+compile_error!(
+    "feature `transport-https` requires a crypto provider; also enable `tls-ring` or `tls-aws-lc-rs`"
+);
+
+// The ported end-to-end scenarios drive lookups through a mock UDP nameserver,
+// so they need the UDP transport.
+#[cfg(all(test, transport_udp))]
 mod tests;
 
 #[cfg(any(target_os = "android", doc))]
@@ -69,7 +88,7 @@ pub struct Builder {
     nameservers: Vec<Nameserver>,
     fallback: FallbackMode,
     fallback_nameservers: Option<Vec<Nameserver>>,
-    #[cfg(with_crypto_provider)]
+    #[cfg(with_rustls)]
     tls_client_config: Option<rustls::ClientConfig>,
 }
 
@@ -80,7 +99,7 @@ impl Default for Builder {
             nameservers: Vec::new(),
             fallback: FallbackMode::default(),
             fallback_nameservers: None,
-            #[cfg(with_crypto_provider)]
+            #[cfg(with_rustls)]
             tls_client_config: None,
         }
     }
@@ -128,7 +147,7 @@ impl Builder {
     /// The connection is made to `addr`, while `server_name` drives the TLS SNI
     /// and certificate validation. Use this for providers whose certificates
     /// cover a hostname rather than the IP.
-    #[cfg(any(with_crypto_provider, doc))]
+    #[cfg(any(with_rustls, doc))]
     #[must_use]
     pub fn nameserver_with_name(
         mut self,
@@ -186,8 +205,8 @@ impl Builder {
 
     /// Sets a custom TLS client config for DNS-over-TLS and DNS-over-HTTPS.
     ///
-    /// Requires enabling either the `tls-ring` or `tls-aws-lc-rs` feature.
-    #[cfg(any(with_crypto_provider, doc))]
+    /// Requires enabling the `transport-tls` or `transport-https` feature.
+    #[cfg(with_rustls)]
     #[must_use]
     pub fn tls_client_config(mut self, config: rustls::ClientConfig) -> Self {
         self.tls_client_config = Some(config);
@@ -235,8 +254,9 @@ pub enum FallbackMode {
 pub struct Nameserver {
     pub(crate) addr: SocketAddr,
     pub(crate) protocol: DnsProtocol,
-    /// Only used for DoT/DoH, which require a crypto provider.
-    #[cfg(with_crypto_provider)]
+    /// Only used for DoT/DoH, which need rustls (the `transport-tls` or
+    /// `transport-https` feature).
+    #[cfg(with_rustls)]
     pub(crate) server_name: Option<String>,
 }
 
@@ -246,13 +266,13 @@ impl Nameserver {
         Self {
             addr,
             protocol,
-            #[cfg(with_crypto_provider)]
+            #[cfg(with_rustls)]
             server_name: None,
         }
     }
 
     /// A DoT/DoH nameserver addressed by IP but validated against `server_name`.
-    #[cfg(any(with_crypto_provider, doc))]
+    #[cfg(any(with_rustls, doc))]
     pub fn with_server_name(
         addr: SocketAddr,
         protocol: DnsProtocol,
@@ -284,14 +304,12 @@ pub enum DnsProtocol {
     /// Performs DNS lookups over TLS-encrypted TCP connections, as defined in [RFC 7858].
     ///
     /// [RFC 7858]: https://www.rfc-editor.org/rfc/rfc7858.html
-    #[cfg(with_crypto_provider)]
     Tls,
     /// DNS over HTTPS
     ///
     /// Performs DNS lookups over HTTPS, as defined in [RFC 8484].
     ///
     /// [RFC 8484]: https://www.rfc-editor.org/rfc/rfc8484.html
-    #[cfg(with_crypto_provider)]
     Https,
 }
 

@@ -40,12 +40,12 @@ const MAX_IDLE_PER_KEY: usize = 2;
 const PRUNE_INTERVAL: Duration = IDLE_TIMEOUT;
 
 /// An established DNS-over-TLS stream.
-#[cfg(with_crypto_provider)]
+#[cfg(transport_tls)]
 pub(super) type TlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 
 /// Pool key for a DoT connection: the address plus the TLS server name, so a
 /// connection is never reused for a different server name.
-#[cfg(with_crypto_provider)]
+#[cfg(transport_tls)]
 pub(super) type TlsKey = (SocketAddr, Option<String>);
 
 /// A pooled idle connection and when it was last returned to the pool.
@@ -70,16 +70,18 @@ impl<S> Idle<S> {
 /// The pooled connections, shared between the [`ConnPool`] and its pruning task.
 #[derive(Default)]
 struct Inner {
+    #[cfg(transport_tcp)]
     tcp: Mutex<HashMap<SocketAddr, Vec<Idle<TcpStream>>>>,
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_tls)]
     tls: Mutex<HashMap<TlsKey, Vec<Idle<TlsStream>>>>,
 }
 
 impl Inner {
     /// Drops every idle connection past [`IDLE_TIMEOUT`] and any key left empty.
     fn prune(&self) {
+        #[cfg(transport_tcp)]
         prune_map(&self.tcp);
-        #[cfg(with_crypto_provider)]
+        #[cfg(transport_tls)]
         prune_map(&self.tls);
     }
 }
@@ -106,11 +108,13 @@ impl ConnPool {
     }
 
     /// Takes an idle TCP connection to `addr`, if a fresh one is pooled.
+    #[cfg(transport_tcp)]
     pub(super) fn checkout_tcp(&self, addr: SocketAddr) -> Option<TcpStream> {
         take_fresh(self.inner.tcp.lock().expect("poisoned").get_mut(&addr)?)
     }
 
     /// Returns a healthy TCP connection to the pool for reuse.
+    #[cfg(transport_tcp)]
     pub(super) fn checkin_tcp(&self, addr: SocketAddr, stream: TcpStream) {
         push_capped(
             self.inner
@@ -125,13 +129,13 @@ impl ConnPool {
     }
 
     /// Takes an idle DoT connection for `key`, if a fresh one is pooled.
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_tls)]
     pub(super) fn checkout_tls(&self, key: &TlsKey) -> Option<TlsStream> {
         take_fresh(self.inner.tls.lock().expect("poisoned").get_mut(key)?)
     }
 
     /// Returns a healthy DoT connection to the pool for reuse.
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_tls)]
     pub(super) fn checkin_tls(&self, key: TlsKey, stream: TlsStream) {
         push_capped(
             self.inner
@@ -194,7 +198,7 @@ fn prune_map<K, S>(map: &Mutex<HashMap<K, Vec<Idle<S>>>>) {
     });
 }
 
-#[cfg(test)]
+#[cfg(all(test, transport_tcp))]
 mod tests {
     use super::*;
 

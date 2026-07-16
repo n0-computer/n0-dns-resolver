@@ -1,10 +1,13 @@
 //! Built-in DNS resolver using `simple-dns` for packet construction/parsing
 //! and tokio for transport.
 
-#[cfg(with_crypto_provider)]
-use std::sync::{Arc, Mutex};
+#[cfg(has_transport)]
+use std::future::Future;
+#[cfg(with_rustls)]
+use std::sync::Arc;
+#[cfg(transport_https)]
+use std::sync::Mutex;
 use std::{
-    future::Future,
     net::{Ipv4Addr, Ipv6Addr},
     time::Instant,
 };
@@ -25,17 +28,20 @@ use crate::{
 };
 
 mod cache;
+#[cfg(any(transport_tcp, transport_tls))]
 mod pool;
 mod query;
 mod rtt_map;
 mod transport;
 
+#[cfg(any(transport_tcp, transport_tls))]
+use self::pool::ConnPool;
+#[cfg(any(transport_udp, transport_tcp, transport_tls, transport_https))]
+use self::transport::TransportError;
 use self::{
     cache::{CachedResult, DnsCache, NEGATIVE_TTL_SECS},
-    pool::ConnPool,
     query::{MAX_CNAME_DEPTH, QueryError},
     rtt_map::RttMap,
-    transport::TransportError,
 };
 
 impl RecordKind {
@@ -56,6 +62,7 @@ impl RecordKind {
 }
 
 /// Maps a transport-layer failure onto the public [`Error`].
+#[cfg(any(transport_udp, transport_tcp, transport_tls, transport_https))]
 impl From<TransportError> for Error {
     fn from(err: TransportError) -> Self {
         e!(Error::Transport, AnyError::from_stack(err))
@@ -77,6 +84,7 @@ impl From<QueryError> for Error {
 }
 
 /// Per-nameserver timeout for a single attempt.
+#[cfg(has_transport)]
 const NAMESERVER_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Maximum number of nameserver queries in flight at once.
@@ -92,6 +100,7 @@ const QUERY_ATTEMPT_DELAY: Duration = Duration::from_millis(100);
 
 /// Number of UDP retry attempts per nameserver before giving up.
 /// UDP is unreliable, so a single dropped packet shouldn't be fatal.
+#[cfg(transport_udp)]
 const UDP_ATTEMPTS: usize = 2;
 
 /// Default value for `ndots` per resolv.conf(5).
@@ -121,15 +130,16 @@ pub struct SimpleDnsResolver {
     primary_count: usize,
     search_domains: Vec<String>,
     ndots: usize,
-    #[cfg(with_crypto_provider)]
+    #[cfg(with_rustls)]
     tls_config: Option<Arc<rustls::ClientConfig>>,
     /// Lazily initialized, cached reqwest client for DNS-over-HTTPS queries.
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     https_client: Mutex<Option<reqwest::Client>>,
     /// Smoothed RTT per nameserver (parallel to `nameservers`), used to order
     /// servers and re-probe demoted ones.
     rtt_map: RttMap,
     /// Pooled TCP/DoT connections, reused across queries.
+    #[cfg(any(transport_tcp, transport_tls))]
     conn_pool: ConnPool,
     cache: DnsCache,
     /// Static name-to-address mappings from the system hosts file, consulted
@@ -218,7 +228,7 @@ impl SimpleDnsResolver {
             ndots = ?system.ndots,
             "configured DNS resolver"
         );
-        #[cfg(with_crypto_provider)]
+        #[cfg(with_rustls)]
         let tls_config = builder
             .tls_client_config
             .as_ref()
@@ -237,11 +247,12 @@ impl SimpleDnsResolver {
             primary_count,
             search_domains: system.search_domains,
             ndots: system.ndots.unwrap_or(DEFAULT_NDOTS),
-            #[cfg(with_crypto_provider)]
+            #[cfg(with_rustls)]
             tls_config,
-            #[cfg(with_crypto_provider)]
+            #[cfg(transport_https)]
             https_client: Mutex::new(None),
             rtt_map,
+            #[cfg(any(transport_tcp, transport_tls))]
             conn_pool: ConnPool::new(),
             cache,
             hosts,
@@ -303,7 +314,7 @@ impl SimpleDnsResolver {
     /// Returns a clone of the cached reqwest client, creating it on first use.
     ///
     /// `reqwest::Client` uses an inner `Arc`, so cloning is cheap.
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     fn get_or_init_https_client(&self) -> Result<reqwest::Client, Error> {
         let mut guard = self.https_client.lock().expect("poisoned");
         match guard.as_ref() {
@@ -325,6 +336,7 @@ impl SimpleDnsResolver {
     }
 
     /// Run a future with [`NAMESERVER_TIMEOUT`].
+    #[cfg(has_transport)]
     async fn with_timeout<T, E: Into<AnyError>>(
         fut: impl Future<Output = Result<T, E>>,
     ) -> Result<T, Error> {
@@ -335,6 +347,13 @@ impl SimpleDnsResolver {
     }
 
     /// Query a single nameserver, with UDP retry and truncation fallback.
+    ///
+    /// A nameserver whose transport is not compiled into the crate's feature set
+    /// fails with an [`Error::Transport`] carrying an [`std::io::ErrorKind::Unsupported`].
+    #[cfg_attr(
+        not(any(transport_udp, transport_tcp, transport_tls, transport_https)),
+        allow(unused_variables, clippy::unused_async)
+    )]
     async fn query_nameserver(
         &self,
         ns: &Nameserver,
@@ -342,6 +361,7 @@ impl SimpleDnsResolver {
     ) -> Result<Vec<u8>, Error> {
         let addr = ns.addr;
         match ns.protocol {
+            #[cfg(transport_udp)]
             DnsProtocol::Udp => {
                 let mut last_err = None;
                 for attempt in 0..UDP_ATTEMPTS {
@@ -350,13 +370,28 @@ impl SimpleDnsResolver {
                         Ok((resp, maybe_truncated))
                             if maybe_truncated || query::is_truncated(&resp) =>
                         {
-                            debug!(%addr, "UDP response truncated, retrying over TCP");
-                            return Self::with_timeout(transport::tcp_query(
-                                &self.conn_pool,
-                                addr,
-                                query_bytes,
-                            ))
-                            .await;
+                            // A truncated response can only be recovered by
+                            // retrying over TCP, so fall back to it when that
+                            // transport is compiled in; otherwise return what
+                            // arrived and let the caller parse what it can.
+                            #[cfg(transport_tcp)]
+                            {
+                                debug!(%addr, "UDP response truncated, retrying over TCP");
+                                return Self::with_timeout(transport::tcp_query(
+                                    &self.conn_pool,
+                                    addr,
+                                    query_bytes,
+                                ))
+                                .await;
+                            }
+                            #[cfg(not(transport_tcp))]
+                            {
+                                debug!(
+                                    %addr,
+                                    "UDP response truncated but TCP transport disabled, returning as-is"
+                                );
+                                return Ok(resp);
+                            }
                         }
                         Ok((resp, _)) => return Ok(resp),
                         Err(e) => {
@@ -367,10 +402,11 @@ impl SimpleDnsResolver {
                 }
                 Err(last_err.unwrap_or_else(|| e!(Error::NoResponse)))
             }
+            #[cfg(transport_tcp)]
             DnsProtocol::Tcp => {
                 Self::with_timeout(transport::tcp_query(&self.conn_pool, addr, query_bytes)).await
             }
-            #[cfg(with_crypto_provider)]
+            #[cfg(transport_tls)]
             DnsProtocol::Tls => {
                 let tls_config = self
                     .tls_config
@@ -385,7 +421,7 @@ impl SimpleDnsResolver {
                 ))
                 .await
             }
-            #[cfg(with_crypto_provider)]
+            #[cfg(transport_https)]
             DnsProtocol::Https => {
                 let client = self.get_or_init_https_client()?;
                 Self::with_timeout(transport::https_query(
@@ -396,6 +432,14 @@ impl SimpleDnsResolver {
                 ))
                 .await
             }
+            #[allow(unreachable_patterns)]
+            _ => Err(e!(
+                Error::Transport,
+                AnyError::from_std(std::io::Error::new(
+                    std::io::ErrorKind::Unsupported,
+                    "this transport is not enabled in the crate's feature set",
+                ))
+            )),
         }
     }
 
@@ -884,7 +928,7 @@ impl SimpleDnsResolver {
     /// Test-only hook for the ported search-list scenarios in [`crate::tests`],
     /// which drive the public API but cannot reach these fields, since the
     /// builder only populates them from the system configuration.
-    #[cfg(test)]
+    #[cfg(all(test, transport_udp))]
     pub(crate) fn set_search(&mut self, search_domains: Vec<String>, ndots: usize) {
         self.search_domains = search_domains;
         self.ndots = ndots;
@@ -925,20 +969,22 @@ mod tests {
 
     const GOOGLE_DNS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
     const CLOUDFLARE_DNS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_tls)]
     const GOOGLE_DNS_TLS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 853);
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     const CLOUDFLARE_DNS_HTTPS: SocketAddr =
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443);
 
     /// Builds a resolver that queries a single nameserver over `proto`.
     fn with_proto(addr: SocketAddr, proto: DnsProtocol) -> SimpleDnsResolver {
-        #[cfg_attr(not(with_crypto_provider), allow(unused_mut))]
+        // The DoT branch below builds a rustls `ClientConfig`, which needs a
+        // crypto provider; without one `builder` is never reassigned.
+        #[cfg_attr(not(transport_tls), allow(unused_mut))]
         let mut builder = SimpleDnsResolver::builder()
             .without_system_defaults()
             .disable_fallback()
             .nameserver(addr, proto);
-        #[cfg(with_crypto_provider)]
+        #[cfg(transport_tls)]
         if proto == DnsProtocol::Tls {
             let root_store =
                 rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
@@ -989,14 +1035,14 @@ mod tests {
         assert_resolves_ipv4(&with_proto(CLOUDFLARE_DNS, DnsProtocol::Tcp), "google.com").await;
     }
 
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_tls)]
     #[tokio::test]
     #[ignore = "requires network access"]
     async fn resolve_ipv4_tls() {
         assert_resolves_ipv4(&with_proto(GOOGLE_DNS_TLS, DnsProtocol::Tls), "google.com").await;
     }
 
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     #[tokio::test]
     #[ignore = "requires network access"]
     async fn resolve_ipv4_https() {
@@ -1176,6 +1222,7 @@ mod tests {
 
     /// Spawns a mock UDP nameserver that answers one query with `rcode`,
     /// echoing the question and adding `answer` as an A record when given.
+    #[cfg(transport_udp)]
     async fn spawn_mock_ns(
         rcode: simple_dns::RCODE,
         answer: Option<Ipv4Addr>,
@@ -1216,6 +1263,7 @@ mod tests {
 
     /// A SERVFAIL or REFUSED response from the fastest nameserver must not be
     /// the final answer: the resolver races on to a nameserver that can answer.
+    #[cfg(transport_udp)]
     #[tokio::test]
     async fn servfail_winner_falls_through_to_next_nameserver() {
         let (bad, bad_handle) = spawn_mock_ns(simple_dns::RCODE::ServerFailure, None).await;
@@ -1299,6 +1347,7 @@ mod tests {
 
     /// When every primary nameserver fails, the lookup escalates to the fallback
     /// tier, which resolves the name.
+    #[cfg(transport_udp)]
     #[tokio::test]
     async fn escalates_to_fallback_when_primary_fails() {
         let (bad, bad_handle) = spawn_mock_ns(simple_dns::RCODE::ServerFailure, None).await;
