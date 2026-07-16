@@ -44,3 +44,28 @@ use windows::read_system_dns;
 pub(crate) fn read_system() -> Result<DnsConfig, std::io::Error> {
     read_system_dns()
 }
+
+/// Drives arbitrary bytes through the `resolv.conf` parser, for the fuzz suite.
+///
+/// The parser lives in the Unix submodule and works on `&str`, so the bytes are
+/// decoded with [`String::from_utf8_lossy`] first. On platforms without an
+/// `/etc/resolv.conf` reader there is no parser to exercise, so the call decodes
+/// the bytes and returns. Gated on the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_resolv_conf(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    #[cfg(all(unix, not(any(target_os = "android", target_vendor = "apple"))))]
+    unix::fuzz_parse_resolv_conf(&text);
+    #[cfg(not(all(unix, not(any(target_os = "android", target_vendor = "apple")))))]
+    let _ = &text;
+}
+
+/// Drives arbitrary bytes through the hosts-file parser, for the fuzz suite.
+///
+/// As with [`fuzz_resolv_conf`], the bytes are decoded with
+/// [`String::from_utf8_lossy`] before parsing. Gated on the `fuzzing` feature.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_hosts(data: &[u8]) {
+    let text = String::from_utf8_lossy(data);
+    Hosts::fuzz_parse(&text);
+}

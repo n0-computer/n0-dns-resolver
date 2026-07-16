@@ -34,6 +34,9 @@ mod config;
 #[cfg(feature = "dnssec")]
 mod dnssec;
 mod error;
+#[cfg(feature = "fuzzing")]
+#[doc(hidden)]
+pub mod fuzz;
 mod resolver;
 mod system_config;
 #[cfg(test)]

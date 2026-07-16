@@ -99,6 +99,15 @@ impl Hosts {
     pub(crate) fn from_content(content: &str) -> Self {
         Self::parse(content)
     }
+
+    /// Drives arbitrary text through [`Hosts::parse`], for the crate's fuzz suite.
+    ///
+    /// [`Hosts::parse`] is private; this shim reaches it and discards the result.
+    /// Gated on the `fuzzing` feature so it never enters a normal build.
+    #[cfg(feature = "fuzzing")]
+    pub(crate) fn fuzz_parse(content: &str) {
+        let _ = Self::parse(content);
+    }
 }
 
 #[cfg(unix)]

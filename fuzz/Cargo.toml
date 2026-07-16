@@ -1,0 +1,56 @@
+[package]
+name = "n0-dns-resolver-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.n0-dns-resolver]
+path = ".."
+features = ["fuzzing"]
+
+[features]
+# Enables the crate's DNSSEC toolkit so the `dnssec_parse` target can drive it.
+dnssec = ["n0-dns-resolver/dnssec"]
+
+# cargo-fuzz builds each target as its own binary. Keep this crate out of the
+# parent so its nightly-only, sanitizer-instrumented profile never leaks into a
+# normal build (the cargo-fuzz default).
+[workspace]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "parse_response"
+path = "fuzz_targets/parse_response.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "resolv_conf"
+path = "fuzz_targets/resolv_conf.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "hosts"
+path = "fuzz_targets/hosts.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dnssec_parse"
+path = "fuzz_targets/dnssec_parse.rs"
+test = false
+doc = false
+bench = false
+required-features = ["dnssec"]

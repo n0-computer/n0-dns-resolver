@@ -1785,6 +1785,106 @@ fn type_bit_present<'a>(windows: impl Iterator<Item = (u8, &'a [u8])>, type_code
     false
 }
 
+/// Drives arbitrary bytes through the DNSSEC wire and crypto toolkit, for the
+/// crate's fuzz suite.
+///
+/// The wire-facing code must never panic on weird-but-parseable input, so this
+/// runs the whole non-network surface over whatever a fuzzer supplies: the NSEC3
+/// RDATA parser on the raw bytes, then, if the bytes form a DNS packet, the key
+/// tag, DS, RRSIG, chain, and denial-of-existence code over the records the
+/// packet yields. Every result is discarded; only a panic would fail the target.
+/// The async `validate_answer`/`validate_nodata` paths are out of scope because
+/// they drive network I/O rather than parse untrusted bytes. Gated on the
+/// `fuzzing` feature so it never enters a normal build.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_dnssec(data: &[u8]) {
+    // The NSEC3 RDATA parser runs on raw record data with no packet framing.
+    let _ = Nsec3::parse(data);
+
+    let Ok(packet) = Packet::parse(data) else {
+        return;
+    };
+
+    // Every section can carry the record types the toolkit consumes, so gather
+    // them all into one set to drive the parsers from.
+    let mut records: Vec<ResourceRecord<'_>> = Vec::new();
+    records.extend(packet.answers.iter().cloned());
+    records.extend(packet.name_servers.iter().cloned());
+    records.extend(packet.additional_records.iter().cloned());
+
+    let dnskeys: Vec<DNSKEY<'_>> = records
+        .iter()
+        .filter_map(|rr| match &rr.rdata {
+            RData::DNSKEY(key) => Some(key.clone()),
+            _ => None,
+        })
+        .collect();
+    let dss: Vec<DS<'_>> = records
+        .iter()
+        .filter_map(|rr| match &rr.rdata {
+            RData::DS(ds) => Some(ds.clone()),
+            _ => None,
+        })
+        .collect();
+    let rrsigs: Vec<RRSIG<'_>> = records
+        .iter()
+        .filter_map(|rr| match &rr.rdata {
+            RData::RRSIG(rrsig) => Some(rrsig.clone()),
+            _ => None,
+        })
+        .collect();
+
+    // A qname to anchor the denial proofs and canonical-form code on. Prefer the
+    // question, fall back to the first record's owner, and skip the name-driven
+    // parsers entirely when the packet carries neither.
+    let Some(qname) = packet
+        .questions
+        .first()
+        .map(|question| question.qname.clone())
+        .or_else(|| records.first().map(|rr| rr.name.clone()))
+    else {
+        return;
+    };
+    let qtype = match packet.questions.first().map(|question| question.qtype) {
+        Some(QTYPE::TYPE(ty)) => u16::from(ty),
+        _ => u16::from(TYPE::A),
+    };
+
+    for key in &dnskeys {
+        let _ = key_tag(key);
+        for ds in &dss {
+            let _ = verify_ds(&qname, key, ds);
+        }
+    }
+    for rrsig in &rrsigs {
+        for key in &dnskeys {
+            let _ = verify_rrsig(rrsig, &records, key);
+        }
+    }
+
+    // Assemble a chain of trust from the gathered records and walk it. The bytes
+    // will almost never form a valid chain, but the point is that the walk fails
+    // closed rather than panicking on the canonical-form and crypto code.
+    let signed = SignedRrset {
+        records: records.clone(),
+        rrsigs: rrsigs.clone(),
+    };
+    let chain = ChainOfTrust {
+        root_dnskeys: signed.clone(),
+        zones: vec![DelegatedZone {
+            delegation: signed.clone(),
+            dnskeys: signed.clone(),
+        }],
+        target: signed,
+    };
+    let _ = verify_chain(&chain);
+
+    let _ = prove_nodata(&qname, qtype, &records, &dnskeys);
+    let _ = prove_nxdomain(&qname, &records, &dnskeys);
+    let _ = prove_no_ds(&qname, &records, &dnskeys);
+    let _ = prove_wildcard(&qname, 1, &records, &dnskeys);
+}
+
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;

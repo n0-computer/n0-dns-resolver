@@ -40,6 +40,43 @@ use self::{
     transport::TransportError,
 };
 
+/// Drives arbitrary bytes through the response parsers in [`query`], for the
+/// crate's fuzz suite.
+///
+/// The parsers are `pub(super)` and so unreachable from the out-of-crate fuzz
+/// targets; this shim reaches them and discards every result, upholding the "no
+/// panic on untrusted input" contract the fuzz suite checks. Gated on the
+/// `fuzzing` feature so it never enters a normal build.
+#[cfg(feature = "fuzzing")]
+pub(crate) fn fuzz_parse_response(data: &[u8]) {
+    use simple_dns::{Name, Packet};
+
+    for kind in [
+        RecordKind::A,
+        RecordKind::Aaaa,
+        RecordKind::Txt,
+        RecordKind::Ns,
+        RecordKind::Srv,
+        RecordKind::Mx,
+        RecordKind::Caa,
+        RecordKind::Svcb,
+        RecordKind::Https,
+    ] {
+        let _ = query::parse_records(data, kind);
+    }
+    let _ = query::is_truncated(data);
+    let _ = query::server_failure_rcode(data);
+
+    // `cname_target` and `check_response` operate on an already-parsed packet, so
+    // parse first and drive them only when the bytes form a packet at all.
+    if let Ok(packet) = Packet::parse(data) {
+        let _ = query::cname_target(&packet, "example.com");
+        if let Ok(name) = Name::new("example.com") {
+            let _ = query::check_response(&packet, packet.id(), &name, TYPE::A);
+        }
+    }
+}
+
 impl RecordKind {
     /// Maps this kind onto the `simple_dns` query type used on the wire.
     fn dns_type(self) -> TYPE {

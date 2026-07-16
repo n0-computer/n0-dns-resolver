@@ -54,6 +54,10 @@ tls-aws-lc-rs = ["rustls/aws-lc-rs"]
 # Basic DNSSEC validation: RRSIG signature checks plus DS delegation-link and
 # key-tag helpers. Pulls in `ring` for the signature and digest primitives.
 dnssec = ["dep:ring"]
+# Exposes a hidden `fuzz` module that drives the crate's internal parsers on
+# arbitrary bytes, for the cargo-fuzz suite under `fuzz/`. Not part of the public
+# API and never enabled in a normal build.
+fuzzing = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt"] }

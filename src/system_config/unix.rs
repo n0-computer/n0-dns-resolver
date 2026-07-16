@@ -92,6 +92,16 @@ fn parse_resolv_conf(content: &str) -> DnsConfig {
     }
 }
 
+/// Drives arbitrary text through [`parse_resolv_conf`], for the crate's fuzz
+/// suite.
+///
+/// The parser is private to this module; this shim reaches it and discards the
+/// result. Gated on the `fuzzing` feature so it never enters a normal build.
+#[cfg(feature = "fuzzing")]
+pub(super) fn fuzz_parse_resolv_conf(content: &str) {
+    let _ = parse_resolv_conf(content);
+}
+
 /// Returns true if `domain` can serve as a search suffix.
 ///
 /// systemd-resolved writes a `--` placeholder when it has no search domain, and
