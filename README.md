@@ -1,14 +1,13 @@
 # n0-dns-resolver
 
-A small async DNS stub resolver built on [`simple-dns`] and tokio, extracted
-from [iroh].
+A small async DNS stub resolver built on [`simple-dns`] and tokio, used in
+[iroh].
 
-It resolves `A`, `AAAA`, and `TXT` records against the system's configured
-nameservers (or an explicit list), and is meant to be a lightweight,
-dependency-light alternative to a full recursive resolver for clients that just
-need to look names up.
+It resolves DNS records against the system's configured nameservers 
+(or an explicit list), and is meant to be a lightweight, dependency-light
+yet fully-featured DNS resolver. It does not perform recursive resolution.
 
-## What it does
+## Features
 
 - Reads the system DNS configuration: `/etc/resolv.conf` on Unix, the
   SystemConfiguration framework on Apple platforms, the network adapters on
@@ -24,7 +23,7 @@ need to look names up.
 - With a crypto provider enabled, also speaks DNS-over-TLS and
   DNS-over-HTTPS, pooling and reusing connections.
 
-It does not perform DNSSEC validation or negative caching.
+It does not currently perform DNSSEC validation or negative caching.
 
 ## Usage
 
@@ -64,10 +63,23 @@ fallback alongside the primary servers, `disable_fallback` removes it, and
 Neither is enabled by default; without a crypto provider the resolver speaks
 plain DNS over UDP and TCP only.
 
+
 ## License
 
-Licensed under either of [Apache License, Version 2.0](LICENSE-APACHE) or
-[MIT license](LICENSE-MIT) at your option.
+Copyright 2025 N0, INC.
+
+This project is licensed under either of
+
+ * Apache License, Version 2.0, ([LICENSE-APACHE](LICENSE-APACHE) or
+   https://www.apache.org/licenses/LICENSE-2.0)
+ * MIT license ([LICENSE-MIT](LICENSE-MIT) or
+   https://opensource.org/licenses/MIT)
+
+at your option.
+
+## Contribution
+
+Unless you explicitly state otherwise, any contribution intentionally submitted for inclusion in this project by you, as defined in the Apache-2.0 license, shall be dual licensed as above, without any additional terms or conditions.
 
 [`simple-dns`]: https://docs.rs/simple-dns
 [iroh]: https://github.com/n0-computer/iroh

@@ -16,7 +16,7 @@
 //! [`simple-dns`]: https://docs.rs/simple-dns
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
-#![cfg_attr(n0_dns_resolver_docsrs, feature(doc_auto_cfg))]
+#![cfg_attr(n0_dns_resolver_docsrs, feature(doc_cfg))]
 
 use std::{
     fmt,
