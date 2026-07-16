@@ -1,0 +1,236 @@
+name: CI
+
+on:
+  pull_request:
+    types: [ 'labeled', 'unlabeled', 'opened', 'synchronize', 'reopened' ]
+  merge_group:
+  push:
+    branches:
+      - main
+
+# n0-dns-resolver is a plain-DNS + DoT + DoH stub resolver that needs UDP and TCP
+# sockets and a native TLS stack. The browser wasm target (wasm32-unknown-unknown)
+# has neither, and rustls does not build there, so there is deliberately no wasm
+# build job: iroh-dns excludes this crate on that target for the same reason.
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+env:
+  RUST_BACKTRACE: 1
+  RUSTFLAGS: -Dwarnings
+  RUSTDOCFLAGS: -Dwarnings
+  MSRV: "1.85"
+  SCCACHE_CACHE_SIZE: "50G"
+
+jobs:
+  tests:
+    name: CI Test Suite
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    uses: './.github/workflows/tests.yaml'
+
+  android_build:
+    name: Android Build Only
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-linux-android
+          - armv7-linux-androideabi
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@stable
+      with:
+        target: ${{ matrix.target }}
+    - name: Install rustup target
+      run: rustup target add ${{ matrix.target }}
+
+    - name: Setup Java
+      uses: actions/setup-java@v5
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@v3
+
+    - name: Setup Android NDK
+      uses: arqu/setup-ndk@main
+      id: setup-ndk
+      with:
+        ndk-version: r23
+        add-to-path: true
+
+    - name: Build
+      env:
+        ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+      run: |
+        cargo install --version 3.5.4 cargo-ndk
+        cargo ndk --target ${{ matrix.target }} build
+
+  check_semver:
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+
+      - name: Setup Environment (PR)
+        if: ${{ github.event_name == 'pull_request' }}
+        shell: bash
+        run: |
+          echo "HEAD_COMMIT_SHA=$(git rev-parse origin/${{ github.base_ref }})" >> ${GITHUB_ENV}
+      - name: Setup Environment (Push)
+        if: ${{ github.event_name == 'push' || github.event_name == 'merge_group' }}
+        shell: bash
+        run: |
+          echo "HEAD_COMMIT_SHA=$(git rev-parse origin/main)" >> ${GITHUB_ENV}
+      - name: Check semver
+        uses: n0-computer/cargo-semver-checks-action@feat-baseline
+        with:
+          package: n0-dns-resolver
+          baseline-rev: ${{ env.HEAD_COMMIT_SHA }}
+          use-cache: false
+
+  check_fmt:
+    timeout-minutes: 30
+    name: Checking fmt
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+    steps:
+    - uses: actions/checkout@v5
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: rustfmt
+    - uses: mozilla-actions/sccache-action@v0.0.9
+    - uses: taiki-e/install-action@cargo-make
+    - run: cargo make format-check
+
+  check_docs:
+    timeout-minutes: 30
+    name: Checking docs
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+    steps:
+    - uses: actions/checkout@v5
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly-2025-06-28
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Docs
+      run: cargo doc --workspace --all-features --no-deps --document-private-items
+      env:
+        RUSTDOCFLAGS: --cfg n0_dns_resolver_docsrs
+
+  clippy_check:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+    steps:
+    - uses: actions/checkout@v5
+    - uses: dtolnay/rust-toolchain@stable
+      with:
+        components: clippy
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: clippy check (all features)
+      run: cargo clippy --workspace --all-features --all-targets --bins --tests --benches
+
+    - name: clippy check (no features)
+      run: cargo clippy --workspace --no-default-features --lib --bins --tests
+
+    - name: clippy check (default features)
+      run: cargo clippy --workspace --all-targets
+
+  check_external_types:
+    timeout-minutes: 30
+    name: Check external types in public API
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+      # The tool drives an internal rustdoc invocation that only emits JSON for
+      # the analyzer, so the workflow-wide `-Dwarnings` would turn unrelated
+      # rustdoc lints into hard failures here. Clear it for this job.
+      RUSTDOCFLAGS: ""
+      # Pin to the nightly the pinned cargo-check-external-types release was last
+      # tested against. Update both together.
+      CARGO_CHECK_EXTERNAL_TYPES_VERSION: "0.5.0"
+      TOOLCHAIN: "nightly-2026-03-20"
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ env.TOOLCHAIN }}
+      - name: Install sccache
+        uses: mozilla-actions/sccache-action@v0.0.9
+      - name: Install cargo-make and cargo-check-external-types
+        uses: taiki-e/install-action@v2
+        with:
+          tool: |
+            cargo-make
+            cargo-check-external-types@${{ env.CARGO_CHECK_EXTERNAL_TYPES_VERSION }}
+      - name: Check external types
+        run: cargo make check-external-types
+
+  msrv:
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    timeout-minutes: 30
+    name: Minimal Supported Rust Version
+    runs-on: ubuntu-latest
+    env:
+      RUSTC_WRAPPER: "sccache"
+      SCCACHE_GHA_ENABLED: "on"
+    steps:
+    - uses: actions/checkout@v5
+    - uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: ${{ env.MSRV }}
+    - name: Install sccache
+      uses: mozilla-actions/sccache-action@v0.0.9
+
+    - name: Check MSRV all features
+      run: |
+        cargo +$MSRV check --workspace --all-targets --all-features
+
+  cargo_deny:
+    timeout-minutes: 30
+    name: cargo deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          arguments: --workspace --all-features
+          command: check
+          command-arguments: "-Dwarnings"
+
+  codespell:
+    timeout-minutes: 30
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v5
+    - run: pip install --user codespell[toml]
+    - run: codespell --ignore-words-list=ans,atmost,crate,inout,ser,stayin,worl --skip=CHANGELOG.md

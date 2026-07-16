@@ -1,0 +1,65 @@
+[package]
+name = "n0-dns-resolver"
+version = "0.1.0"
+edition = "2024"
+readme = "README.md"
+description = "A small async DNS stub resolver built on simple-dns, used by iroh."
+license = "MIT OR Apache-2.0"
+authors = ["n0 team"]
+repository = "https://github.com/n0-computer/iroh"
+keywords = ["dns", "resolver", "networking", "async"]
+rust-version = "1.85"
+
+[lints.rust]
+missing_debug_implementations = "warn"
+unexpected_cfgs = { level = "warn", check-cfg = [
+    "cfg(with_crypto_provider)",
+    "cfg(n0_dns_resolver_docsrs)",
+] }
+
+[lints.clippy]
+unused-async = "warn"
+
+[dependencies]
+derive_more = { version = "2.0.1", features = ["display"] }
+lru = "0.18.0"
+n0-error = "1.0.0"
+n0-future = "0.3"
+rand = "0.10"
+reqwest = { version = "0.13", default-features = false, features = ["rustls-no-provider", "stream"] }
+rustls = { version = "0.23.33", default-features = false }
+simple-dns = "0.11"
+tokio = { version = "1", features = ["macros", "sync", "io-util"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["logging"] }
+tracing = "0.1"
+
+[target.'cfg(target_os = "android")'.dependencies]
+ndk-context = "0.1"
+jni = "0.22"
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+system-configuration = "0.7"
+
+[target.'cfg(windows)'.dependencies]
+ipconfig = "0.3"
+
+[build-dependencies]
+cfg_aliases = "0.2.1"
+
+[features]
+default = []
+tls-ring = ["rustls/ring"]
+tls-aws-lc-rs = ["rustls/aws-lc-rs"]
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt"] }
+tracing-subscriber = "0.3.23"
+webpki-roots = "1.0.7"
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+    # The error type carries n0_error::AnyError sources.
+    "n0_error::*",
+    # The builder accepts a caller-provided rustls TLS client config.
+    "rustls::client::client_conn::ClientConfig",
+]
