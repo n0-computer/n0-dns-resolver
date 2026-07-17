@@ -1,10 +1,10 @@
 //! DNS transport implementations: UDP, TCP, TLS, and HTTPS.
 
-#[cfg(with_crypto_provider)]
+#[cfg(with_rustls)]
 use std::sync::Arc;
 use std::{io, net::SocketAddr};
 
-#[cfg(with_crypto_provider)]
+#[cfg(with_rustls)]
 use n0_error::AnyError;
 use n0_error::{e, stack_error};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
@@ -30,16 +30,16 @@ pub(super) enum TransportError {
     },
     #[error("query too large for TCP framing")]
     QueryTooLarge {},
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_tls)]
     #[error("invalid TLS server name")]
     InvalidServerName { source: AnyError },
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     #[error("DNS-over-HTTPS request failed")]
     Http {
         #[error(from)]
         source: reqwest::Error,
     },
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     #[error("failed to build HTTPS client")]
     BuildClient { source: AnyError },
 }
@@ -148,7 +148,7 @@ pub(super) async fn tcp_query(
 ///
 /// Reuses a pooled connection when one is available, retrying once on a fresh
 /// connection if a pooled one turns out to have been closed while idle.
-#[cfg(with_crypto_provider)]
+#[cfg(transport_tls)]
 pub(super) async fn tls_query(
     pool: &ConnPool,
     addr: SocketAddr,
@@ -183,7 +183,7 @@ pub(super) async fn tls_query(
 ///
 /// `resolves` pins each named DoH host to a fixed address, so a hostname-based
 /// DoH URL connects to that IP instead of being resolved recursively.
-#[cfg(with_crypto_provider)]
+#[cfg(transport_https)]
 pub(super) fn build_https_client(
     tls_config: &Arc<rustls::ClientConfig>,
     resolves: &[(String, SocketAddr)],
@@ -203,7 +203,7 @@ pub(super) fn build_https_client(
 /// `addr`); without it the URL is addressed by IP (e.g.
 /// `https://1.1.1.1/dns-query`), which works only for providers whose
 /// certificates include the IP address.
-#[cfg(with_crypto_provider)]
+#[cfg(transport_https)]
 pub(super) async fn https_query(
     addr: SocketAddr,
     server_name: Option<&str>,

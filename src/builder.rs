@@ -36,7 +36,7 @@ pub struct Builder {
     pub(crate) nameservers: Vec<Nameserver>,
     pub(crate) fallback: FallbackMode,
     pub(crate) fallback_nameservers: Option<Vec<Nameserver>>,
-    #[cfg(with_crypto_provider)]
+    #[cfg(with_rustls)]
     pub(crate) tls_client_config: Option<rustls::ClientConfig>,
 }
 
@@ -47,7 +47,7 @@ impl Default for Builder {
             nameservers: Vec::new(),
             fallback: FallbackMode::default(),
             fallback_nameservers: None,
-            #[cfg(with_crypto_provider)]
+            #[cfg(with_rustls)]
             tls_client_config: None,
         }
     }
@@ -95,7 +95,7 @@ impl Builder {
     /// The connection is made to `addr`, while `server_name` drives the TLS SNI
     /// and certificate validation. Use this for providers whose certificates
     /// cover a hostname rather than the IP.
-    #[cfg(any(with_crypto_provider, doc))]
+    #[cfg(any(with_rustls, doc))]
     #[must_use]
     pub fn nameserver_with_name(
         mut self,
@@ -153,8 +153,10 @@ impl Builder {
 
     /// Sets a custom TLS client config for DNS-over-TLS and DNS-over-HTTPS.
     ///
-    /// Requires enabling either the `tls-ring` or `tls-aws-lc-rs` feature.
-    #[cfg(any(with_crypto_provider, doc))]
+    /// Requires the `transport-tls` or `transport-https` feature. Without a
+    /// config, DoT/DoH use one built from the crypto provider (`tls-ring` or
+    /// `tls-aws-lc-rs`); with neither a config nor a provider, they error.
+    #[cfg(with_rustls)]
     #[must_use]
     pub fn tls_client_config(mut self, config: rustls::ClientConfig) -> Self {
         self.tls_client_config = Some(config);
@@ -202,8 +204,8 @@ pub enum FallbackMode {
 pub struct Nameserver {
     pub(crate) addr: SocketAddr,
     pub(crate) protocol: DnsProtocol,
-    /// Only used for DoT/DoH, which require a crypto provider.
-    #[cfg(with_crypto_provider)]
+    /// Only used for DoT/DoH (the `transport-tls` or `transport-https` feature).
+    #[cfg(any(with_rustls, doc))]
     pub(crate) server_name: Option<String>,
 }
 
@@ -213,13 +215,13 @@ impl Nameserver {
         Self {
             addr,
             protocol,
-            #[cfg(with_crypto_provider)]
+            #[cfg(any(with_rustls, doc))]
             server_name: None,
         }
     }
 
     /// A DoT/DoH nameserver addressed by IP but validated against `server_name`.
-    #[cfg(any(with_crypto_provider, doc))]
+    #[cfg(any(with_rustls, doc))]
     pub fn with_server_name(
         addr: SocketAddr,
         protocol: DnsProtocol,
@@ -251,13 +253,13 @@ pub enum DnsProtocol {
     /// Performs DNS lookups over TLS-encrypted TCP connections, as defined in [RFC 7858].
     ///
     /// [RFC 7858]: https://www.rfc-editor.org/rfc/rfc7858.html
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_tls)]
     Tls,
     /// DNS over HTTPS
     ///
     /// Performs DNS lookups over HTTPS, as defined in [RFC 8484].
     ///
     /// [RFC 8484]: https://www.rfc-editor.org/rfc/rfc8484.html
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     Https,
 }

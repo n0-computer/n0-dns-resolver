@@ -12,7 +12,7 @@ use crate::{DnsProtocol, Nameserver, system_config::Hosts};
 /// Standard DNS port (Do53). DoH fallbacks use the HTTPS port instead.
 pub(crate) const DNS_PORT: u16 = 53;
 /// HTTPS port, used for the DNS-over-HTTPS fallback nameservers.
-#[cfg(with_crypto_provider)]
+#[cfg(transport_https)]
 const HTTPS_PORT: u16 = 443;
 
 // Public DNS providers used for the last-resort fallback.
@@ -96,7 +96,7 @@ fn fallback_nameservers() -> Vec<Nameserver> {
     ];
     // DoH right after the two fastest UDP primaries, so it lands in the first
     // raced wave when plain DNS is blocked.
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     {
         let doh = |ip: IpAddr| Nameserver::new(SocketAddr::new(ip, HTTPS_PORT), DnsProtocol::Https);
         servers.extend([
@@ -148,7 +148,7 @@ mod tests {
     /// DoH must land in the first raced wave (see `MAX_CONCURRENT_QUERIES`, 3),
     /// otherwise it would never be tried before the lookup times out on a
     /// network that silently drops UDP/53.
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     #[test]
     fn fallback_races_doh_in_first_wave() {
         let servers = fallback_nameservers();

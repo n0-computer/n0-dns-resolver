@@ -1,8 +1,10 @@
 //! Built-in DNS resolver using `simple-dns` for packet construction/parsing
 //! and tokio for transport.
 
-#[cfg(with_crypto_provider)]
-use std::sync::{Arc, Mutex};
+#[cfg(with_rustls)]
+use std::sync::Arc;
+#[cfg(transport_https)]
+use std::sync::Mutex;
 use std::{
     future::Future,
     net::{Ipv4Addr, Ipv6Addr},
@@ -115,10 +117,10 @@ fn is_localhost(host: &str) -> bool {
 /// nameservers and fallback behavior.
 #[derive(Debug)]
 pub struct SimpleDnsResolver {
-    #[cfg(with_crypto_provider)]
+    #[cfg(with_rustls)]
     tls_config: Option<Arc<rustls::ClientConfig>>,
     /// Lazily initialized, cached reqwest client for DNS-over-HTTPS queries.
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     https_client: Mutex<Option<reqwest::Client>>,
     /// Pooled TCP/DoT connections, reused across queries.
     conn_pool: ConnPool,
@@ -243,21 +245,51 @@ impl SimpleDnsResolver {
     /// carrying the cache across, so lookups keep hitting cached records while
     /// the new nameservers settle (see issue #4037), without any eager IO.
     fn new_deferred(builder: Builder, cache: DnsCache) -> Self {
-        #[cfg(with_crypto_provider)]
+        // Use the caller's TLS client config, or fall back to one built from the
+        // compiled-in crypto provider. When neither is present, DoT/DoH fail with
+        // `MissingTlsConfig` rather than reaching for a reqwest/rustls default.
+        #[cfg(with_rustls)]
         let tls_config = builder
             .tls_client_config
             .as_ref()
-            .map(|c| Arc::new(c.clone()));
+            .map(|config| Arc::new(config.clone()))
+            .or_else(Self::default_tls_config);
         Self {
-            #[cfg(with_crypto_provider)]
+            #[cfg(with_rustls)]
             tls_config,
-            #[cfg(with_crypto_provider)]
+            #[cfg(transport_https)]
             https_client: Mutex::new(None),
             conn_pool: ConnPool::new(),
             cache,
             builder,
             state: OnceLock::new(),
         }
+    }
+
+    /// Builds a default TLS client config from the compiled-in crypto provider,
+    /// preferring ring over aws-lc-rs, with the webpki roots.
+    #[cfg(all(with_rustls, with_crypto_provider))]
+    fn default_tls_config() -> Option<Arc<rustls::ClientConfig>> {
+        #[cfg(feature = "tls-ring")]
+        let provider = rustls::crypto::ring::default_provider();
+        #[cfg(all(feature = "tls-aws-lc-rs", not(feature = "tls-ring")))]
+        let provider = rustls::crypto::aws_lc_rs::default_provider();
+        let roots =
+            rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(provider))
+            .with_safe_default_protocol_versions()
+            .expect("crypto provider supports the default protocol versions")
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        Some(Arc::new(config))
+    }
+
+    /// Without a crypto provider there is no default config, so DoT/DoH need one
+    /// from [`Builder::tls_client_config`] and otherwise fail with
+    /// [`Error::MissingTlsConfig`].
+    #[cfg(all(with_rustls, not(with_crypto_provider)))]
+    fn default_tls_config() -> Option<Arc<rustls::ClientConfig>> {
+        None
     }
 
     /// Returns the runtime state, reading the system DNS configuration on first
@@ -322,11 +354,11 @@ impl SimpleDnsResolver {
     /// Returns a clone of the cached reqwest client, creating it on first use.
     ///
     /// `reqwest::Client` uses an inner `Arc`, so cloning is cheap.
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     fn get_or_init_https_client(&self) -> Result<reqwest::Client, Error> {
-        // DoH requires an explicit TLS client config, like the DoT path. Without
-        // one, reqwest (built with `rustls-no-provider`) would fall back to a
-        // process-default crypto provider and panic when none is installed.
+        // DoH needs a TLS client config, like the DoT path. Without one, reqwest
+        // (built with `rustls-no-provider`) would fall back to a process-default
+        // crypto provider and panic when none is installed.
         let tls_config = self
             .tls_config
             .as_ref()
@@ -398,7 +430,7 @@ impl SimpleDnsResolver {
             DnsProtocol::Tcp => {
                 Self::with_timeout(transport::tcp_query(&self.conn_pool, addr, query_bytes)).await
             }
-            #[cfg(with_crypto_provider)]
+            #[cfg(transport_tls)]
             DnsProtocol::Tls => {
                 let tls_config = self
                     .tls_config
@@ -413,7 +445,7 @@ impl SimpleDnsResolver {
                 ))
                 .await
             }
-            #[cfg(with_crypto_provider)]
+            #[cfg(transport_https)]
             DnsProtocol::Https => {
                 let client = self.get_or_init_https_client()?;
                 Self::with_timeout(transport::https_query(
@@ -970,30 +1002,22 @@ mod tests {
 
     const GOOGLE_DNS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
     const CLOUDFLARE_DNS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 53);
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_tls)]
     const GOOGLE_DNS_TLS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 853);
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     const CLOUDFLARE_DNS_HTTPS: SocketAddr =
         SocketAddr::new(IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1)), 443);
 
     /// Builds a resolver that queries a single nameserver over `proto`.
+    ///
+    /// DoT/DoH rely on the default client config built from the crypto provider
+    /// (`tls-ring` in the default features), so no config is set here.
     fn with_proto(addr: SocketAddr, proto: DnsProtocol) -> SimpleDnsResolver {
-        #[cfg_attr(not(with_crypto_provider), allow(unused_mut))]
-        let mut builder = SimpleDnsResolver::builder()
+        SimpleDnsResolver::builder()
             .without_system_defaults()
             .disable_fallback()
-            .nameserver(addr, proto);
-        #[cfg(with_crypto_provider)]
-        if matches!(proto, DnsProtocol::Tls | DnsProtocol::Https) {
-            let root_store =
-                rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-            builder = builder.tls_client_config(
-                rustls::ClientConfig::builder()
-                    .with_root_certificates(root_store)
-                    .with_no_client_auth(),
-            );
-        }
-        builder.build()
+            .nameserver(addr, proto)
+            .build()
     }
 
     /// A resolver that reads the host system's DNS configuration.
@@ -1034,14 +1058,14 @@ mod tests {
         assert_resolves_ipv4(&with_proto(CLOUDFLARE_DNS, DnsProtocol::Tcp), "google.com").await;
     }
 
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_tls)]
     #[tokio::test]
     #[ignore = "requires network access"]
     async fn resolve_ipv4_tls() {
         assert_resolves_ipv4(&with_proto(GOOGLE_DNS_TLS, DnsProtocol::Tls), "google.com").await;
     }
 
-    #[cfg(with_crypto_provider)]
+    #[cfg(transport_https)]
     #[tokio::test]
     #[ignore = "requires network access"]
     async fn resolve_ipv4_https() {
