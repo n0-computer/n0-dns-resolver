@@ -185,13 +185,10 @@ pub(super) async fn tls_query(
 /// DoH URL connects to that IP instead of being resolved recursively.
 #[cfg(with_crypto_provider)]
 pub(super) fn build_https_client(
-    tls_config: Option<&Arc<rustls::ClientConfig>>,
+    tls_config: &Arc<rustls::ClientConfig>,
     resolves: &[(String, SocketAddr)],
 ) -> Result<reqwest::Client, TransportError> {
-    let mut builder = reqwest::Client::builder();
-    if let Some(config) = tls_config {
-        builder = builder.use_preconfigured_tls(config.clone());
-    }
+    let mut builder = reqwest::Client::builder().use_preconfigured_tls(tls_config.clone());
     for (host, addr) in resolves {
         builder = builder.resolve(host, *addr);
     }

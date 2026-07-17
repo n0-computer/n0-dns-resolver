@@ -338,6 +338,13 @@ impl SimpleDnsResolver {
     /// `reqwest::Client` uses an inner `Arc`, so cloning is cheap.
     #[cfg(with_crypto_provider)]
     fn get_or_init_https_client(&self) -> Result<reqwest::Client, Error> {
+        // DoH requires an explicit TLS client config, like the DoT path. Without
+        // one, reqwest (built with `rustls-no-provider`) would fall back to a
+        // process-default crypto provider and panic when none is installed.
+        let tls_config = self
+            .tls_config
+            .as_ref()
+            .ok_or_else(|| e!(Error::MissingTlsConfig))?;
         let mut guard = self.https_client.lock().expect("poisoned");
         match guard.as_ref() {
             Some(client) => Ok(client.clone()),
@@ -351,7 +358,7 @@ impl SimpleDnsResolver {
                     .filter(|ns| ns.protocol == DnsProtocol::Https)
                     .filter_map(|ns| ns.server_name.clone().map(|name| (name, ns.addr)))
                     .collect();
-                let client = transport::build_https_client(self.tls_config.as_ref(), &resolves)?;
+                let client = transport::build_https_client(tls_config, &resolves)?;
                 *guard = Some(client.clone());
                 Ok(client)
             }
@@ -989,7 +996,7 @@ mod tests {
             .disable_fallback()
             .nameserver(addr, proto);
         #[cfg(with_crypto_provider)]
-        if proto == DnsProtocol::Tls {
+        if matches!(proto, DnsProtocol::Tls | DnsProtocol::Https) {
             let root_store =
                 rustls::RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
             builder = builder.tls_client_config(
