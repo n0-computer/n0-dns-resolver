@@ -1,12 +1,16 @@
 //! DNS transport implementations: UDP, TCP, TLS, and HTTPS.
 
+#[cfg(not(wasm_browser))]
+use std::io;
+use std::net::SocketAddr;
 #[cfg(with_rustls)]
 use std::sync::Arc;
-use std::{io, net::SocketAddr};
 
 use n0_error::{e, stack_error};
+#[cfg(not(wasm_browser))]
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
+#[cfg(not(wasm_browser))]
 use super::pool::ConnPool;
 
 /// A network or transport-level failure while querying a single nameserver.
@@ -16,6 +20,7 @@ use super::pool::ConnPool;
 #[non_exhaustive]
 pub enum TransportError {
     /// A socket read or write failed.
+    #[cfg(not(wasm_browser))]
     #[error("transport I/O failed")]
     Io {
         /// The underlying I/O error.
@@ -24,6 +29,7 @@ pub enum TransportError {
     },
     /// A UDP response arrived from an address other than the nameserver queried,
     /// so it was rejected (a spoofing defence).
+    #[cfg(not(wasm_browser))]
     #[error("response from unexpected source {actual}, expected {expected}")]
     UnexpectedSource {
         /// The nameserver address the query was sent to.
@@ -32,6 +38,7 @@ pub enum TransportError {
         actual: SocketAddr,
     },
     /// The query did not fit the 2-byte length prefix used for TCP and DoT.
+    #[cfg(not(wasm_browser))]
     #[error("query too large for TCP framing")]
     QueryTooLarge {},
     /// The configured TLS server name is not a valid DNS name for SNI.
@@ -56,6 +63,13 @@ pub enum TransportError {
         /// The reqwest error from building the client.
         source: reqwest::Error,
     },
+    /// UDP and TCP are unavailable on the browser wasm target, which has only
+    /// DNS-over-HTTPS.
+    #[cfg(wasm_browser)]
+    #[error(
+        "UDP and TCP DNS are unavailable on the browser wasm target; use a DNS-over-HTTPS nameserver"
+    )]
+    Unsupported {},
 }
 
 // TCP and DoT connections are pooled (see the `pool` module) and reused across
@@ -71,6 +85,7 @@ pub enum TransportError {
 /// server's UDP response always fits and a larger answer arrives with the DNS TC
 /// bit set (handled by retrying over TCP). A datagram that fills this buffer is
 /// treated as possibly truncated and also retried over TCP.
+#[cfg(not(wasm_browser))]
 const UDP_RECV_BUFFER: usize = 4096;
 
 /// Sends a DNS query over UDP and reads the response.
@@ -79,6 +94,7 @@ const UDP_RECV_BUFFER: usize = 4096;
 /// prevent cache poisoning. The response source address is validated against
 /// the target nameserver. The returned flag is set when the datagram filled the
 /// receive buffer and may be truncated, so the caller can retry over TCP.
+#[cfg(not(wasm_browser))]
 pub(super) async fn udp_query(
     addr: SocketAddr,
     query: &[u8],
@@ -113,6 +129,7 @@ pub(super) async fn udp_query(
 ///
 /// Uses the 2-byte length prefix framing from RFC 1035 Section 4.2.2. Shared by
 /// TCP and DoT.
+#[cfg(not(wasm_browser))]
 async fn framed_query<S>(stream: &mut S, query: &[u8]) -> Result<Vec<u8>, TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -135,6 +152,7 @@ where
 /// A pooled connection may have been closed by the server while idle; that only
 /// surfaces on the first read/write, so on failure we dial a fresh connection
 /// and retry the query once.
+#[cfg(not(wasm_browser))]
 pub(super) async fn tcp_query(
     pool: &ConnPool,
     addr: SocketAddr,
@@ -200,7 +218,7 @@ pub(super) async fn tls_query(
 ///
 /// `resolves` pins each named DoH host to a fixed address, so a hostname-based
 /// DoH URL connects to that IP instead of being resolved recursively.
-#[cfg(transport_https)]
+#[cfg(all(transport_https, not(wasm_browser)))]
 pub(super) fn build_https_client(
     tls_config: &Arc<rustls::ClientConfig>,
     resolves: &[(String, SocketAddr)],
@@ -213,6 +231,17 @@ pub(super) fn build_https_client(
         builder = builder.resolve(host, *addr);
     }
     builder
+        .build()
+        .map_err(|source| e!(TransportError::BuildClient { source }))
+}
+
+/// Builds a [`reqwest::Client`] for DNS-over-HTTPS on the browser wasm target.
+///
+/// The browser resolves DNS and performs TLS itself through the fetch backend,
+/// so there is no address pinning or preconfigured TLS config to apply here.
+#[cfg(all(transport_https, wasm_browser))]
+pub(super) fn build_https_client() -> Result<reqwest::Client, TransportError> {
+    reqwest::Client::builder()
         .build()
         .map_err(|source| e!(TransportError::BuildClient { source }))
 }

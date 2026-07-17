@@ -27,15 +27,19 @@ use crate::{
 };
 
 mod cache;
+// The connection pool serves the TCP and DNS-over-TLS transports, which do not
+// exist on the browser wasm target.
+#[cfg(not(wasm_browser))]
 mod pool;
 mod query;
 mod rtt_map;
 mod transport;
 
+#[cfg(not(wasm_browser))]
+use self::pool::ConnPool;
 pub use self::transport::TransportError;
 use self::{
     cache::{CachedResult, DnsCache, NEGATIVE_TTL_MAX_SECS, NEGATIVE_TTL_SECS},
-    pool::ConnPool,
     query::{MAX_CNAME_DEPTH, QueryError},
     rtt_map::RttMap,
 };
@@ -90,6 +94,7 @@ impl From<QueryError> for Error {
 /// [`STREAM_TIMEOUT`] so a silent server fails over quickly rather than stalling
 /// the whole lookup. Higher than the historical 2s but below the 5s that glibc,
 /// Go, and hickory-resolver use for their (un-raced) queries.
+#[cfg(not(wasm_browser))]
 const UDP_TIMEOUT: Duration = Duration::from_secs(3);
 
 /// Per-attempt timeout for a connection-oriented query (TCP, DoT, DoH).
@@ -112,6 +117,7 @@ const QUERY_ATTEMPT_DELAY: Duration = Duration::from_millis(100);
 
 /// Number of UDP retry attempts per nameserver before giving up.
 /// UDP is unreliable, so a single dropped packet shouldn't be fatal.
+#[cfg(not(wasm_browser))]
 const UDP_ATTEMPTS: usize = 2;
 
 /// Default value for `ndots` per resolv.conf(5).
@@ -140,6 +146,7 @@ pub struct DnsResolver {
     #[cfg(transport_https)]
     https_client: Mutex<Option<reqwest::Client>>,
     /// Pooled TCP/DoT connections, reused across queries.
+    #[cfg(not(wasm_browser))]
     conn_pool: ConnPool,
     cache: DnsCache,
     /// The settings this resolver was built from, kept so [`Self::reset`] can
@@ -276,6 +283,7 @@ impl DnsResolver {
             tls_config,
             #[cfg(transport_https)]
             https_client: Mutex::new(None),
+            #[cfg(not(wasm_browser))]
             conn_pool: ConnPool::new(),
             cache,
             builder,
@@ -373,32 +381,37 @@ impl DnsResolver {
     /// `reqwest::Client` uses an inner `Arc`, so cloning is cheap.
     #[cfg(transport_https)]
     fn get_or_init_https_client(&self) -> Result<reqwest::Client, Error> {
-        // DoH needs a TLS client config, like the DoT path. Without one, reqwest
-        // (built with `rustls-no-provider`) would fall back to a process-default
-        // crypto provider and panic when none is installed.
-        let tls_config = self
-            .tls_config
-            .as_ref()
-            .ok_or_else(|| e!(Error::MissingTlsConfig))?;
         let mut guard = self.https_client.lock().expect("poisoned");
-        match guard.as_ref() {
-            Some(client) => Ok(client.clone()),
-            None => {
-                // Pin each named DoH server to its address so reqwest does not
-                // recursively resolve the hostname.
-                let resolves: Vec<(String, std::net::SocketAddr)> = self
-                    .state()
-                    .config
-                    .nameservers
-                    .iter()
-                    .filter(|ns| ns.protocol == DnsProtocol::Https)
-                    .filter_map(|ns| ns.server_name.clone().map(|name| (name, ns.addr)))
-                    .collect();
-                let client = transport::build_https_client(tls_config, &resolves)?;
-                *guard = Some(client.clone());
-                Ok(client)
-            }
+        if let Some(client) = guard.as_ref() {
+            return Ok(client.clone());
         }
+        // On native, DoH needs a rustls client config like the DoT path; without
+        // one, reqwest (built with `rustls-no-provider`) would fall back to a
+        // process-default crypto provider and panic when none is installed. Each
+        // named DoH server is pinned to its address so reqwest does not resolve
+        // the hostname recursively.
+        #[cfg(with_rustls)]
+        let client = {
+            let tls_config = self
+                .tls_config
+                .as_ref()
+                .ok_or_else(|| e!(Error::MissingTlsConfig))?;
+            let resolves: Vec<(String, std::net::SocketAddr)> = self
+                .state()
+                .config
+                .nameservers
+                .iter()
+                .filter(|ns| ns.protocol == DnsProtocol::Https)
+                .filter_map(|ns| ns.server_name.clone().map(|name| (name, ns.addr)))
+                .collect();
+            transport::build_https_client(tls_config, &resolves)?
+        };
+        // On wasm the browser performs DNS resolution and TLS through the fetch
+        // backend, so there is no address pinning or TLS config to apply.
+        #[cfg(wasm_browser)]
+        let client = transport::build_https_client()?;
+        *guard = Some(client.clone());
+        Ok(client)
     }
 
     /// The configured cache min-TTL floor in seconds, or 0 when unset.
@@ -457,6 +470,7 @@ impl DnsResolver {
     ) -> Result<Vec<u8>, Error> {
         let addr = ns.addr;
         match ns.protocol {
+            #[cfg(not(wasm_browser))]
             DnsProtocol::Udp => {
                 let mut last_err = None;
                 for attempt in 0..UDP_ATTEMPTS {
@@ -493,6 +507,7 @@ impl DnsResolver {
                 )
                 .await
             }
+            #[cfg(not(wasm_browser))]
             DnsProtocol::Tcp => {
                 Self::with_timeout(
                     STREAM_TIMEOUT,
@@ -527,6 +542,10 @@ impl DnsResolver {
                 )
                 .await
             }
+            // On the browser wasm target only DNS-over-HTTPS is available; UDP and
+            // TCP need sockets the browser does not provide.
+            #[cfg(wasm_browser)]
+            DnsProtocol::Udp | DnsProtocol::Tcp => Err(e!(TransportError::Unsupported).into()),
         }
     }
 

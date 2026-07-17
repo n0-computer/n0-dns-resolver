@@ -8,10 +8,9 @@
 
 use tracing::warn;
 
-use super::{
-    DnsProtocol, Nameserver,
-    config::{DNS_PORT, DnsConfig},
-};
+use super::config::DnsConfig;
+#[cfg(not(wasm_browser))]
+use super::{DnsProtocol, Nameserver, config::DNS_PORT};
 
 #[cfg(any(target_os = "android", doc))]
 mod android;
@@ -34,6 +33,14 @@ pub(crate) use hosts::Hosts;
 use unix::read_system_dns;
 #[cfg(windows)]
 use windows::read_system_dns;
+
+/// The browser exposes no host DNS configuration, so there is nothing to read;
+/// the resolver relies on explicitly configured DoH nameservers and the fallback
+/// tier. Returns an empty configuration.
+#[cfg(wasm_browser)]
+fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
+    Ok(DnsConfig::default())
+}
 
 /// Reads the host system's DNS configuration using the platform-specific reader.
 ///

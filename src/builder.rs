@@ -104,7 +104,7 @@ impl Builder {
     /// The connection is made to `addr`, while `server_name` drives the TLS SNI
     /// and certificate validation. Use this for providers whose certificates
     /// cover a hostname rather than the IP.
-    #[cfg(any(with_rustls, doc))]
+    #[cfg(any(with_rustls, wasm_browser, doc))]
     #[must_use]
     pub fn nameserver_with_name(
         mut self,
@@ -239,8 +239,9 @@ pub enum FallbackMode {
 pub struct Nameserver {
     pub(crate) addr: SocketAddr,
     pub(crate) protocol: DnsProtocol,
-    /// Only used for DoT/DoH (the `transport-tls` or `transport-https` feature).
-    #[cfg(any(with_rustls, doc))]
+    /// Only used for DoT and DoH; on the browser wasm target DoH is the only
+    /// transport.
+    #[cfg(any(with_rustls, wasm_browser, doc))]
     pub(crate) server_name: Option<String>,
 }
 
@@ -250,13 +251,13 @@ impl Nameserver {
         Self {
             addr,
             protocol,
-            #[cfg(any(with_rustls, doc))]
+            #[cfg(any(with_rustls, wasm_browser, doc))]
             server_name: None,
         }
     }
 
     /// A DoT/DoH nameserver addressed by IP but validated against `server_name`.
-    #[cfg(any(with_rustls, doc))]
+    #[cfg(any(with_rustls, wasm_browser, doc))]
     pub fn with_server_name(
         addr: SocketAddr,
         protocol: DnsProtocol,
@@ -292,7 +293,9 @@ pub enum DnsProtocol {
     Tls,
     /// DNS over HTTPS
     ///
-    /// Performs DNS lookups over HTTPS, as defined in [RFC 8484].
+    /// Performs DNS lookups over HTTPS, as defined in [RFC 8484]. This is the
+    /// only transport available on the browser wasm target, where it goes
+    /// through the fetch backend and the browser performs TLS.
     ///
     /// [RFC 8484]: https://www.rfc-editor.org/rfc/rfc8484.html
     #[cfg(transport_https)]
