@@ -16,13 +16,13 @@ use n0_future::{
     time::{self, Duration},
 };
 use simple_dns::TYPE;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
+#[cfg(test)]
+use crate::system_config::Hosts;
 use crate::{
     Builder, DnsProtocol, Error, FallbackMode, HttpsRecord, MxRecordData, Nameserver, Record,
-    RecordKind, SrvRecordData, SvcbRecordData, TxtRecordData,
-    config::DnsConfig,
-    system_config::{self, Hosts},
+    RecordKind, SrvRecordData, SvcbRecordData, TxtRecordData, config::DnsConfig, system_config,
 };
 
 mod cache;
@@ -124,59 +124,55 @@ pub struct SimpleDnsResolver {
     conn_pool: ConnPool,
     cache: DnsCache,
     /// The settings this resolver was built from, kept so [`Self::reset`] can
-    /// rebuild against a changed network, and used to compute `resolved`.
+    /// rebuild against a changed network, and used to compute `state`.
     builder: Builder,
     /// Config-derived state built on first use, so that construction and
     /// [`Self::reset`] perform no IO: the system DNS read (which on some
     /// platforms is a blocking or otherwise costly call) is deferred until the
     /// first lookup rather than run eagerly on every network change.
-    resolved: OnceLock<Resolved>,
+    state: OnceLock<ResolverState>,
 }
 
-/// The parts of a resolver derived from reading the system DNS configuration,
-/// built lazily by [`SimpleDnsResolver::resolved`].
+/// The runtime state a resolver derives from its builder and the system DNS
+/// configuration, built lazily by [`SimpleDnsResolver::state`].
 #[derive(Debug)]
-struct Resolved {
-    /// The primary nameservers followed by the fallback ones. The two tiers are
-    /// split at `primary_count`; see [`SimpleDnsResolver::send_query`] for how
-    /// they are used.
-    nameservers: Vec<Nameserver>,
-    /// Number of leading entries in `nameservers` that form the primary tier.
+struct ResolverState {
+    /// The effective configuration: the assembled nameserver list, the search
+    /// list, `ndots`, and the hosts file.
+    ///
+    /// `config.nameservers` holds the primary nameservers followed by the
+    /// fallback ones, split at `primary_count`; see
+    /// [`SimpleDnsResolver::send_query`] for how the two tiers are used.
+    config: DnsConfig,
+    /// Number of leading entries in `config.nameservers` that form the primary
+    /// tier.
     primary_count: usize,
-    search_domains: Vec<String>,
-    ndots: usize,
-    /// Smoothed RTT per nameserver (parallel to `nameservers`), used to order
-    /// servers and re-probe demoted ones.
+    /// Smoothed RTT per nameserver (parallel to `config.nameservers`), used to
+    /// order servers and re-probe demoted ones.
     rtt_map: RttMap,
-    /// Static name-to-address mappings from the system hosts file, consulted
-    /// ahead of the cache for A/AAAA lookups. Empty unless system defaults are
-    /// in use.
-    hosts: Hosts,
 }
 
-impl Resolved {
+impl ResolverState {
     /// Reads the system DNS configuration (when enabled) and assembles the
-    /// primary and fallback nameserver tiers, the search list, the RTT map, and
-    /// the hosts file. This is the IO-performing part of building a resolver.
+    /// effective configuration and the RTT map.
+    ///
+    /// This is the IO-performing part of building a resolver: the platform
+    /// readers read the nameservers, search list, and hosts file.
     fn build(builder: &Builder) -> Self {
-        // Primary tier: the system configuration (when enabled) plus any
-        // explicitly configured nameservers. A failure to read the system
-        // configuration is logged and treated as an empty one, so the fallback
-        // can take over.
-        let system = if builder.use_system_defaults {
-            match system_config::read_system() {
-                Ok(config) => config,
-                Err(err) => {
-                    warn!(%err, "failed to read system DNS configuration, using fallback");
-                    DnsConfig::default()
-                }
-            }
+        // Start from the system configuration (when enabled). It also carries
+        // the search list and hosts file, which we keep as-is; a failed read
+        // yields an empty configuration so the fallback can take over.
+        let mut config = if builder.use_system_defaults {
+            system_config::read_system()
         } else {
             DnsConfig::default()
         };
-        let system_has_nameservers = !system.nameservers.is_empty();
-        let mut nameservers = system.nameservers;
-        nameservers.extend(builder.nameservers.iter().cloned());
+        // Primary tier: the system nameservers plus any explicitly configured
+        // ones.
+        let system_has_nameservers = !config.nameservers.is_empty();
+        config
+            .nameservers
+            .extend(builder.nameservers.iter().cloned());
 
         // Fallback tier: the configured (or default public) resolvers. Whether
         // to include them, and whether they defer behind the primary tier or
@@ -197,35 +193,24 @@ impl Resolved {
             FallbackMode::IfSystemUnavailable => (fallback_servers(), false),
         };
         let primary_count = if defer {
-            nameservers.len()
+            config.nameservers.len()
         } else {
-            nameservers.len() + fallback.len()
+            config.nameservers.len() + fallback.len()
         };
-        nameservers.append(&mut fallback);
+        config.nameservers.append(&mut fallback);
 
         debug!(
-            ?nameservers,
+            nameservers = ?config.nameservers,
             primary_count,
-            search_domains = ?system.search_domains,
-            ndots = ?system.ndots,
+            search_domains = ?config.search_domains,
+            ndots = ?config.ndots,
             "configured DNS resolver"
         );
-        let rtt_map = RttMap::new(nameservers.len());
-        // The hosts file is part of the system resolver configuration, so we
-        // only consult it when the caller opted into system defaults. Reading
-        // it here mirrors reading /etc/resolv.conf above.
-        let hosts = if builder.use_system_defaults {
-            Hosts::from_system()
-        } else {
-            Hosts::default()
-        };
+        let rtt_map = RttMap::new(config.nameservers.len());
         Self {
-            nameservers,
+            config,
             primary_count,
-            search_domains: system.search_domains,
-            ndots: system.ndots.unwrap_or(DEFAULT_NDOTS),
             rtt_map,
-            hosts,
         }
     }
 }
@@ -253,7 +238,7 @@ impl SimpleDnsResolver {
     /// Builds a resolver that reads the system DNS configuration lazily.
     ///
     /// Only cheap, IO-free state is set up here; the nameserver list, search
-    /// list, RTT map, and hosts file are built on first use by [`Self::resolved`].
+    /// list, RTT map, and hosts file are built on first use by [`Self::state`].
     /// [`Self::reset`] reuses this to rebuild after a network change while
     /// carrying the cache across, so lookups keep hitting cached records while
     /// the new nameservers settle (see issue #4037), without any eager IO.
@@ -271,14 +256,15 @@ impl SimpleDnsResolver {
             conn_pool: ConnPool::new(),
             cache,
             builder,
-            resolved: OnceLock::new(),
+            state: OnceLock::new(),
         }
     }
 
-    /// Returns the config-derived state, reading the system DNS configuration on
-    /// first call and caching it for the life of this resolver.
-    fn resolved(&self) -> &Resolved {
-        self.resolved.get_or_init(|| Resolved::build(&self.builder))
+    /// Returns the runtime state, reading the system DNS configuration on first
+    /// call and caching it for the life of this resolver.
+    fn state(&self) -> &ResolverState {
+        self.state
+            .get_or_init(|| ResolverState::build(&self.builder))
     }
 
     /// Returns the list of candidate names to try for a given hostname,
@@ -291,9 +277,9 @@ impl SimpleDnsResolver {
     ///
     /// See <https://man7.org/linux/man-pages/man5/resolv.conf.5.html>.
     fn search_names(&self, host: &str) -> Vec<String> {
-        let resolved = self.resolved();
+        let config = &self.state().config;
         // Explicit FQDN: no search domain expansion.
-        if host.ends_with('.') || resolved.search_domains.is_empty() {
+        if host.ends_with('.') || config.search_domains.is_empty() {
             return vec![host.to_string()];
         }
 
@@ -301,9 +287,9 @@ impl SimpleDnsResolver {
         // resolv.conf(5): "if the name has more dots than ndots, try as absolute first"
         // which is equivalent to num_labels > ndots.
         let num_labels = host.bytes().filter(|&b| b == b'.').count() + 1;
-        let bare_first = num_labels > resolved.ndots;
+        let bare_first = num_labels > config.ndots.unwrap_or(DEFAULT_NDOTS);
 
-        let mut names: Vec<String> = Vec::with_capacity(resolved.search_domains.len() + 1);
+        let mut names: Vec<String> = Vec::with_capacity(config.search_domains.len() + 1);
 
         // Append a candidate unless it is already present.
         fn push(names: &mut Vec<String>, name: String) {
@@ -315,7 +301,7 @@ impl SimpleDnsResolver {
         if bare_first {
             push(&mut names, host.to_string());
         }
-        for domain in &resolved.search_domains {
+        for domain in &config.search_domains {
             let expanded = format!("{host}.{domain}");
             // Drop an expansion that cannot form a valid DNS name, such as an
             // over-long suffix or a `--` placeholder from systemd-resolved. One
@@ -352,7 +338,8 @@ impl SimpleDnsResolver {
                 // Pin each named DoH server to its address so reqwest does not
                 // recursively resolve the hostname.
                 let resolves: Vec<(String, std::net::SocketAddr)> = self
-                    .resolved()
+                    .state()
+                    .config
                     .nameservers
                     .iter()
                     .filter(|ns| ns.protocol == DnsProtocol::Https)
@@ -442,7 +429,7 @@ impl SimpleDnsResolver {
 
     /// Returns the given nameserver indices ordered fastest-first by smoothed RTT.
     fn order_indices(&self, indices: &[usize]) -> Vec<usize> {
-        let rtt_map = &self.resolved().rtt_map;
+        let rtt_map = &self.state().rtt_map;
         let mut order = indices.to_vec();
         order.sort_by(|&a, &b| rtt_map.get_decayed(a).total_cmp(&rtt_map.get_decayed(b)));
         order
@@ -458,21 +445,21 @@ impl SimpleDnsResolver {
     /// configuration could not be read), escalation makes the fallback tier the
     /// effective primary.
     async fn send_query(&self, query_bytes: &[u8]) -> Result<Vec<u8>, Error> {
-        let resolved = self.resolved();
-        if resolved.nameservers.is_empty() {
+        let state = self.state();
+        if state.config.nameservers.is_empty() {
             return Err(e!(Error::NoResponse));
         }
 
-        let primary: Vec<usize> = (0..resolved.primary_count).collect();
+        let primary: Vec<usize> = (0..state.primary_count).collect();
         match self.race(&primary, query_bytes).await {
             Ok(resp) => Ok(resp),
             Err(primary_err) => {
-                if resolved.primary_count == resolved.nameservers.len() {
+                if state.primary_count == state.config.nameservers.len() {
                     return Err(primary_err);
                 }
                 debug!(err = %primary_err, "primary nameservers failed, escalating to fallback");
                 let fallback: Vec<usize> =
-                    (resolved.primary_count..resolved.nameservers.len()).collect();
+                    (state.primary_count..state.config.nameservers.len()).collect();
                 self.race(&fallback, query_bytes).await
             }
         }
@@ -487,7 +474,7 @@ impl SimpleDnsResolver {
     /// nameserver on failure. Per-server success and failure update the
     /// smoothed RTT used for ordering, so the server list is self-healing.
     async fn race(&self, indices: &[usize], query_bytes: &[u8]) -> Result<Vec<u8>, Error> {
-        let resolved = self.resolved();
+        let state = self.state();
         let order = self.order_indices(indices);
         // Index into `order` of the next nameserver to try.
         let mut next = 0;
@@ -507,7 +494,7 @@ impl SimpleDnsResolver {
                 next += 1;
                 let start = Instant::now();
                 dials.push(async move {
-                    let ns = &resolved.nameservers[idx];
+                    let ns = &state.config.nameservers[idx];
                     (idx, start, self.query_nameserver(ns, query_bytes).await)
                 });
                 // Pace the following attempt, unless this was the last server.
@@ -533,18 +520,18 @@ impl SimpleDnsResolver {
                         // server rather than making it the final answer; another
                         // nameserver may still resolve the name.
                         if let Some(rcode) = query::server_failure_rcode(&resp) {
-                            resolved.rtt_map.record_failure(idx);
+                            state.rtt_map.record_failure(idx);
                             last_err =
                                 Some(e!(Error::ServerError { rcode: format!("{rcode:?}") }));
                             // Fail fast: start the next attempt now rather than waiting.
                             next_attempt.as_mut().set_none();
                         } else {
-                            resolved.rtt_map.record_success(idx, start.elapsed());
+                            state.rtt_map.record_success(idx, start.elapsed());
                             return Ok(resp);
                         }
                     }
                     Err(e) => {
-                        resolved.rtt_map.record_failure(idx);
+                        state.rtt_map.record_failure(idx);
                         last_err = Some(e);
                         // Fail fast: start the next attempt now rather than waiting.
                         next_attempt.as_mut().set_none();
@@ -749,7 +736,7 @@ impl SimpleDnsResolver {
         if let Some(addrs) = self
             .search_names(&host)
             .iter()
-            .find_map(|name| self.resolved().hosts.lookup_ipv4(name))
+            .find_map(|name| self.state().config.hosts.lookup_ipv4(name))
         {
             trace!(%host, ?addrs, "resolved from hosts file");
             return Ok(addrs.into_iter());
@@ -781,7 +768,7 @@ impl SimpleDnsResolver {
         if let Some(addrs) = self
             .search_names(&host)
             .iter()
-            .find_map(|name| self.resolved().hosts.lookup_ipv6(name))
+            .find_map(|name| self.state().config.hosts.lookup_ipv6(name))
         {
             trace!(%host, ?addrs, "resolved from hosts file");
             return Ok(addrs.into_iter());
@@ -914,7 +901,8 @@ impl SimpleDnsResolver {
 
     /// Returns the configured nameservers and their transports.
     pub fn nameservers(&self) -> Vec<(std::net::SocketAddr, DnsProtocol)> {
-        self.resolved()
+        self.state()
+            .config
             .nameservers
             .iter()
             .map(|ns| (ns.addr, ns.protocol))
@@ -928,22 +916,22 @@ impl SimpleDnsResolver {
     /// builder only populates them from the system configuration.
     #[cfg(test)]
     pub(crate) fn set_search(&mut self, search_domains: Vec<String>, ndots: usize) {
-        // Force the config-derived state to exist (keeping the configured
-        // nameservers), then override just the search settings under test.
-        let mut resolved = Resolved::build(&self.builder);
-        resolved.search_domains = search_domains;
-        resolved.ndots = ndots;
-        self.resolved = OnceLock::new();
-        let _ = self.resolved.set(resolved);
+        // Force the runtime state to exist (keeping the configured nameservers),
+        // then override just the search settings under test.
+        let mut state = ResolverState::build(&self.builder);
+        state.config.search_domains = search_domains;
+        state.config.ndots = Some(ndots);
+        self.state = OnceLock::new();
+        let _ = self.state.set(state);
     }
 
     /// Overrides the hosts-file mapping. Test-only hook, like [`Self::set_search`].
     #[cfg(test)]
     pub(crate) fn set_hosts(&mut self, hosts: Hosts) {
-        let mut resolved = Resolved::build(&self.builder);
-        resolved.hosts = hosts;
-        self.resolved = OnceLock::new();
-        let _ = self.resolved.set(resolved);
+        let mut state = ResolverState::build(&self.builder);
+        state.config.hosts = hosts;
+        self.state = OnceLock::new();
+        let _ = self.state.set(state);
     }
 
     /// Rebuilds the resolver after a network change, carrying the cache across.
@@ -1313,8 +1301,8 @@ mod tests {
             .nameserver(DUMMY, DnsProtocol::Udp)
             .fallback_nameservers([Nameserver::new(DUMMY, DnsProtocol::Udp)])
             .build();
-        assert_eq!(r.resolved().primary_count, 1);
-        assert_eq!(r.resolved().nameservers.len(), 2);
+        assert_eq!(r.state().primary_count, 1);
+        assert_eq!(r.state().config.nameservers.len(), 2);
     }
 
     /// `always_use_fallback` merges the fallback nameservers into the primary
@@ -1327,8 +1315,8 @@ mod tests {
             .fallback_nameservers([Nameserver::new(DUMMY, DnsProtocol::Udp)])
             .always_use_fallback()
             .build();
-        assert_eq!(r.resolved().primary_count, 2);
-        assert_eq!(r.resolved().nameservers.len(), 2);
+        assert_eq!(r.state().primary_count, 2);
+        assert_eq!(r.state().config.nameservers.len(), 2);
     }
 
     /// `disable_fallback` drops the fallback tier entirely.
@@ -1339,8 +1327,8 @@ mod tests {
             .nameserver(DUMMY, DnsProtocol::Udp)
             .disable_fallback()
             .build();
-        assert_eq!(r.resolved().primary_count, 1);
-        assert_eq!(r.resolved().nameservers.len(), 1);
+        assert_eq!(r.state().primary_count, 1);
+        assert_eq!(r.state().config.nameservers.len(), 1);
     }
 
     /// With no system configuration, `IfSystemUnavailable` includes the fallback
@@ -1352,8 +1340,8 @@ mod tests {
             .fallback_mode(FallbackMode::IfSystemUnavailable)
             .fallback_nameservers([Nameserver::new(DUMMY, DnsProtocol::Udp)])
             .build();
-        assert_eq!(r.resolved().nameservers.len(), 1);
-        assert_eq!(r.resolved().primary_count, 1);
+        assert_eq!(r.state().config.nameservers.len(), 1);
+        assert_eq!(r.state().primary_count, 1);
     }
 
     /// When every primary nameserver fails, the lookup escalates to the fallback

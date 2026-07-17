@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-use super::{DNS_PORT, DnsConfig, DnsProtocol, Nameserver};
+use super::{DNS_PORT, DnsConfig, DnsProtocol, Hosts, Nameserver};
 
 /// Deprecated IPv6 site-local anycast addresses still configured by Windows.
 ///
@@ -18,7 +18,8 @@ const WINDOWS_BAD_SITE_LOCAL_DNS_SERVERS: [IpAddr; 3] = [
     IpAddr::V6(Ipv6Addr::new(0xfec0, 0, 0, 0xffff, 0, 0, 0, 3)),
 ];
 
-/// Read DNS servers from Windows network adapter configuration.
+/// Reads the DNS servers from the Windows network adapter configuration, plus
+/// the hosts file.
 pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
     let adapters =
         ipconfig::get_adapters().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
@@ -67,5 +68,6 @@ pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
         nameservers: servers,
         search_domains,
         ndots: None,
+        hosts: Hosts::from_system(),
     })
 }

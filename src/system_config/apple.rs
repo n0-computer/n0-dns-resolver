@@ -27,9 +27,10 @@ use system_configuration::{
 };
 use tracing::warn;
 
-use super::{DNS_PORT, DnsConfig, DnsProtocol, Nameserver};
+use super::{DNS_PORT, DnsConfig, DnsProtocol, Hosts, Nameserver};
 
-/// Reads the primary system DNS configuration from SystemConfiguration.
+/// Reads the primary system DNS configuration from SystemConfiguration, plus
+/// the hosts file.
 pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
     let store = SCDynamicStoreBuilder::new("iroh-dns")
         .build()
@@ -61,6 +62,7 @@ pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
         nameservers,
         search_domains,
         ndots: None,
+        hosts: Hosts::from_system(),
     })
 }
 

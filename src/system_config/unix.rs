@@ -2,12 +2,15 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use super::{DNS_PORT, DnsConfig, DnsProtocol, Nameserver};
+use super::{DNS_PORT, DnsConfig, DnsProtocol, Hosts, Nameserver};
 
-/// Read `/etc/resolv.conf` and extract nameserver addresses and search domains.
+/// Reads the nameservers and search domains from `/etc/resolv.conf`, plus the
+/// hosts file.
 pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
     let content = std::fs::read_to_string("/etc/resolv.conf")?;
-    Ok(parse_resolv_conf(&content))
+    let mut config = parse_resolv_conf(&content);
+    config.hosts = Hosts::from_system();
+    Ok(config)
 }
 
 /// Parse resolv.conf content and extract nameserver addresses and search domains.
@@ -89,6 +92,7 @@ fn parse_resolv_conf(content: &str) -> DnsConfig {
         nameservers: servers,
         search_domains,
         ndots,
+        hosts: Hosts::default(),
     }
 }
 

@@ -6,6 +6,8 @@
 //! in the submodules; this module dispatches to them via [`read_system`]. The
 //! [`DnsConfig`] they produce lives in [`crate::config`].
 
+use tracing::warn;
+
 use super::{
     DnsProtocol, Nameserver,
     config::{DNS_PORT, DnsConfig},
@@ -35,12 +37,20 @@ use windows::read_system_dns;
 
 /// Reads the host system's DNS configuration using the platform-specific reader.
 ///
-/// # Errors
-///
-/// Returns the platform reader's error when the configuration cannot be read,
-/// for example a missing or unreadable `/etc/resolv.conf`, or an uninitialized
-/// JNI context on Android. The caller decides how to recover; the resolver logs
-/// the failure and falls back to public resolvers.
-pub(crate) fn read_system() -> Result<DnsConfig, std::io::Error> {
-    read_system_dns()
+/// A reader failure (a missing or unreadable `/etc/resolv.conf`, an
+/// uninitialized JNI context on Android) is logged and yields an otherwise-empty
+/// configuration, so the resolver falls back to public resolvers. The hosts file
+/// is still read in that case, since a missing resolv.conf does not imply a
+/// missing hosts file.
+pub(crate) fn read_system() -> DnsConfig {
+    match read_system_dns() {
+        Ok(config) => config,
+        Err(err) => {
+            warn!(%err, "failed to read system DNS configuration, using fallback");
+            DnsConfig {
+                hosts: Hosts::from_system(),
+                ..Default::default()
+            }
+        }
+    }
 }

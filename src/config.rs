@@ -7,7 +7,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use crate::{DnsProtocol, Nameserver};
+use crate::{DnsProtocol, Nameserver, system_config::Hosts};
 
 /// Standard DNS port (Do53). DoH fallbacks use the HTTPS port instead.
 pub(crate) const DNS_PORT: u16 = 53;
@@ -50,6 +50,11 @@ pub(crate) struct DnsConfig {
     /// `None` means use the default (1).
     /// See <https://man7.org/linux/man-pages/man5/resolv.conf.5.html>.
     pub(crate) ndots: Option<usize>,
+    /// Static name-to-address mappings from the system hosts file.
+    ///
+    /// Consulted ahead of the cache for A/AAAA lookups. Populated by the
+    /// platform readers when the system configuration is read; empty otherwise.
+    pub(crate) hosts: Hosts,
 }
 
 impl DnsConfig {
@@ -65,6 +70,7 @@ impl DnsConfig {
             nameservers,
             search_domains: Vec::new(),
             ndots: None,
+            hosts: Hosts::default(),
         }
     }
 }

@@ -13,14 +13,14 @@ use std::{
 use tracing::warn;
 
 /// The A and AAAA addresses mapped to a single name.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 struct Entry {
     a: Vec<Ipv4Addr>,
     aaaa: Vec<Ipv6Addr>,
 }
 
 /// Static host-to-address mappings parsed from the system hosts file.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub(crate) struct Hosts {
     by_name: HashMap<String, Entry>,
 }

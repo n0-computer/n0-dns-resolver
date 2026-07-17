@@ -35,9 +35,9 @@ use jni::{
 use tracing::{trace, warn};
 
 #[cfg(target_os = "android")]
-use super::{DNS_PORT, DnsConfig, DnsProtocol, Nameserver};
+use super::{DNS_PORT, DnsConfig, DnsProtocol, Hosts, Nameserver};
 
-/// Read the active network's DNS configuration via JNI.
+/// Reads the active network's DNS configuration via JNI, plus the hosts file.
 #[cfg(target_os = "android")]
 pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
     match catch_unwind(AssertUnwindSafe(read_system_dns_jni)) {
@@ -142,6 +142,7 @@ fn read_system_dns_jni() -> Result<DnsConfig, std::io::Error> {
         nameservers,
         search_domains: Vec::new(),
         ndots: None,
+        hosts: Hosts::from_system(),
     })
 }
 

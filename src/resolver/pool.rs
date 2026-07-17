@@ -85,6 +85,7 @@ impl Inner {
 }
 
 /// A pool of idle TCP and DoT connections, keyed by nameserver.
+#[derive(Clone)]
 pub(super) struct ConnPool {
     inner: Arc<Inner>,
     /// Set once the idle-connection pruning task has been spawned.
