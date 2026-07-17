@@ -28,7 +28,7 @@ use simple_dns::{
 };
 use tokio::{net::UdpSocket, task::JoinHandle};
 
-use crate::{DnsProtocol, SimpleDnsResolver};
+use crate::{DnsProtocol, DnsResolver};
 
 /// TTL, in seconds, stamped on every answer the mock nameserver returns.
 const ANSWER_TTL: u32 = 300;
@@ -104,8 +104,8 @@ where
 
 /// Builds a resolver that queries only `addr` over UDP, with no system defaults
 /// and no fallback tier, so the lookup is hermetic and hits only the mock.
-pub(crate) fn resolver_for(addr: SocketAddr) -> SimpleDnsResolver {
-    SimpleDnsResolver::builder()
+pub(crate) fn resolver_for(addr: SocketAddr) -> DnsResolver {
+    DnsResolver::builder()
         .without_system_defaults()
         .disable_fallback()
         .nameserver(addr, DnsProtocol::Udp)

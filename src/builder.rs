@@ -2,7 +2,7 @@
 
 use std::net::SocketAddr;
 
-use crate::SimpleDnsResolver;
+use crate::DnsResolver;
 
 /// Builds a [`SimpleDnsResolver`].
 ///
@@ -164,8 +164,8 @@ impl Builder {
     }
 
     /// Builds the resolver.
-    pub fn build(self) -> SimpleDnsResolver {
-        SimpleDnsResolver::from_builder(self)
+    pub fn build(self) -> DnsResolver {
+        DnsResolver::from_builder(self)
     }
 }
 

@@ -116,7 +116,7 @@ fn is_localhost(host: &str) -> bool {
 /// cross-platform defaults, or with [`Self::builder`] to configure the
 /// nameservers and fallback behavior.
 #[derive(Debug)]
-pub struct SimpleDnsResolver {
+pub struct DnsResolver {
     #[cfg(with_rustls)]
     tls_config: Option<Arc<rustls::ClientConfig>>,
     /// Lazily initialized, cached reqwest client for DNS-over-HTTPS queries.
@@ -217,7 +217,7 @@ impl ResolverState {
     }
 }
 
-impl SimpleDnsResolver {
+impl DnsResolver {
     /// Creates a resolver with cross-platform defaults.
     ///
     /// Reads the system's DNS configuration and escalates to public resolvers
@@ -977,7 +977,7 @@ impl SimpleDnsResolver {
     }
 }
 
-impl Default for SimpleDnsResolver {
+impl Default for DnsResolver {
     fn default() -> Self {
         Self::new()
     }
@@ -987,14 +987,14 @@ impl Default for SimpleDnsResolver {
 mod tests {
     use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-    use super::{CachedResult, Hosts, SimpleDnsResolver};
+    use super::{CachedResult, DnsResolver, Hosts};
     use crate::{DnsProtocol, FallbackMode, Nameserver, Record, RecordKind};
 
     /// A resolver with no nameservers and no fallback, for unit tests that do
     /// not query the network. Skips reading the host's DNS configuration so the
     /// tests stay hermetic.
-    fn empty_resolver() -> SimpleDnsResolver {
-        SimpleDnsResolver::builder()
+    fn empty_resolver() -> DnsResolver {
+        DnsResolver::builder()
             .without_system_defaults()
             .disable_fallback()
             .build()
@@ -1012,8 +1012,8 @@ mod tests {
     ///
     /// DoT/DoH rely on the default client config built from the crypto provider
     /// (`tls-ring` in the default features), so no config is set here.
-    fn with_proto(addr: SocketAddr, proto: DnsProtocol) -> SimpleDnsResolver {
-        SimpleDnsResolver::builder()
+    fn with_proto(addr: SocketAddr, proto: DnsProtocol) -> DnsResolver {
+        DnsResolver::builder()
             .without_system_defaults()
             .disable_fallback()
             .nameserver(addr, proto)
@@ -1021,11 +1021,11 @@ mod tests {
     }
 
     /// A resolver that reads the host system's DNS configuration.
-    fn system_resolver() -> SimpleDnsResolver {
-        SimpleDnsResolver::new()
+    fn system_resolver() -> DnsResolver {
+        DnsResolver::new()
     }
 
-    async fn assert_resolves_ipv4(resolver: &SimpleDnsResolver, host: &str) {
+    async fn assert_resolves_ipv4(resolver: &DnsResolver, host: &str) {
         let addrs: Vec<_> = resolver
             .lookup_ipv4(host.to_string())
             .await
@@ -1138,7 +1138,7 @@ mod tests {
     mod search_names {
         use super::*;
 
-        fn resolver_with_search(domains: &[&str]) -> SimpleDnsResolver {
+        fn resolver_with_search(domains: &[&str]) -> DnsResolver {
             let mut r = empty_resolver();
             r.set_search(domains.iter().map(|s| s.to_string()).collect(), 1);
             r
@@ -1295,7 +1295,7 @@ mod tests {
 
         // `bad` is listed first, so it is the fastest by default ordering and
         // wins the race with a SERVFAIL; the lookup must fall through to `good`.
-        let resolver = SimpleDnsResolver::builder()
+        let resolver = DnsResolver::builder()
             .without_system_defaults()
             .disable_fallback()
             .nameservers([(bad, DnsProtocol::Udp), (good, DnsProtocol::Udp)])
@@ -1320,7 +1320,7 @@ mod tests {
     /// primary tier rather than racing with it.
     #[test]
     fn deferred_keeps_fallback_in_second_tier() {
-        let r = SimpleDnsResolver::builder()
+        let r = DnsResolver::builder()
             .without_system_defaults()
             .nameserver(DUMMY, DnsProtocol::Udp)
             .fallback_nameservers([Nameserver::new(DUMMY, DnsProtocol::Udp)])
@@ -1333,7 +1333,7 @@ mod tests {
     /// tier so they race from the start.
     #[test]
     fn always_use_fallback_merges_tiers() {
-        let r = SimpleDnsResolver::builder()
+        let r = DnsResolver::builder()
             .without_system_defaults()
             .nameserver(DUMMY, DnsProtocol::Udp)
             .fallback_nameservers([Nameserver::new(DUMMY, DnsProtocol::Udp)])
@@ -1346,7 +1346,7 @@ mod tests {
     /// `disable_fallback` drops the fallback tier entirely.
     #[test]
     fn disable_fallback_drops_second_tier() {
-        let r = SimpleDnsResolver::builder()
+        let r = DnsResolver::builder()
             .without_system_defaults()
             .nameserver(DUMMY, DnsProtocol::Udp)
             .disable_fallback()
@@ -1359,7 +1359,7 @@ mod tests {
     /// nameservers, and merges them into the primary tier rather than deferring.
     #[test]
     fn if_system_unavailable_includes_fallback_when_system_empty() {
-        let r = SimpleDnsResolver::builder()
+        let r = DnsResolver::builder()
             .without_system_defaults()
             .fallback_mode(FallbackMode::IfSystemUnavailable)
             .fallback_nameservers([Nameserver::new(DUMMY, DnsProtocol::Udp)])
@@ -1378,7 +1378,7 @@ mod tests {
 
         // The primary tier is only `bad`, which SERVFAILs; the fallback tier is
         // `good`, reached only after the primary tier is exhausted.
-        let resolver = SimpleDnsResolver::builder()
+        let resolver = DnsResolver::builder()
             .without_system_defaults()
             .nameserver(bad, DnsProtocol::Udp)
             .fallback_nameservers([Nameserver::new(good, DnsProtocol::Udp)])
