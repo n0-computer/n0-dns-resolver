@@ -37,6 +37,5 @@ pub use self::{
         CaaRecordData, HttpsRecord, MxRecordData, Record, RecordKind, SrvRecordData,
         SvcbRecordData, TxtRecordData,
     },
-    resolver::DnsResolver,
-    resolver::TransportError,
+    resolver::{DnsResolver, TransportError},
 };

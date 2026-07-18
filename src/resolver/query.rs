@@ -3,16 +3,14 @@
 use std::net::{Ipv4Addr, Ipv6Addr};
 
 use n0_error::{e, stack_error};
-
-use crate::ResponseCode;
 use simple_dns::{
     CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, RCODE, TYPE, header_buffer,
     rdata::{A, AAAA, RData, SVCB},
 };
 
 use crate::{
-    CaaRecordData, HttpsRecord, MxRecordData, Record, RecordKind, SrvRecordData, SvcbRecordData,
-    TxtRecordData,
+    CaaRecordData, HttpsRecord, MxRecordData, Record, RecordKind, ResponseCode, SrvRecordData,
+    SvcbRecordData, TxtRecordData,
 };
 
 /// Errors that can occur while building a query packet or parsing a response.
