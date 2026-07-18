@@ -9,15 +9,15 @@ use simple_dns::rdata::{SVCB, SVCParam};
 
 /// A DNS record kind the resolver can look up.
 ///
-/// Pass one to [`SimpleDnsResolver::lookup_record`] to resolve records of that
-/// kind. The typed methods ([`SimpleDnsResolver::lookup_ipv4`],
-/// [`SimpleDnsResolver::lookup_ipv6`], [`SimpleDnsResolver::lookup_txt`]) each
+/// Pass one to [`DnsResolver::lookup_record`] to resolve records of that
+/// kind. The typed methods ([`DnsResolver::lookup_ipv4`],
+/// [`DnsResolver::lookup_ipv6`], [`DnsResolver::lookup_txt`]) each
 /// resolve a fixed kind and are thin wrappers over `lookup_record`.
 ///
-/// [`SimpleDnsResolver::lookup_record`]: crate::SimpleDnsResolver::lookup_record
-/// [`SimpleDnsResolver::lookup_ipv4`]: crate::SimpleDnsResolver::lookup_ipv4
-/// [`SimpleDnsResolver::lookup_ipv6`]: crate::SimpleDnsResolver::lookup_ipv6
-/// [`SimpleDnsResolver::lookup_txt`]: crate::SimpleDnsResolver::lookup_txt
+/// [`DnsResolver::lookup_record`]: crate::DnsResolver::lookup_record
+/// [`DnsResolver::lookup_ipv4`]: crate::DnsResolver::lookup_ipv4
+/// [`DnsResolver::lookup_ipv6`]: crate::DnsResolver::lookup_ipv6
+/// [`DnsResolver::lookup_txt`]: crate::DnsResolver::lookup_txt
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum RecordKind {
@@ -41,14 +41,14 @@ pub enum RecordKind {
     Https,
 }
 
-/// Parsed record data returned by [`SimpleDnsResolver::lookup_record`].
+/// Parsed record data returned by [`DnsResolver::lookup_record`].
 ///
 /// Each variant corresponds to a [`RecordKind`]. A single lookup returns only
 /// records of the requested kind, so matching one variant is enough in
 /// practice, but the enum is [`non_exhaustive`] so that adding kinds later is
 /// not a breaking change.
 ///
-/// [`SimpleDnsResolver::lookup_record`]: crate::SimpleDnsResolver::lookup_record
+/// [`DnsResolver::lookup_record`]: crate::DnsResolver::lookup_record
 /// [`non_exhaustive`]: https://doc.rust-lang.org/reference/attributes/type_system.html
 #[derive(Debug, Clone)]
 #[non_exhaustive]
@@ -232,11 +232,11 @@ impl SvcbRecordData {
 /// the raw parameters) together with the record's owner name, and layers on the
 /// HTTPS-specific rules: the AliasMode/ServiceMode distinction (RFC 9460 Section
 /// 2.4), the `"."` target rule (Section 2.5), and the default `http/1.1` ALPN
-/// (Section 7.1.1 and Section 9.5). It is what [`SimpleDnsResolver::lookup_https`]
+/// (Section 7.1.1 and Section 9.5). It is what [`DnsResolver::lookup_https`]
 /// returns.
 ///
 /// [RFC 9460]: https://datatracker.ietf.org/doc/html/rfc9460
-/// [`SimpleDnsResolver::lookup_https`]: crate::SimpleDnsResolver::lookup_https
+/// [`DnsResolver::lookup_https`]: crate::DnsResolver::lookup_https
 #[derive(Debug, Clone)]
 pub struct HttpsRecord {
     /// The record's owner name, needed to resolve a `"."` target (RFC 9460

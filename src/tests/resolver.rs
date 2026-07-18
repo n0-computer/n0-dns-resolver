@@ -160,11 +160,11 @@ async fn search_list_expansion_reaches_bare_name() {
 /// search order is the answer, so an appended candidate's empty result never
 /// masks a name that genuinely does not exist.
 ///
-/// Guards the negative-answer precedence in [`SimpleDnsResolver::lookup_record`]
+/// Guards the negative-answer precedence in [`DnsResolver::lookup_record`]
 /// against a regression found in adversarial review, where any NODATA across the
 /// search list overrode an NXDOMAIN of the queried name.
 ///
-/// [`SimpleDnsResolver::lookup_record`]: crate::SimpleDnsResolver::lookup_record
+/// [`DnsResolver::lookup_record`]: crate::DnsResolver::lookup_record
 #[tokio::test]
 async fn bare_nxdomain_wins_over_appended_nodata() {
     let server = spawn_mock(|query| {
@@ -200,9 +200,9 @@ async fn bare_nxdomain_wins_over_appended_nodata() {
 /// failure clears. The second lookup must reach the network again.
 ///
 /// Guards the no-cache-on-indeterminate rule in
-/// [`SimpleDnsResolver::lookup_record`], added after adversarial review.
+/// [`DnsResolver::lookup_record`], added after adversarial review.
 ///
-/// [`SimpleDnsResolver::lookup_record`]: crate::SimpleDnsResolver::lookup_record
+/// [`DnsResolver::lookup_record`]: crate::DnsResolver::lookup_record
 #[tokio::test]
 async fn transient_failure_blocks_negative_caching() {
     let server = spawn_mock(|query| {
@@ -270,9 +270,9 @@ async fn srv_lookup_end_to_end() {
 /// An MX lookup returns the parsed preference and exchange.
 ///
 /// Exercises RFC 1035 Section 3.3.9 (MX RDATA) end-to-end through
-/// [`SimpleDnsResolver::lookup_record`].
+/// [`DnsResolver::lookup_record`].
 ///
-/// [`SimpleDnsResolver::lookup_record`]: crate::SimpleDnsResolver::lookup_record
+/// [`DnsResolver::lookup_record`]: crate::DnsResolver::lookup_record
 #[tokio::test]
 async fn mx_lookup_end_to_end() {
     let server = spawn_mock(|query| {
@@ -300,9 +300,9 @@ async fn mx_lookup_end_to_end() {
 /// A CAA lookup returns the flag, tag, and raw value as they appear on the wire.
 ///
 /// Exercises RFC 8659 (CAA RDATA) end-to-end through
-/// [`SimpleDnsResolver::lookup_record`].
+/// [`DnsResolver::lookup_record`].
 ///
-/// [`SimpleDnsResolver::lookup_record`]: crate::SimpleDnsResolver::lookup_record
+/// [`DnsResolver::lookup_record`]: crate::DnsResolver::lookup_record
 #[tokio::test]
 async fn caa_lookup_end_to_end() {
     let server = spawn_mock(|query| {
@@ -329,11 +329,11 @@ async fn caa_lookup_end_to_end() {
 }
 
 /// An NS lookup returns the nameserver name via the generic
-/// [`SimpleDnsResolver::lookup_record`] path.
+/// [`DnsResolver::lookup_record`] path.
 ///
 /// Modeled on hickory-resolver `caching_client.rs::test_single_ns_query_response`.
 ///
-/// [`SimpleDnsResolver::lookup_record`]: crate::SimpleDnsResolver::lookup_record
+/// [`DnsResolver::lookup_record`]: crate::DnsResolver::lookup_record
 #[tokio::test]
 async fn ns_lookup_end_to_end() {
     let server = spawn_mock(|query| {

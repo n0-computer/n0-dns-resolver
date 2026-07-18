@@ -97,10 +97,10 @@ impl CacheEntry {
 /// necessary because the result must outlive the lock guard.
 ///
 /// Cloning shares the same underlying cache, so a resolver rebuilt on a network
-/// change (see [`SimpleDnsResolver::reset`]) can carry its cache across rather
+/// change (see [`DnsResolver::reset`]) can carry its cache across rather
 /// than starting cold while DNS is still in flux.
 ///
-/// [`SimpleDnsResolver::reset`]: super::SimpleDnsResolver::reset
+/// [`DnsResolver::reset`]: super::DnsResolver::reset
 #[derive(Debug, Clone)]
 pub(super) struct DnsCache {
     inner: Arc<Mutex<LruCache<u64, CacheEntry>>>,

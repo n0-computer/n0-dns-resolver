@@ -4,44 +4,58 @@
 use std::sync::Arc;
 use std::{io, net::SocketAddr};
 
-#[cfg(with_rustls)]
-use n0_error::AnyError;
 use n0_error::{e, stack_error};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::pool::ConnPool;
 
-/// Errors that can occur while sending a query to a single nameserver and
-/// reading its response.
+/// A network or transport-level failure while querying a single nameserver.
 ///
-/// Mapped to [`crate::Error::Transport`] by the resolver layer.
-#[allow(missing_docs)]
+/// The source of [`crate::Error::Transport`]; match on it for the specific cause.
 #[stack_error(derive, add_meta, std_sources)]
-pub(super) enum TransportError {
+#[non_exhaustive]
+pub enum TransportError {
+    /// A socket read or write failed.
     #[error("transport I/O failed")]
     Io {
+        /// The underlying I/O error.
         #[error(from)]
         source: io::Error,
     },
+    /// A UDP response arrived from an address other than the nameserver queried,
+    /// so it was rejected (a spoofing defence).
     #[error("response from unexpected source {actual}, expected {expected}")]
     UnexpectedSource {
+        /// The nameserver address the query was sent to.
         expected: SocketAddr,
+        /// The address the response actually came from.
         actual: SocketAddr,
     },
+    /// The query did not fit the 2-byte length prefix used for TCP and DoT.
     #[error("query too large for TCP framing")]
     QueryTooLarge {},
+    /// The configured TLS server name is not a valid DNS name for SNI.
     #[cfg(transport_tls)]
-    #[error("invalid TLS server name")]
-    InvalidServerName { source: AnyError },
+    #[error("invalid TLS server name: {name}")]
+    InvalidServerName {
+        /// The rejected server name.
+        name: String,
+    },
+    /// A DNS-over-HTTPS request failed at the HTTP layer.
     #[cfg(transport_https)]
     #[error("DNS-over-HTTPS request failed")]
     Http {
+        /// The underlying reqwest error.
         #[error(from)]
         source: reqwest::Error,
     },
+    /// The DNS-over-HTTPS client could not be constructed.
     #[cfg(transport_https)]
     #[error("failed to build HTTPS client")]
-    BuildClient { source: AnyError },
+    BuildClient {
+        /// The reqwest error from building the client.
+        source: reqwest::Error,
+    },
 }
 
 // TCP and DoT connections are pooled (see the `pool` module) and reused across
@@ -169,8 +183,11 @@ pub(super) async fn tls_query(
     // Use the explicit server name for SNI and validation if given, otherwise
     // validate against the IP the connection was made to.
     let sni = match server_name {
-        Some(name) => rustls::pki_types::ServerName::try_from(name.to_string())
-            .map_err(|e| e!(TransportError::InvalidServerName, AnyError::from_std(e)))?,
+        Some(name) => rustls::pki_types::ServerName::try_from(name.to_string()).map_err(|_| {
+            e!(TransportError::InvalidServerName {
+                name: name.to_string()
+            })
+        })?,
         None => rustls::pki_types::ServerName::IpAddress(addr.ip().into()),
     };
     let mut stream = connector.connect(sni, tcp_stream).await?;
@@ -194,7 +211,7 @@ pub(super) fn build_https_client(
     }
     builder
         .build()
-        .map_err(|e| e!(TransportError::BuildClient, AnyError::from_std(e)))
+        .map_err(|source| e!(TransportError::BuildClient { source }))
 }
 
 /// Sends a DNS query over HTTPS (DNS-over-HTTPS, RFC 8484).

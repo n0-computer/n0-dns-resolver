@@ -12,7 +12,7 @@ use std::{
     time::Instant,
 };
 
-use n0_error::{AnyError, e};
+use n0_error::e;
 use n0_future::{
     FuturesUnordered, MaybeFuture, StreamExt,
     time::{self, Duration},
@@ -33,12 +33,12 @@ mod query;
 mod rtt_map;
 mod transport;
 
+pub use self::transport::TransportError;
 use self::{
     cache::{CachedResult, DnsCache, NEGATIVE_TTL_SECS},
     pool::ConnPool,
     query::{MAX_CNAME_DEPTH, QueryError},
     rtt_map::RttMap,
-    transport::TransportError,
 };
 
 impl RecordKind {
@@ -60,8 +60,8 @@ impl RecordKind {
 
 /// Maps a transport-layer failure onto the public [`Error`].
 impl From<TransportError> for Error {
-    fn from(err: TransportError) -> Self {
-        e!(Error::Transport, AnyError::from_stack(err))
+    fn from(source: TransportError) -> Self {
+        e!(Error::Transport { source })
     }
 }
 
@@ -69,12 +69,16 @@ impl From<TransportError> for Error {
 impl From<QueryError> for Error {
     fn from(err: QueryError) -> Self {
         match err {
-            QueryError::BuildQuery { source, .. } => e!(Error::InvalidQuery, source),
+            QueryError::BuildQuery { name, .. } => e!(Error::InvalidName { name }),
             QueryError::Malformed { .. } | QueryError::Unexpected { .. } => {
                 e!(Error::InvalidResponse)
             }
             QueryError::NxDomain { .. } => e!(Error::NxDomain),
-            QueryError::ServerFailure { rcode, .. } => e!(Error::ServerError { rcode }),
+            QueryError::ServerFailure { rcode, .. } => {
+                e!(Error::ServerError {
+                    code: query::response_code(rcode)
+                })
+            }
         }
     }
 }
@@ -136,7 +140,7 @@ pub struct DnsResolver {
 }
 
 /// The runtime state a resolver derives from its builder and the system DNS
-/// configuration, built lazily by [`SimpleDnsResolver::state`].
+/// configuration, built lazily by [`DnsResolver::state`].
 #[derive(Debug)]
 struct ResolverState {
     /// The effective configuration: the assembled nameserver list, the search
@@ -144,7 +148,7 @@ struct ResolverState {
     ///
     /// `config.nameservers` holds the primary nameservers followed by the
     /// fallback ones, split at `primary_count`; see
-    /// [`SimpleDnsResolver::send_query`] for how the two tiers are used.
+    /// [`DnsResolver::send_query`] for how the two tiers are used.
     config: DnsConfig,
     /// Number of leading entries in `config.nameservers` that form the primary
     /// tier.
@@ -222,7 +226,7 @@ impl DnsResolver {
     ///
     /// Reads the system's DNS configuration and escalates to public resolvers
     /// when it cannot be read or a query goes unanswered. Equivalent to
-    /// `SimpleDnsResolver::builder().build()`.
+    /// `DnsResolver::builder().build()`.
     pub fn new() -> Self {
         Self::builder().build()
     }
@@ -384,13 +388,13 @@ impl DnsResolver {
         }
     }
 
-    /// Run a future with [`NAMESERVER_TIMEOUT`].
-    async fn with_timeout<T, E: Into<AnyError>>(
-        fut: impl Future<Output = Result<T, E>>,
+    /// Run a transport future with [`NAMESERVER_TIMEOUT`].
+    async fn with_timeout<T>(
+        fut: impl Future<Output = Result<T, TransportError>>,
     ) -> Result<T, Error> {
         time::timeout(NAMESERVER_TIMEOUT, fut)
             .await
-            .map(|r| r.map_err(|e| e!(Error::Transport, e.into())))
+            .map(|r| r.map_err(Error::from))
             .map_err(|_| e!(Error::Timeout))?
     }
 
@@ -479,7 +483,7 @@ impl DnsResolver {
     async fn send_query(&self, query_bytes: &[u8]) -> Result<Vec<u8>, Error> {
         let state = self.state();
         if state.config.nameservers.is_empty() {
-            return Err(e!(Error::NoResponse));
+            return Err(e!(Error::NoNameservers));
         }
 
         let primary: Vec<usize> = (0..state.primary_count).collect();
@@ -553,8 +557,9 @@ impl DnsResolver {
                         // nameserver may still resolve the name.
                         if let Some(rcode) = query::server_failure_rcode(&resp) {
                             state.rtt_map.record_failure(idx);
-                            last_err =
-                                Some(e!(Error::ServerError { rcode: format!("{rcode:?}") }));
+                            last_err = Some(e!(Error::ServerError {
+                                code: query::response_code(rcode),
+                            }));
                             // Fail fast: start the next attempt now rather than waiting.
                             next_attempt.as_mut().set_none();
                         } else {
@@ -586,8 +591,11 @@ impl DnsResolver {
     ) -> Result<Vec<u8>, Error> {
         let mut current_host = host;
         for _ in 0..MAX_CNAME_DEPTH {
-            let name = simple_dns::Name::new(&current_host)
-                .map_err(|e| e!(Error::InvalidQuery, AnyError::from_std(e)))?;
+            let name = simple_dns::Name::new(&current_host).map_err(|_| {
+                e!(Error::InvalidName {
+                    name: current_host.clone()
+                })
+            })?;
             let (id, query_bytes) = query::build_query(&current_host, qtype)?;
             let response = self.send_query(&query_bytes).await?;
             let packet =
@@ -1420,7 +1428,7 @@ mod tests {
         assert_eq!(v6, [Ipv6Addr::LOCALHOST]);
     }
 
-    /// A major network change rebuilds the resolver via [`SimpleDnsResolver::reset`];
+    /// A major network change rebuilds the resolver via [`DnsResolver::reset`];
     /// the DNS cache must carry across so reconnects keep resolving while the new
     /// nameservers settle (issue #4037).
     #[test]

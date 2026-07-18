@@ -1,14 +1,14 @@
-//! The [`Builder`] for configuring a [`SimpleDnsResolver`].
+//! The [`Builder`] for configuring a [`DnsResolver`].
 
 use std::net::SocketAddr;
 
 use crate::DnsResolver;
 
-/// Builds a [`SimpleDnsResolver`].
+/// Builds a [`DnsResolver`].
 ///
 /// The default builder reads the host system's DNS configuration and, when a
 /// query cannot be answered there, escalates to a set of public resolvers. Get
-/// one from [`SimpleDnsResolver::builder`], adjust it with the setters, and
+/// one from [`DnsResolver::builder`], adjust it with the setters, and
 /// finish with [`Builder::build`].
 ///
 /// # Nameserver tiers
@@ -25,10 +25,10 @@ use crate::DnsResolver;
 /// # Examples
 ///
 /// ```
-/// use n0_dns_resolver::SimpleDnsResolver;
+/// use n0_dns_resolver::DnsResolver;
 ///
 /// // System configuration first, public resolvers as a fallback.
-/// let resolver = SimpleDnsResolver::builder().build();
+/// let resolver = DnsResolver::builder().build();
 /// ```
 #[derive(Debug, Clone)]
 pub struct Builder {

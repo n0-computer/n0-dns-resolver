@@ -16,7 +16,7 @@
 //!
 //! The JNI implementation is adapted from `hickory_resolver`.
 //!
-//! [`DnsResolver`]: crate::SimpleDnsResolver
+//! [`DnsResolver`]: crate::DnsResolver
 //! [`ndk_context`]: https://docs.rs/ndk-context
 
 use std::ffi::c_void;
@@ -187,7 +187,7 @@ fn read_system_dns_jni() -> Result<DnsConfig, std::io::Error> {
 /// Both the `java_vm` and `context_jobject` pointers must remain valid until the process exits.
 /// See also [`ndk_context::initialize_android_context`].
 ///
-/// [`DnsResolver`]: crate::SimpleDnsResolver
+/// [`DnsResolver`]: crate::DnsResolver
 /// [`ndk_context`]: https://docs.rs/ndk-context
 /// [`ndk_context::initialize_android_context`]: https://docs.rs/ndk-context/latest/ndk_context/fn.initialize_android_context.html
 pub unsafe fn install_android_jni_context(java_vm: *mut c_void, application_context: *mut c_void) {

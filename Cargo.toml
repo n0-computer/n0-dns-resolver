@@ -69,4 +69,6 @@ allowed_external_types = [
     "n0_error::*",
     # The builder accepts a caller-provided rustls TLS client config.
     "rustls::client::client_conn::ClientConfig",
+    # TransportError exposes the reqwest error behind DNS-over-HTTPS failures.
+    "reqwest::error::Error",
 ]

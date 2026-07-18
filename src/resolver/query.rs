@@ -2,7 +2,9 @@
 
 use std::net::{Ipv4Addr, Ipv6Addr};
 
-use n0_error::{AnyError, e, stack_error};
+use n0_error::{e, stack_error};
+
+use crate::ResponseCode;
 use simple_dns::{
     CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, RCODE, TYPE, header_buffer,
     rdata::{A, AAAA, RData, SVCB},
@@ -19,16 +21,27 @@ use crate::{
 #[allow(missing_docs)]
 #[stack_error(derive, add_meta, std_sources)]
 pub(super) enum QueryError {
-    #[error("failed to build query packet")]
-    BuildQuery { source: AnyError },
+    #[error("invalid domain name: {name}")]
+    BuildQuery { name: String },
     #[error("malformed DNS response")]
-    Malformed { source: AnyError },
+    Malformed {},
     #[error("response did not match query")]
     Unexpected {},
     #[error("domain name does not exist (NXDOMAIN)")]
     NxDomain {},
-    #[error("server returned error: {rcode}")]
-    ServerFailure { rcode: String },
+    #[error("server returned error: {rcode:?}")]
+    ServerFailure { rcode: RCODE },
+}
+
+/// Maps a `simple_dns` [`RCODE`] onto the public [`ResponseCode`].
+pub(super) fn response_code(rcode: RCODE) -> ResponseCode {
+    match rcode {
+        RCODE::ServerFailure => ResponseCode::ServerFailure,
+        RCODE::Refused => ResponseCode::Refused,
+        RCODE::FormatError => ResponseCode::FormatError,
+        RCODE::NotImplemented => ResponseCode::NotImplemented,
+        _ => ResponseCode::Other,
+    }
 }
 
 /// Length of a fixed DNS message header (RFC 1035 Section 4.1.1).
@@ -57,7 +70,11 @@ pub(super) fn build_query(host: &str, qtype: TYPE) -> Result<(u16, Vec<u8>), Que
     let mut packet = Packet::new_query(id);
     packet.set_flags(PacketFlag::RECURSION_DESIRED);
 
-    let name = Name::new(host).map_err(|e| e!(QueryError::BuildQuery, AnyError::from_std(e)))?;
+    let name = Name::new(host).map_err(|_| {
+        e!(QueryError::BuildQuery {
+            name: host.to_string()
+        })
+    })?;
     let question = Question::new(name, QTYPE::TYPE(qtype), QCLASS::CLASS(CLASS::IN), false);
     packet.questions.push(question);
 
@@ -68,9 +85,11 @@ pub(super) fn build_query(host: &str, qtype: TYPE) -> Result<(u16, Vec<u8>), Que
         opt_codes: vec![],
     });
 
-    let bytes = packet
-        .build_bytes_vec()
-        .map_err(|e| e!(QueryError::BuildQuery, AnyError::from_std(e)))?;
+    let bytes = packet.build_bytes_vec().map_err(|_| {
+        e!(QueryError::BuildQuery {
+            name: host.to_string()
+        })
+    })?;
     Ok((id, bytes))
 }
 
@@ -174,9 +193,7 @@ pub(super) fn check_response(
     match packet.rcode() {
         RCODE::NoError => Ok(()),
         RCODE::NameError => Err(e!(QueryError::NxDomain)),
-        rcode => Err(e!(QueryError::ServerFailure {
-            rcode: format!("{rcode:?}"),
-        })),
+        rcode => Err(e!(QueryError::ServerFailure { rcode })),
     }
 }
 
@@ -190,8 +207,7 @@ fn parse_response<T>(
     data: &[u8],
     extract: impl Fn(&Name<'_>, &RData<'_>) -> Option<T>,
 ) -> Result<(Vec<T>, u32), QueryError> {
-    let packet =
-        Packet::parse(data).map_err(|e| e!(QueryError::Malformed, AnyError::from_std(e)))?;
+    let packet = Packet::parse(data).map_err(|_| e!(QueryError::Malformed))?;
 
     // The chain is empty only for a response with no question section, which
     // `check_response` already rejects; extraction then matches nothing.
