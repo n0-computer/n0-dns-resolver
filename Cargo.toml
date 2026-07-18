@@ -74,6 +74,15 @@ tls-aws-lc-rs = ["rustls?/aws-lc-rs"]
 tokio = { version = "1", features = ["macros", "rt"] }
 tracing-subscriber = "0.3.23"
 
+# The browser wasm target runs the integration test through wasm-bindgen-test.
+[target.'cfg(all(target_family = "wasm", target_os = "unknown"))'.dev-dependencies]
+wasm-bindgen-test = "0.3"
+console_error_panic_hook = "0.1"
+
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
 [package.metadata.docs.rs]
 all-features = true
 rustdoc-args = ["--cfg", "n0_dns_resolver_docsrs"]

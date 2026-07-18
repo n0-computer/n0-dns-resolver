@@ -234,3 +234,39 @@ jobs:
     - uses: actions/checkout@v5
     - run: pip install --user codespell[toml]
     - run: codespell --ignore-words-list=ans,atmost,crate,inout,ser,stayin,worl --skip=CHANGELOG.md
+
+  wasm_build_and_test:
+    timeout-minutes: 30
+    name: Build & test wasm32
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    runs-on: ubuntu-latest
+    steps:
+    - name: Checkout
+      uses: actions/checkout@v5
+
+    # node.js 22 provides a browser-like fetch/WebSocket API for the test runner.
+    - name: Setup node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: 22
+
+    - name: Install stable toolchain
+      uses: dtolnay/rust-toolchain@stable
+
+    - name: Add wasm target
+      run: rustup target add wasm32-unknown-unknown
+
+    - name: Install wasm-bindgen-test-runner
+      uses: taiki-e/install-action@v2
+      with:
+        tool: wasm-bindgen-cli
+
+    # The browser wasm target has no sockets or native TLS, so only
+    # DNS-over-HTTPS is available and default features (which pull in the native
+    # TLS stack) do not build; see the crate docs.
+    - name: wasm32 build
+      run: cargo build --target wasm32-unknown-unknown --no-default-features --features transport-https
+
+    # Runs through wasm-bindgen-test-runner (configured in .cargo/config.toml).
+    - name: wasm32 integration test
+      run: cargo test --target wasm32-unknown-unknown --test integration --no-default-features --features transport-https
