@@ -1042,11 +1042,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires UDP/53, which is unreliable in CI"]
     async fn resolve_ipv4_udp() {
         assert_resolves_ipv4(&with_proto(GOOGLE_DNS, DnsProtocol::Udp), "google.com").await;
     }
 
     #[tokio::test]
+    #[ignore = "requires UDP/53, which is unreliable in CI"]
     async fn resolve_ipv6_udp() {
         let resolver = with_proto(GOOGLE_DNS, DnsProtocol::Udp);
         let addrs: Vec<_> = resolver
@@ -1079,6 +1081,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires UDP/53, which is unreliable in CI"]
     async fn resolve_txt_udp() {
         let resolver = with_proto(GOOGLE_DNS, DnsProtocol::Udp);
         let records: Vec<_> = resolver
@@ -1090,11 +1093,13 @@ mod tests {
     }
 
     #[tokio::test]
+    #[ignore = "requires UDP/53, which is unreliable in CI"]
     async fn resolve_system_defaults() {
         assert_resolves_ipv4(&system_resolver(), "google.com").await;
     }
 
     #[tokio::test]
+    #[ignore = "requires UDP/53, which is unreliable in CI"]
     async fn resolve_multiple_sites() {
         let resolver = system_resolver();
         for host in ["google.com", "cloudflare.com", "example.com"] {
@@ -1105,6 +1110,7 @@ mod tests {
     /// Run with `cargo test -p iroh-relay resolve_success_and_nxdomain -- --ignored --nocapture`
     /// and `RUST_LOG=iroh_relay::dns=trace` to see the log output.
     #[tokio::test]
+    #[ignore = "requires UDP/53, which is unreliable in CI"]
     async fn resolve_success_and_nxdomain() {
         let _ = tracing_subscriber::fmt::try_init();
         let resolver = with_proto(GOOGLE_DNS, DnsProtocol::Udp);
