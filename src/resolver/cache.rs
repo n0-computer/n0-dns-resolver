@@ -3,10 +3,11 @@
 use std::{
     hash::{Hash, Hasher},
     sync::{Arc, Mutex},
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use lru::LruCache;
+use n0_future::time::Instant;
 
 use crate::{Record, RecordKind};
 

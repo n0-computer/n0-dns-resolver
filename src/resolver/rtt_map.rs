@@ -1,8 +1,8 @@
 //! Smoothed round-trip-time tracking used to order nameservers fastest-first.
 
-use std::{sync::Mutex, time::Instant};
+use std::sync::Mutex;
 
-use n0_future::time::Duration;
+use n0_future::time::{Duration, Instant};
 
 /// Weight of each new round-trip sample in the running average, from 0 to 1.
 ///

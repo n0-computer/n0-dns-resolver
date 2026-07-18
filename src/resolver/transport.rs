@@ -205,7 +205,10 @@ pub(super) fn build_https_client(
     tls_config: &Arc<rustls::ClientConfig>,
     resolves: &[(String, SocketAddr)],
 ) -> Result<reqwest::Client, TransportError> {
-    let mut builder = reqwest::Client::builder().use_preconfigured_tls(tls_config.clone());
+    // reqwest wraps the argument in an `Option` and downcasts to
+    // `Option<rustls::ClientConfig>`, so hand it a bare `ClientConfig` (not the
+    // `Arc`), or it rejects it as an unknown backend at build time.
+    let mut builder = reqwest::Client::builder().use_preconfigured_tls((**tls_config).clone());
     for (host, addr) in resolves {
         builder = builder.resolve(host, *addr);
     }
