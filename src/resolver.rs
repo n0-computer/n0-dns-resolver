@@ -444,7 +444,12 @@ impl DnsResolver {
         Ok(resp)
     }
 
-    /// Query a single nameserver once, with UDP retry and truncation fallback.
+    /// Query a single nameserver once, retrying UDP and falling back to TCP.
+    ///
+    /// A UDP query is retried [`UDP_ATTEMPTS`] times, then falls back to TCP on
+    /// the same server if every attempt failed, so lookups still succeed on
+    /// networks that drop outbound UDP/53 but allow TCP/53. A truncated UDP
+    /// response also falls back to TCP, to fetch the full answer.
     async fn query_nameserver_once(
         &self,
         ns: &Nameserver,
@@ -476,7 +481,17 @@ impl DnsResolver {
                         }
                     }
                 }
-                Err(last_err.unwrap_or_else(|| e!(Error::NoResponse)))
+                // Every UDP attempt failed (timed out or errored). The server may
+                // still answer over TCP: some networks (locked-down containers,
+                // egress firewalls) drop outbound UDP/53 while permitting TCP/53,
+                // so fall back to TCP on the same server before giving up.
+                let last_err = last_err.unwrap_or_else(|| e!(Error::NoResponse));
+                debug!(%addr, err = %last_err, "UDP attempts failed, falling back to TCP");
+                Self::with_timeout(
+                    STREAM_TIMEOUT,
+                    transport::tcp_query(&self.conn_pool, addr, query_bytes),
+                )
+                .await
             }
             DnsProtocol::Tcp => {
                 Self::with_timeout(
@@ -1177,6 +1192,65 @@ mod tests {
             .collect();
         assert_eq!(addrs, [expected]);
         handle.await.unwrap();
+    }
+
+    /// When every UDP attempt fails, the resolver falls back to TCP on the same
+    /// server, so lookups still succeed on a network that drops UDP/53 but allows
+    /// TCP/53. Serves DNS over TCP only and leaves the UDP port unbound, so the
+    /// UDP attempts time out.
+    #[tokio::test]
+    async fn udp_failure_falls_back_to_tcp() {
+        use simple_dns::{
+            CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, ResourceRecord, TYPE,
+            rdata::{A, RData},
+        };
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let expected = Ipv4Addr::new(93, 184, 216, 34);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        // Answer a single query over TCP, echoing the question with one A record.
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let len = stream.read_u16().await.unwrap() as usize;
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await.unwrap();
+            let id = Packet::parse(&buf).unwrap().id();
+            let mut reply = Packet::new_reply(id);
+            reply.set_flags(PacketFlag::RECURSION_DESIRED | PacketFlag::RECURSION_AVAILABLE);
+            reply.questions.push(Question::new(
+                Name::new_unchecked("example.com"),
+                QTYPE::TYPE(TYPE::A),
+                QCLASS::CLASS(CLASS::IN),
+                false,
+            ));
+            reply.answers.push(ResourceRecord::new(
+                Name::new_unchecked("example.com"),
+                CLASS::IN,
+                300,
+                RData::A(A {
+                    address: u32::from(expected),
+                }),
+            ));
+            let bytes = reply.build_bytes_vec().unwrap();
+            stream
+                .write_all(&(bytes.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&bytes).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+
+        // Nothing listens on UDP at `addr`, so the UDP attempts time out and the
+        // resolver falls back to TCP.
+        let resolver = with_proto(addr, DnsProtocol::Udp);
+        let addrs: Vec<_> = resolver
+            .lookup_ipv4("example.com".to_string())
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(addrs, [expected]);
+        server.await.unwrap();
     }
 
     /// With serve-stale enabled, a lookup that cannot reach any nameserver falls
