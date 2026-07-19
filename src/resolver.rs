@@ -34,7 +34,7 @@ mod transport;
 
 pub use self::transport::TransportError;
 use self::{
-    cache::{CachedResult, DnsCache, NEGATIVE_TTL_SECS},
+    cache::{CachedResult, DnsCache, NEGATIVE_TTL_MAX_SECS, NEGATIVE_TTL_SECS},
     pool::ConnPool,
     query::{MAX_CNAME_DEPTH, QueryError},
     rtt_map::RttMap,
@@ -387,6 +387,13 @@ impl DnsResolver {
         }
     }
 
+    /// The configured cache min-TTL floor in seconds, or 0 when unset.
+    fn cache_min_ttl_secs(&self) -> u32 {
+        self.builder
+            .cache_min_ttl
+            .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
+    }
+
     /// Run a transport future with [`NAMESERVER_TIMEOUT`].
     async fn with_timeout<T>(
         fut: impl Future<Output = Result<T, TransportError>>,
@@ -397,8 +404,30 @@ impl DnsResolver {
             .map_err(|_| e!(Error::Timeout))?
     }
 
-    /// Query a single nameserver, with UDP retry and truncation fallback.
+    /// Query a single nameserver, retrying without EDNS on a FORMERR.
+    ///
+    /// A FORMERR response often means the server or a middlebox rejected our
+    /// EDNS(0) OPT record, so retry the same server once without it (RFC 6891
+    /// Section 6.2.2) before letting the caller move on. If the query carries no
+    /// OPT, or the stripped retry still fails, the response is returned as-is and
+    /// the race treats a lingering FORMERR like any other retryable failure.
     async fn query_nameserver(
+        &self,
+        ns: &Nameserver,
+        query_bytes: &[u8],
+    ) -> Result<Vec<u8>, Error> {
+        let resp = self.query_nameserver_once(ns, query_bytes).await?;
+        if query::is_format_error(&resp)
+            && let Some(stripped) = query::strip_edns(query_bytes)
+        {
+            debug!(addr = %ns.addr, "FORMERR with EDNS, retrying without OPT");
+            return self.query_nameserver_once(ns, &stripped).await;
+        }
+        Ok(resp)
+    }
+
+    /// Query a single nameserver once, with UDP retry and truncation fallback.
+    async fn query_nameserver_once(
         &self,
         ns: &Nameserver,
         query_bytes: &[u8],
@@ -549,12 +578,13 @@ impl DnsResolver {
                 // A dial attempt completed.
                 Some((idx, start, res)) = dials.next(), if !dials.is_empty() => match res {
                     Ok(resp) => {
-                        // A SERVFAIL or REFUSED response means this server cannot
-                        // answer for the name (overloaded, not authoritative, policy
-                        // block). Treat it like a transport failure and race the next
-                        // server rather than making it the final answer; another
-                        // nameserver may still resolve the name.
-                        if let Some(rcode) = query::server_failure_rcode(&resp) {
+                        // A SERVFAIL, REFUSED, or FORMERR response means this server
+                        // will not answer for the name (overloaded, not authoritative,
+                        // policy block, or it rejected the query even without EDNS).
+                        // Treat it like a transport failure and race the next server
+                        // rather than making it the final answer; another nameserver
+                        // may still resolve the name.
+                        if let Some(rcode) = query::retryable_failure_rcode(&resp) {
                             state.rtt_map.record_failure(idx);
                             last_err = Some(e!(Error::ServerError {
                                 code: query::response_code(rcode),
@@ -668,6 +698,9 @@ impl DnsResolver {
         // order keeps an appended candidate's NODATA from masking an NXDOMAIN
         // of the intended (bare) name.
         let mut first_negative: Option<CachedResult> = None;
+        // The negative-cache TTL for `first_negative`, derived from that
+        // response's authority SOA (RFC 2308) and capped, or the fixed fallback.
+        let mut negative_ttl_secs = NEGATIVE_TTL_SECS;
         // Set when any candidate returned an indeterminate failure (SERVFAIL or
         // the like). We never learned whether that name exists, so a later
         // candidate's negative must not be cached: a flaky nameserver would
@@ -677,15 +710,27 @@ impl DnsResolver {
         let total = names.len();
         for (i, search_name) in names.into_iter().enumerate() {
             trace!(%search_name, ?kind, "resolving");
-            let res = match self
+            let (res, soa_negative_ttl) = match self
                 .send_query_following_cnames(search_name.clone(), kind.dns_type())
                 .await
             {
-                Ok(response) => query::parse_records(&response, kind).map_err(Error::from),
-                Err(e) => Err(e),
+                Ok(response) => {
+                    let parsed = query::parse_records(&response, kind).map_err(Error::from);
+                    // Derive the RFC 2308 negative TTL from the authority SOA while
+                    // the response bytes are still in scope; only meaningful for a
+                    // negative answer (empty or NXDOMAIN).
+                    let soa = match &parsed {
+                        Ok((records, _)) if records.is_empty() => query::negative_ttl(&response),
+                        Err(Error::NxDomain { .. }) => query::negative_ttl(&response),
+                        _ => None,
+                    };
+                    (parsed, soa.map(|ttl| ttl.min(NEGATIVE_TTL_MAX_SECS)))
+                }
+                Err(e) => (Err(e), None),
             };
             match res {
                 Ok((results, ttl)) if !results.is_empty() => {
+                    let ttl = ttl.max(self.cache_min_ttl_secs());
                     debug!(%name, ?kind, ?results, ttl, "resolved");
                     self.cache
                         .insert(&name, kind, CachedResult::Positive(results.clone()), ttl);
@@ -696,6 +741,7 @@ impl DnsResolver {
                 Ok(_) => {
                     if first_negative.is_none() {
                         first_negative = Some(CachedResult::NoData);
+                        negative_ttl_secs = soa_negative_ttl.unwrap_or(NEGATIVE_TTL_SECS);
                     }
                 }
                 Err(e @ Error::NxDomain { .. }) => {
@@ -703,6 +749,7 @@ impl DnsResolver {
                     trace!(%search_name, ?kind, remaining, reason = %e, "lookup failed");
                     if first_negative.is_none() {
                         first_negative = Some(CachedResult::NxDomain);
+                        negative_ttl_secs = soa_negative_ttl.unwrap_or(NEGATIVE_TTL_SECS);
                     }
                     last_err = Some(e);
                 }
@@ -742,7 +789,7 @@ impl DnsResolver {
                 debug!(%name, ?kind, "resolved to no records (NODATA)");
                 if !saw_transient {
                     self.cache
-                        .insert(&name, kind, CachedResult::NoData, NEGATIVE_TTL_SECS);
+                        .insert(&name, kind, CachedResult::NoData, negative_ttl_secs);
                 }
                 Ok(Vec::new())
             }
@@ -750,12 +797,21 @@ impl DnsResolver {
                 debug!(%name, ?kind, "does not exist (NXDOMAIN)");
                 if !saw_transient {
                     self.cache
-                        .insert(&name, kind, CachedResult::NxDomain, NEGATIVE_TTL_SECS);
+                        .insert(&name, kind, CachedResult::NxDomain, negative_ttl_secs);
                 }
                 Err(e!(Error::NxDomain))
             }
             _ => {
                 let err = last_err.unwrap_or_else(|| e!(Error::NoResponse));
+                // Serve-stale (RFC 8767): every candidate failed indeterminately
+                // and produced no authoritative answer, so fall back to an expired
+                // positive answer within the configured window rather than fail.
+                if let Some(max_age) = self.builder.serve_stale
+                    && let Some(records) = self.cache.get_stale(&name, kind, max_age)
+                {
+                    debug!(%name, ?kind, "serving stale answer after resolution failure");
+                    return Ok(records);
+                }
                 debug!(%name, ?kind, reason = %err, "resolve failed");
                 Err(err)
             }
@@ -1039,6 +1095,96 @@ mod tests {
             .unwrap()
             .collect();
         assert!(!addrs.is_empty(), "{host} should have IPv4 addresses");
+    }
+
+    /// A FORMERR response triggers an EDNS-less retry to the same server (RFC
+    /// 6891): the mock rejects the EDNS query with FORMERR, then answers the
+    /// retry that carries no OPT record.
+    #[tokio::test]
+    async fn formerr_retries_without_edns() {
+        use simple_dns::{
+            CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, ResourceRecord, TYPE,
+            rdata::{A, RData},
+        };
+
+        let expected = Ipv4Addr::new(198, 51, 100, 9);
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            // First query carries EDNS: reply FORMERR (RCODE 1, low nibble of
+            // header byte 3).
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let first = Packet::parse(&buf[..n]).unwrap();
+            assert!(first.opt().is_some(), "first query should carry EDNS");
+            let mut formerr = Packet::new_reply(first.id()).build_bytes_vec().unwrap();
+            formerr[3] = (formerr[3] & 0xF0) | 0x01;
+            server.send_to(&formerr, peer).await.unwrap();
+
+            // The retry drops EDNS: answer it with an A record.
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let retry = Packet::parse(&buf[..n]).unwrap();
+            assert!(retry.opt().is_none(), "retry should drop EDNS");
+            let mut reply = Packet::new_reply(retry.id());
+            reply.set_flags(PacketFlag::RECURSION_DESIRED | PacketFlag::RECURSION_AVAILABLE);
+            reply.questions.push(Question::new(
+                Name::new_unchecked("example.com"),
+                QTYPE::TYPE(TYPE::A),
+                QCLASS::CLASS(CLASS::IN),
+                false,
+            ));
+            reply.answers.push(ResourceRecord::new(
+                Name::new_unchecked("example.com"),
+                CLASS::IN,
+                300,
+                RData::A(A {
+                    address: u32::from(expected),
+                }),
+            ));
+            let bytes = reply.build_bytes_vec().unwrap();
+            server.send_to(&bytes, peer).await.unwrap();
+        });
+
+        let resolver = with_proto(addr, DnsProtocol::Udp);
+        let addrs: Vec<_> = resolver
+            .lookup_ipv4("example.com".to_string())
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(addrs, [expected]);
+        handle.await.unwrap();
+    }
+
+    /// With serve-stale enabled, a lookup that cannot reach any nameserver falls
+    /// back to an expired positive cache entry instead of failing.
+    #[tokio::test]
+    async fn serve_stale_returns_expired_answer_on_failure() {
+        use std::time::Duration;
+
+        let expected = Ipv4Addr::new(203, 0, 113, 7);
+        // A nameserver on a closed port: the TCP connect is refused at once, so
+        // live resolution fails fast and the stale fallback runs.
+        let resolver = DnsResolver::builder()
+            .without_system_defaults()
+            .disable_fallback()
+            .serve_stale(Duration::from_secs(3600))
+            .nameserver("127.0.0.1:1".parse().unwrap(), DnsProtocol::Tcp)
+            .build();
+        // Seed a positive entry that expired 5s ago.
+        resolver.cache.insert_expired(
+            "stale.test",
+            RecordKind::A,
+            CachedResult::Positive(vec![Record::A(expected)]),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+
+        let addrs: Vec<_> = resolver
+            .lookup_ipv4("stale.test".to_string())
+            .await
+            .unwrap()
+            .collect();
+        assert_eq!(addrs, [expected]);
     }
 
     #[tokio::test]
