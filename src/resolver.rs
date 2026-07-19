@@ -82,8 +82,22 @@ impl From<QueryError> for Error {
     }
 }
 
-/// Per-nameserver timeout for a single attempt.
-const NAMESERVER_TIMEOUT: Duration = Duration::from_secs(2);
+/// Per-attempt timeout for a UDP query.
+///
+/// UDP is retried [`UDP_ATTEMPTS`] times and servers are raced, so a lost or
+/// slow datagram is recovered by another attempt or another server; the timeout
+/// only needs to cover a healthy server answering over a slow link. Kept below
+/// [`STREAM_TIMEOUT`] so a silent server fails over quickly rather than stalling
+/// the whole lookup. Higher than the historical 2s but below the 5s that glibc,
+/// Go, and hickory-resolver use for their (un-raced) queries.
+const UDP_TIMEOUT: Duration = Duration::from_secs(3);
+
+/// Per-attempt timeout for a connection-oriented query (TCP, DoT, DoH).
+///
+/// Longer than [`UDP_TIMEOUT`] because it must also cover connection setup and,
+/// for DoT/DoH, the TLS handshake, on top of the query round trip. Matches the
+/// ~5s query timeout used by glibc, Go, hickory-resolver, and systemd-resolved.
+const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum number of nameserver queries in flight at once.
 ///
@@ -394,11 +408,15 @@ impl DnsResolver {
             .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
     }
 
-    /// Run a transport future with [`NAMESERVER_TIMEOUT`].
+    /// Run a transport future with a per-attempt `timeout`.
+    ///
+    /// Callers pass [`UDP_TIMEOUT`] for datagram queries and [`STREAM_TIMEOUT`]
+    /// for connection-oriented ones (TCP, DoT, DoH).
     async fn with_timeout<T>(
+        timeout: Duration,
         fut: impl Future<Output = Result<T, TransportError>>,
     ) -> Result<T, Error> {
-        time::timeout(NAMESERVER_TIMEOUT, fut)
+        time::timeout(timeout, fut)
             .await
             .map(|r| r.map_err(Error::from))
             .map_err(|_| e!(Error::Timeout))?
@@ -438,16 +456,17 @@ impl DnsResolver {
                 let mut last_err = None;
                 for attempt in 0..UDP_ATTEMPTS {
                     trace!(%addr, attempt, "sending UDP query");
-                    match Self::with_timeout(transport::udp_query(addr, query_bytes)).await {
+                    match Self::with_timeout(UDP_TIMEOUT, transport::udp_query(addr, query_bytes))
+                        .await
+                    {
                         Ok((resp, maybe_truncated))
                             if maybe_truncated || query::is_truncated(&resp) =>
                         {
                             debug!(%addr, "UDP response truncated, retrying over TCP");
-                            return Self::with_timeout(transport::tcp_query(
-                                &self.conn_pool,
-                                addr,
-                                query_bytes,
-                            ))
+                            return Self::with_timeout(
+                                STREAM_TIMEOUT,
+                                transport::tcp_query(&self.conn_pool, addr, query_bytes),
+                            )
                             .await;
                         }
                         Ok((resp, _)) => return Ok(resp),
@@ -460,7 +479,11 @@ impl DnsResolver {
                 Err(last_err.unwrap_or_else(|| e!(Error::NoResponse)))
             }
             DnsProtocol::Tcp => {
-                Self::with_timeout(transport::tcp_query(&self.conn_pool, addr, query_bytes)).await
+                Self::with_timeout(
+                    STREAM_TIMEOUT,
+                    transport::tcp_query(&self.conn_pool, addr, query_bytes),
+                )
+                .await
             }
             #[cfg(transport_tls)]
             DnsProtocol::Tls => {
@@ -468,24 +491,25 @@ impl DnsResolver {
                     .tls_config
                     .as_ref()
                     .ok_or_else(|| e!(Error::MissingTlsConfig))?;
-                Self::with_timeout(transport::tls_query(
-                    &self.conn_pool,
-                    addr,
-                    query_bytes,
-                    tls_config,
-                    ns.server_name.as_deref(),
-                ))
+                Self::with_timeout(
+                    STREAM_TIMEOUT,
+                    transport::tls_query(
+                        &self.conn_pool,
+                        addr,
+                        query_bytes,
+                        tls_config,
+                        ns.server_name.as_deref(),
+                    ),
+                )
                 .await
             }
             #[cfg(transport_https)]
             DnsProtocol::Https => {
                 let client = self.get_or_init_https_client()?;
-                Self::with_timeout(transport::https_query(
-                    addr,
-                    ns.server_name.as_deref(),
-                    query_bytes,
-                    &client,
-                ))
+                Self::with_timeout(
+                    STREAM_TIMEOUT,
+                    transport::https_query(addr, ns.server_name.as_deref(), query_bytes, &client),
+                )
                 .await
             }
         }
