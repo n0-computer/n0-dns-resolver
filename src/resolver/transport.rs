@@ -90,10 +90,15 @@ pub(super) async fn udp_query(
     };
     let bind_addr = SocketAddr::new(unspecified, 0);
     let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
+    let local = socket.local_addr().ok();
+    let start = n0_future::time::Instant::now();
+    tracing::trace!(%addr, ?local, "UDP socket bound, sending query");
     socket.send_to(query, addr).await?;
+    tracing::trace!(%addr, elapsed = ?start.elapsed(), "UDP query sent, awaiting response");
 
     let mut buf = vec![0u8; UDP_RECV_BUFFER];
     let (len, src) = socket.recv_from(&mut buf).await?;
+    tracing::trace!(%addr, len, elapsed = ?start.elapsed(), "UDP response received");
     if src != addr {
         return Err(e!(TransportError::UnexpectedSource {
             expected: addr,

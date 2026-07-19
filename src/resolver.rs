@@ -1041,13 +1041,86 @@ mod tests {
         assert!(!addrs.is_empty(), "{host} should have IPv4 addresses");
     }
 
+    /// Diagnostic aid (not a real test): probes raw DNS connectivity to the
+    /// public resolvers over UDP and TCP with a generous timeout, then panics so
+    /// nextest surfaces the captured report. It tells apart a blocked network (no
+    /// response at any timeout) from a merely slow one (a response that arrives
+    /// past the resolver's 2s [`NAMESERVER_TIMEOUT`] budget), which decides
+    /// whether raising the timeout would help. Remove before merging.
+    #[tokio::test]
+    async fn diagnose_dns_connectivity() {
+        use std::time::Duration;
+
+        use n0_future::time::{Instant, timeout};
+
+        const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
+        let (_, query) = super::query::build_query("google.com", simple_dns::TYPE::A).unwrap();
+
+        async fn probe_udp(target: SocketAddr, query: &[u8], budget: Duration) -> String {
+            let bind = SocketAddr::new(
+                if target.is_ipv6() {
+                    Ipv6Addr::UNSPECIFIED.into()
+                } else {
+                    Ipv4Addr::UNSPECIFIED.into()
+                },
+                0,
+            );
+            let socket = match tokio::net::UdpSocket::bind(bind).await {
+                Ok(s) => s,
+                Err(e) => return format!("bind failed: {e}"),
+            };
+            let local = socket.local_addr().ok();
+            let start = Instant::now();
+            if let Err(e) = socket.send_to(query, target).await {
+                return format!("send failed: {e}");
+            }
+            let mut buf = vec![0u8; 1232];
+            match timeout(budget, socket.recv_from(&mut buf)).await {
+                Ok(Ok((len, src))) => {
+                    format!(
+                        "OK, {len} bytes from {src} in {:?} (local {local:?})",
+                        start.elapsed()
+                    )
+                }
+                Ok(Err(e)) => format!("recv error after {:?}: {e}", start.elapsed()),
+                Err(_) => format!("NO RESPONSE within {budget:?} — blocked (local {local:?})"),
+            }
+        }
+
+        async fn probe_tcp(target: SocketAddr, budget: Duration) -> String {
+            let start = Instant::now();
+            match timeout(budget, tokio::net::TcpStream::connect(target)).await {
+                Ok(Ok(_)) => format!("connect OK in {:?}", start.elapsed()),
+                Ok(Err(e)) => format!("connect error after {:?}: {e}", start.elapsed()),
+                Err(_) => format!("connect NO RESPONSE within {budget:?} — blocked"),
+            }
+        }
+
+        let mut report = String::from("\n===== DNS connectivity diagnostic =====\n");
+        for target in [GOOGLE_DNS, CLOUDFLARE_DNS] {
+            report.push_str(&format!(
+                "UDP {target}: {}\n",
+                probe_udp(target, &query, PROBE_TIMEOUT).await
+            ));
+            report.push_str(&format!(
+                "TCP {target}: {}\n",
+                probe_tcp(target, PROBE_TIMEOUT).await
+            ));
+        }
+        report.push_str("=======================================\n");
+        // Always fails: this is how nextest surfaces the report above.
+        panic!("{report}");
+    }
+
     #[tokio::test]
     async fn resolve_ipv4_udp() {
+        let _ = tracing_subscriber::fmt::try_init();
         assert_resolves_ipv4(&with_proto(GOOGLE_DNS, DnsProtocol::Udp), "google.com").await;
     }
 
     #[tokio::test]
     async fn resolve_ipv6_udp() {
+        let _ = tracing_subscriber::fmt::try_init();
         let resolver = with_proto(GOOGLE_DNS, DnsProtocol::Udp);
         let addrs: Vec<_> = resolver
             .lookup_ipv6("google.com".to_string())
