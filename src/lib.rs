@@ -5,13 +5,24 @@
 //! common record kinds (see [`RecordKind`]) through
 //! [`DnsResolver::lookup_record`], follows CNAME chains, caches positive
 //! results, races nameservers happy-eyeballs style, and falls back to public
-//! resolvers. It
-//! speaks plain DNS over UDP and TCP, and (with a crypto provider enabled)
-//! DNS-over-TLS and DNS-over-HTTPS.
+//! resolvers. It speaks plain DNS over UDP and TCP, and, with the
+//! `transport-tls` and `transport-https` features, DNS-over-TLS and
+//! DNS-over-HTTPS.
 //!
 //! Construct a resolver with [`DnsResolver::new`] for cross-platform
 //! defaults, or with [`DnsResolver::builder`] to configure the nameservers
 //! and the fallback behavior. See [`Builder`] for the available settings.
+//!
+//! # Browser wasm
+//!
+//! On the `wasm32-unknown-unknown` target only DNS-over-HTTPS is available: the
+//! browser has no UDP/TCP sockets and no native TLS stack, so DoH goes through
+//! reqwest's fetch backend, where the browser performs DNS resolution and TLS.
+//! Build with `--no-default-features --features transport-https` (the default
+//! features pull in the native TLS stack, which does not compile on wasm), and
+//! set `RUSTFLAGS='--cfg getrandom_backend="wasm_js"'` when building the
+//! consuming binary. Configure DoH nameservers explicitly; a UDP or TCP
+//! nameserver returns an unsupported-transport error.
 //!
 //! [`simple-dns`]: https://docs.rs/simple-dns
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]

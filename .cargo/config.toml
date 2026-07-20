@@ -1,0 +1,6 @@
+# Run `cargo test --target wasm32-unknown-unknown` through the wasm-bindgen test
+# runner (install with `cargo install wasm-bindgen-cli`), and give getrandom its
+# browser backend so `rand` works on the wasm target.
+[target.wasm32-unknown-unknown]
+runner = "wasm-bindgen-test-runner"
+rustflags = ['--cfg', 'getrandom_backend="wasm_js"']
