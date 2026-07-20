@@ -13,7 +13,7 @@ pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
     Ok(config)
 }
 
-/// Parse resolv.conf content and extract nameserver addresses and search domains.
+/// Parses resolv.conf content and extracts nameserver addresses and search domains.
 ///
 /// Recognized directives:
 /// - `nameserver <ip>` -- adds a DNS nameserver
@@ -26,8 +26,8 @@ pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
 ///
 /// `options timeout:`, `options attempts:`, `options rotate`, and `sortlist`
 /// are deliberately ignored. iroh wraps every lookup in its own timeout and
-/// per-nameserver attempt budget, orders nameservers by measured RTT (which
-/// subsumes `rotate`), and selects addresses itself (which subsumes
+/// per-nameserver attempt budget, orders nameservers by measured round-trip
+/// time (which subsumes `rotate`), and selects addresses itself (which subsumes
 /// `sortlist`), so honoring these would have no observable effect.
 fn parse_resolv_conf(content: &str) -> DnsConfig {
     let mut servers = Vec::new();

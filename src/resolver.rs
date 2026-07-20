@@ -1087,7 +1087,17 @@ impl Default for DnsResolver {
 
 #[cfg(test)]
 mod tests {
-    use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
+    use std::{
+        net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        time::Duration,
+    };
+
+    use simple_dns::{
+        CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, ResourceRecord, TYPE,
+        rdata::{A, RData},
+    };
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tracing::info;
 
     use super::{CachedResult, DnsResolver, Hosts};
     use crate::{DnsProtocol, FallbackMode, Nameserver, Record, RecordKind};
@@ -1141,11 +1151,6 @@ mod tests {
     /// retry that carries no OPT record.
     #[tokio::test]
     async fn formerr_retries_without_edns() {
-        use simple_dns::{
-            CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, ResourceRecord, TYPE,
-            rdata::{A, RData},
-        };
-
         let expected = Ipv4Addr::new(198, 51, 100, 9);
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();
@@ -1200,12 +1205,6 @@ mod tests {
     /// UDP attempts time out.
     #[tokio::test]
     async fn udp_failure_falls_back_to_tcp() {
-        use simple_dns::{
-            CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, ResourceRecord, TYPE,
-            rdata::{A, RData},
-        };
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-
         let expected = Ipv4Addr::new(93, 184, 216, 34);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -1257,8 +1256,6 @@ mod tests {
     /// back to an expired positive cache entry instead of failing.
     #[tokio::test]
     async fn serve_stale_returns_expired_answer_on_failure() {
-        use std::time::Duration;
-
         let expected = Ipv4Addr::new(203, 0, 113, 7);
         // A nameserver on a closed port: the TCP connect is refused at once, so
         // live resolution fails fast and the stale fallback runs.
@@ -1351,7 +1348,7 @@ mod tests {
         let _ = tracing_subscriber::fmt::try_init();
         let resolver = with_proto(GOOGLE_DNS, DnsProtocol::Udp);
 
-        tracing::info!("--- resolving example.com (first, expect network query) ---");
+        info!("--- resolving example.com (first, expect network query) ---");
         let addrs: Vec<_> = resolver
             .lookup_ipv4("example.com".to_string())
             .await
@@ -1359,7 +1356,7 @@ mod tests {
             .collect();
         assert!(!addrs.is_empty());
 
-        tracing::info!("--- resolving example.com (second, expect cache hit) ---");
+        info!("--- resolving example.com (second, expect cache hit) ---");
         let addrs2: Vec<_> = resolver
             .lookup_ipv4("example.com".to_string())
             .await
@@ -1367,7 +1364,7 @@ mod tests {
             .collect();
         assert_eq!(addrs, addrs2);
 
-        tracing::info!("--- resolving nonexistent domain (expect NXDOMAIN) ---");
+        info!("--- resolving nonexistent domain (expect NXDOMAIN) ---");
         let err = resolver
             .lookup_ipv4("this-domain-does-not-exist.example.invalid".to_string())
             .await
@@ -1491,11 +1488,6 @@ mod tests {
         rcode: simple_dns::RCODE,
         answer: Option<Ipv4Addr>,
     ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        use simple_dns::{
-            CLASS, Packet, PacketFlag, ResourceRecord,
-            rdata::{A, RData},
-        };
-
         let socket = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = socket.local_addr().unwrap();
         let handle = tokio::spawn(async move {

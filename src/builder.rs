@@ -186,7 +186,7 @@ impl Builder {
         self
     }
 
-    /// Floors every cached positive TTL to at least `min_ttl`.
+    /// Floors every cached positive time-to-live (TTL) to at least `min_ttl`.
     ///
     /// Absorbs bursts of lookups for records with very low (or zero) TTLs by
     /// holding them for at least this long, at the cost of serving a slightly

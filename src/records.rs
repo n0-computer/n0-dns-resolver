@@ -215,8 +215,9 @@ impl SvcbRecordData {
             .unwrap_or_default()
     }
 
-    /// Whether the `no-default-alpn` parameter is set, meaning the default ALPN
-    /// for the scheme must not be assumed and only [`Self::alpn`] applies.
+    /// Whether the `no-default-alpn` parameter is set, meaning the default
+    /// Application-Layer Protocol Negotiation (ALPN) protocol for the scheme
+    /// must not be assumed and only [`Self::alpn`] applies.
     pub fn no_default_alpn(&self) -> bool {
         self.0
             .iter_params()

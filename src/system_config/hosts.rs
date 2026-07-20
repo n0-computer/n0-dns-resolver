@@ -44,8 +44,8 @@ impl Hosts {
     /// skipped.
     fn parse(content: &str) -> Self {
         let mut by_name: HashMap<String, Entry> = HashMap::new();
-        // An editor may save the hosts file with a UTF-8 byte order mark, which
-        // would otherwise fuse onto the first address token and make it
+        // An editor may save the hosts file with a UTF-8 byte order mark (BOM),
+        // which would otherwise fuse onto the first address token and make it
         // unparsable, dropping the first entry.
         let content = content.strip_prefix('\u{feff}').unwrap_or(content);
         for line in content.lines() {

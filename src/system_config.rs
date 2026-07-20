@@ -1,10 +1,10 @@
 //! Reading the host system's DNS configuration.
 //!
-//! Reading the system DNS configuration is platform-specific: `/etc/resolv.conf`
-//! on Unix, the SystemConfiguration framework on Apple platforms, the network
-//! adapters on Windows, and a JNI call on Android. The per-platform readers live
-//! in the submodules; this module dispatches to them via [`read_system`]. The
-//! [`DnsConfig`] they produce lives in [`crate::config`].
+//! The source is platform-specific: `/etc/resolv.conf` on Unix, the
+//! SystemConfiguration framework on Apple platforms, the network adapters on
+//! Windows, and a Java Native Interface (JNI) call on Android. The per-platform
+//! readers live in the submodules; this module dispatches to them via
+//! [`read_system`]. The [`DnsConfig`] they produce lives in [`crate::config`].
 
 use tracing::warn;
 

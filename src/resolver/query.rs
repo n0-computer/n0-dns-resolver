@@ -94,16 +94,16 @@ pub(super) fn build_query(host: &str, qtype: TYPE) -> Result<(u16, Vec<u8>), Que
 /// Returns the RCODE if `data` is a failure that warrants trying another
 /// nameserver (SERVFAIL, REFUSED, or FORMERR), otherwise `None`.
 ///
-/// SERVFAIL and REFUSED mean this server cannot answer for the name; FORMERR
-/// means it rejected the query itself (often the EDNS OPT record — the caller
-/// retries without EDNS before this, see [`strip_edns`]). In every case another
-/// nameserver may still resolve the name, so the race should move on rather than
-/// treat the response as final.
+/// SERVFAIL and REFUSED mean the server cannot answer for the name. A FORMERR
+/// means it rejected the query itself, usually the EDNS(0) OPT record; the
+/// caller retries that server without EDNS (see [`strip_edns`]) before reaching
+/// here, so a surviving FORMERR likewise means another nameserver should be
+/// tried.
 ///
-/// Reads just the RCODE from the header so it works on the raw response before
-/// the packet is fully parsed or validated. A spoofed RCODE here is harmless:
-/// at worst it makes the race try another server, and the eventual response is
-/// still validated by [`check_response`].
+/// Reads only the header RCODE, so it works on the raw response before the
+/// packet is parsed or validated. A spoofed RCODE is harmless: at worst it makes
+/// the race try another server, and the eventual response is still checked by
+/// [`check_response`].
 pub(super) fn retryable_failure_rcode(data: &[u8]) -> Option<RCODE> {
     // `header_buffer::rcode` indexes `data[2..4]` without a bounds check, so a
     // response shorter than a DNS header would panic. This runs on raw,

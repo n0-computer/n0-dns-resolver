@@ -1,4 +1,4 @@
-//! Smoothed round-trip-time tracking used to order nameservers fastest-first.
+//! Smoothed round-trip time (RTT) tracking used to order nameservers fastest-first.
 
 use std::sync::Mutex;
 

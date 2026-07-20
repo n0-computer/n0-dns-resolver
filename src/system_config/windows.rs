@@ -21,8 +21,7 @@ const WINDOWS_BAD_SITE_LOCAL_DNS_SERVERS: [IpAddr; 3] = [
 /// Reads the DNS servers from the Windows network adapter configuration, plus
 /// the hosts file.
 pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
-    let adapters =
-        ipconfig::get_adapters().map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+    let adapters = ipconfig::get_adapters().map_err(std::io::Error::other)?;
 
     let mut servers = Vec::new();
     for adapter in adapters {

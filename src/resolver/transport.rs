@@ -59,7 +59,7 @@ pub enum TransportError {
 }
 
 // TCP and DoT connections are pooled (see the `pool` module) and reused across
-// queries, so a DNS-over-TLS handshake is paid once and amortized over repeated
+// queries, so a DoT handshake is paid once and amortized over repeated
 // lookups to the same nameserver.
 //
 // UDP sockets are intentionally not reused (a new random source port per query
@@ -230,8 +230,6 @@ pub(super) async fn https_query(
     query: &[u8],
     client: &reqwest::Client,
 ) -> Result<Vec<u8>, TransportError> {
-    // With a server name, address the URL by hostname (the client pins it to
-    // `addr`); otherwise address it by IP.
     let url = match server_name {
         Some(name) => format!("https://{name}:{}/dns-query", addr.port()),
         None => format!("https://{addr}/dns-query"),
@@ -300,7 +298,7 @@ mod tests {
         packet.build_bytes_vec().unwrap()
     }
 
-    /// Spawn a mock UDP server that echoes back an A response for any query.
+    /// Spawns a mock UDP server that echoes back an A response for any query.
     async fn mock_udp_server(addrs: &[Ipv4Addr]) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let server_addr = server.local_addr().unwrap();
@@ -317,7 +315,7 @@ mod tests {
         (server_addr, handle)
     }
 
-    /// Spawn a mock TCP server that echoes back an A response for any query.
+    /// Spawns a mock TCP server that echoes back an A response for any query.
     async fn mock_tcp_server(addrs: &[Ipv4Addr]) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let server_addr = listener.local_addr().unwrap();

@@ -1,17 +1,16 @@
 //! A small async DNS stub resolver built on [`simple-dns`] and tokio.
 //!
-//! The main export is [`DnsResolver`], a stub resolver that reads the
-//! system DNS configuration (or an explicit nameserver list), resolves the
-//! common record kinds (see [`RecordKind`]) through
-//! [`DnsResolver::lookup_record`], follows CNAME chains, caches positive
-//! results, races nameservers happy-eyeballs style, and falls back to public
-//! resolvers. It
-//! speaks plain DNS over UDP and TCP, and (with a crypto provider enabled)
-//! DNS-over-TLS and DNS-over-HTTPS.
+//! The main export is [`DnsResolver`]. It reads the system DNS configuration
+//! (or an explicit nameserver list) and resolves the common record kinds (see
+//! [`RecordKind`]) through [`DnsResolver::lookup_record`]. Lookups follow CNAME
+//! chains, cache their results, and race the configured nameservers
+//! happy-eyeballs style, falling back to public resolvers when the primary ones
+//! cannot answer. The resolver speaks plain DNS over UDP and TCP, and, with a
+//! crypto provider enabled, DNS-over-TLS (DoT) and DNS-over-HTTPS (DoH).
 //!
-//! Construct a resolver with [`DnsResolver::new`] for cross-platform
-//! defaults, or with [`DnsResolver::builder`] to configure the nameservers
-//! and the fallback behavior. See [`Builder`] for the available settings.
+//! Construct a resolver with [`DnsResolver::new`] for cross-platform defaults,
+//! or with [`DnsResolver::builder`] to configure the nameservers and fallback
+//! behavior. See [`Builder`] for the available settings.
 //!
 //! [`simple-dns`]: https://docs.rs/simple-dns
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]

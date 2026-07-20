@@ -9,15 +9,15 @@ use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
 use crate::{DnsProtocol, Nameserver, system_config::Hosts};
 
-/// Standard DNS port (Do53). DoH fallbacks use the HTTPS port instead.
+/// Standard DNS port (Do53). DNS-over-HTTPS (DoH) fallbacks use the HTTPS port instead.
 pub(crate) const DNS_PORT: u16 = 53;
-/// HTTPS port, used for the DNS-over-HTTPS fallback nameservers.
+/// HTTPS port, used for the DoH fallback nameservers.
 #[cfg(transport_https)]
 const HTTPS_PORT: u16 = 443;
 
 // Public DNS providers used for the last-resort fallback.
 //
-// The DNS-over-HTTPS entries below are addressed by IP (see
+// The DoH entries below are addressed by IP (see
 // transport::https_query). This works because Cloudflare, Google and Quad9 all
 // list their anycast IPs (including every IP used here) as iPAddress SANs in
 // their DoH certificates, so IP-addressed DoH validates without a hostname.
@@ -58,7 +58,7 @@ pub(crate) struct DnsConfig {
 }
 
 impl DnsConfig {
-    /// The public-resolver fallback configuration (Cloudflare, Google, Quad9).
+    /// Returns the public-resolver fallback configuration (Cloudflare, Google, Quad9).
     pub(crate) fn fallback() -> Self {
         Self::from_nameservers(fallback_nameservers())
     }
@@ -75,19 +75,20 @@ impl DnsConfig {
     }
 }
 
-/// Public resolvers used as a last resort when no nameservers are configured.
+/// Returns the public resolvers used as a last resort when no nameservers are
+/// configured.
 ///
 /// Spans multiple providers (Cloudflare, Google, Quad9) and transports so that
 /// resolution still works when one provider is down or plain DNS is blocked.
 ///
 /// The order matters: the resolver races the first few entries together (see
-/// `MAX_CONCURRENT_QUERIES`), so the DNS-over-HTTPS entries sit within that
-/// first wave rather than behind every UDP server. On a network that filters
-/// port 53 the UDP entries hang and DoH gets raced right away instead of
-/// waiting out a dozen UDP timeouts; on a working network the UDP entries
-/// answer first, before the staggered DoH attempts are even started. The
-/// resolver also tracks per-server RTT, so the servers that work on the current
-/// network float to the front over time.
+/// `MAX_CONCURRENT_QUERIES`), so the DoH entries sit within that first wave
+/// rather than behind every UDP server. On a network that filters port 53 the
+/// UDP entries hang and DoH gets raced right away instead of waiting out a dozen
+/// UDP timeouts; on a working network the UDP entries answer first, before the
+/// staggered DoH attempts are even started. The resolver also tracks per-server
+/// round-trip time, so the servers that work on the current network float to the
+/// front over time.
 fn fallback_nameservers() -> Vec<Nameserver> {
     let udp = |ip: IpAddr| Nameserver::new(SocketAddr::new(ip, DNS_PORT), DnsProtocol::Udp);
     let mut servers = vec![

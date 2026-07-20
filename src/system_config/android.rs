@@ -1,18 +1,18 @@
 //! Android system DNS reader.
 //!
 //! Android does not use `/etc/resolv.conf`. Instead the active network's DNS
-//! servers are read from `LinkProperties.getDnsServers()` over JNI, going
-//! through [`ndk_context`]. This requires [`ndk_context`] to be initialized
-//! before any [`DnsResolver`] is constructed, either by ndk-glue or
-//! android-activity (both do this before `main`) or by an explicit
+//! servers are read from `LinkProperties.getDnsServers()` over the Java Native
+//! Interface (JNI), going through [`ndk_context`]. This requires [`ndk_context`]
+//! to be initialized before any [`DnsResolver`] is constructed, either by
+//! ndk-glue or android-activity (both do this before `main`) or by an explicit
 //! [`install_android_jni_context`] call.
 //!
 //! Without an initialized [`ndk_context`] the JNI lookup panics. Debug builds
 //! wrap the call in `std::panic::catch_unwind` so unit tests on Android (where
-//! no JVM is in scope) fall back to the resolver's default servers instead of
-//! aborting the test binary. Release builds let the panic propagate;
-//! uninitialized [`ndk_context`] in production is a programming error and
-//! should surface loudly.
+//! no Java Virtual Machine (JVM) is in scope) fall back to the resolver's
+//! default servers instead of aborting the test binary. Release builds let the
+//! panic propagate; uninitialized [`ndk_context`] in production is a programming
+//! error and should surface loudly.
 //!
 //! The JNI implementation is adapted from `hickory_resolver`.
 //!
@@ -162,8 +162,8 @@ fn read_system_dns_jni() -> Result<DnsConfig, std::io::Error> {
 /// If you don't use a glue crate, a typical way to initialize the context is
 /// via `JNI_OnLoad`:
 ///
-/// *Note: `install_android_jni_context` is reexported from `iroh`, so you can substitute
-/// `iroh_dns` for `iroh` below.*
+/// `install_android_jni_context` is reexported from `iroh`, so you can substitute
+/// `iroh_dns` for `iroh` in the example below.
 ///
 /// ```ignore
 /// #[cfg(target_os = "android")]
