@@ -12,7 +12,7 @@ use n0_future::time::Instant;
 use crate::{Record, RecordKind};
 
 /// Maximum number of entries in the DNS cache.
-const MAX_CACHE_ENTRIES: usize = 512;
+const MAX_CACHE_ENTRIES: usize = 4096;
 
 /// Maximum TTL for cache entries (1 day).
 ///
@@ -20,14 +20,23 @@ const MAX_CACHE_ENTRIES: usize = 512;
 /// effectively permanent by returning very large TTL values.
 const MAX_TTL_SECS: u32 = 86400;
 
-/// How long a negative result (NODATA or NXDOMAIN) is cached.
+/// Fallback negative-caching TTL when a negative response carries no SOA.
 ///
-/// Kept short so a thundering herd of concurrent lookups for the same absent
-/// name collapses to one network query, while a name that becomes resolvable
-/// (for example an endpoint that just published its records) is still picked up
-/// promptly. A longer, SOA-derived negative TTL (RFC 2308) would need parsing
-/// the authority section, which we do not do.
+/// Negative results (NODATA, NXDOMAIN) are normally cached for the RFC 2308
+/// SOA-derived TTL (see [`super::query::negative_ttl`]), capped by
+/// [`NEGATIVE_TTL_MAX_SECS`]. When the authority section has no SOA to derive
+/// from, this short fixed value is used instead: long enough to collapse a
+/// thundering herd of concurrent lookups for the same absent name onto one
+/// query, short enough that a name which becomes resolvable is picked up
+/// promptly.
 pub(super) const NEGATIVE_TTL_SECS: u32 = 30;
+
+/// Upper bound on the SOA-derived negative-caching TTL (1 hour).
+///
+/// Caps how long an absence is trusted so a name that starts resolving is not
+/// pinned as absent for the zone's full (possibly long) SOA lifetime. Matches
+/// the negative-TTL cap used by unbound.
+pub(super) const NEGATIVE_TTL_MAX_SECS: u32 = 3600;
 
 /// A cached lookup outcome: records, or an authenticated absence.
 #[derive(Debug, Clone)]
@@ -57,8 +66,8 @@ fn normalize(host: &str) -> String {
 /// for the wrong entry. The kind is part of the key, so a collision can only be
 /// between two distinct host+kind pairs; [`DnsCache::get`] rechecks both against
 /// the stored entry and treats a mismatch as a miss. With 64-bit hashes and a
-/// 512-entry cache, the birthday-bound probability is ~1.4e-14 per lookup,
-/// negligible in practice.
+/// few-thousand-entry cache, the birthday-bound probability is ~1e-13 per
+/// lookup, negligible in practice.
 ///
 /// `host` is expected to already be [`normalize`]d so that names differing only
 /// in case or a trailing dot hash to the same key.
@@ -117,6 +126,10 @@ impl DnsCache {
     }
 
     /// Looks up a cached result, returning `None` if it is absent or expired.
+    ///
+    /// An expired entry is left in place rather than evicted, so [`Self::get_stale`]
+    /// can still serve it as a last resort; it is overwritten on the next
+    /// successful insert or evicted by LRU pressure.
     pub(super) fn get(&self, host: &str, kind: RecordKind) -> Option<CachedResult> {
         let host = normalize(host);
         let key = cache_key(&host, kind);
@@ -127,10 +140,39 @@ impl DnsCache {
             return None;
         }
         if entry.is_expired() {
-            inner.pop(&key);
             return None;
         }
         Some(entry.result.clone())
+    }
+
+    /// Looks up an expired positive entry for serve-stale (RFC 8767).
+    ///
+    /// Returns the records of an entry that has expired but is still within
+    /// `max_stale` of its expiry, so the resolver can answer from stale data
+    /// when live resolution fails. Only positive results are served stale;
+    /// a stale absence is not useful and is never returned.
+    pub(super) fn get_stale(
+        &self,
+        host: &str,
+        kind: RecordKind,
+        max_stale: Duration,
+    ) -> Option<Vec<Record>> {
+        let host = normalize(host);
+        let key = cache_key(&host, kind);
+        let mut inner = self.inner.lock().expect("poisoned");
+        let entry = inner.get(&key)?;
+        if entry.host != host || entry.kind != kind {
+            return None;
+        }
+        // Only expired entries within the stale window, and only positive ones.
+        let age = entry.inserted_at.elapsed();
+        if age <= entry.ttl || age > entry.ttl + max_stale {
+            return None;
+        }
+        match &entry.result {
+            CachedResult::Positive(records) => Some(records.clone()),
+            CachedResult::NoData | CachedResult::NxDomain => None,
+        }
     }
 
     /// Inserts a result into the cache under the given TTL.
@@ -160,6 +202,31 @@ impl DnsCache {
     /// Clears all cache entries.
     pub(super) fn clear(&self) {
         self.inner.lock().expect("poisoned").clear();
+    }
+
+    /// Inserts an entry that expired `expired_ago` ago (stored with `ttl`,
+    /// inserted `ttl + expired_ago` in the past), for serve-stale tests.
+    #[cfg(test)]
+    pub(super) fn insert_expired(
+        &self,
+        host: &str,
+        kind: RecordKind,
+        result: CachedResult,
+        ttl: Duration,
+        expired_ago: Duration,
+    ) {
+        let host = normalize(host);
+        let entry = CacheEntry {
+            host: host.clone(),
+            kind,
+            result,
+            inserted_at: Instant::now() - (ttl + expired_ago),
+            ttl,
+        };
+        self.inner
+            .lock()
+            .expect("poisoned")
+            .put(cache_key(&host, kind), entry);
     }
 
     /// Returns the stored TTL for `host`/`kind`, for tests that assert clamping.
@@ -229,6 +296,60 @@ mod tests {
         let cache = DnsCache::new();
         cache.insert("example.com", RecordKind::A, positive(), 300);
         assert_single_a(cache.get("Example.COM.", RecordKind::A), ADDR);
+    }
+
+    #[test]
+    fn get_stale_serves_expired_positive_within_window() {
+        let cache = DnsCache::new();
+        // Expired 5s ago.
+        cache.insert_expired(
+            "stale.example",
+            RecordKind::A,
+            positive(),
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        // A fresh get misses, since the entry is expired.
+        assert!(cache.get("stale.example", RecordKind::A).is_none());
+        // A stale get within a 60s window serves it.
+        match cache.get_stale("stale.example", RecordKind::A, Duration::from_secs(60)) {
+            Some(records) => match records.as_slice() {
+                [Record::A(ip)] => assert_eq!(*ip, ADDR),
+                other => panic!("expected one A record, got {other:?}"),
+            },
+            None => panic!("expected a stale positive result"),
+        }
+        // Outside the stale window (only 2s allowed, expired 5s ago): none.
+        assert!(
+            cache
+                .get_stale("stale.example", RecordKind::A, Duration::from_secs(2))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn get_stale_ignores_fresh_and_negative_entries() {
+        let cache = DnsCache::new();
+        // A fresh (non-expired) entry is not served stale.
+        cache.insert("fresh.example", RecordKind::A, positive(), 300);
+        assert!(
+            cache
+                .get_stale("fresh.example", RecordKind::A, Duration::from_secs(60))
+                .is_none()
+        );
+        // A stale negative entry is never served.
+        cache.insert_expired(
+            "nx.example",
+            RecordKind::A,
+            CachedResult::NxDomain,
+            Duration::from_secs(10),
+            Duration::from_secs(5),
+        );
+        assert!(
+            cache
+                .get_stale("nx.example", RecordKind::A, Duration::from_secs(60))
+                .is_none()
+        );
     }
 
     #[test]

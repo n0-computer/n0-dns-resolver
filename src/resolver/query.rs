@@ -91,14 +91,20 @@ pub(super) fn build_query(host: &str, qtype: TYPE) -> Result<(u16, Vec<u8>), Que
     Ok((id, bytes))
 }
 
-/// Returns the RCODE if `data` is a server failure that warrants trying another
-/// nameserver (SERVFAIL or REFUSED), otherwise `None`.
+/// Returns the RCODE if `data` is a failure that warrants trying another
+/// nameserver (SERVFAIL, REFUSED, or FORMERR), otherwise `None`.
+///
+/// SERVFAIL and REFUSED mean this server cannot answer for the name; FORMERR
+/// means it rejected the query itself (often the EDNS OPT record — the caller
+/// retries without EDNS before this, see [`strip_edns`]). In every case another
+/// nameserver may still resolve the name, so the race should move on rather than
+/// treat the response as final.
 ///
 /// Reads just the RCODE from the header so it works on the raw response before
 /// the packet is fully parsed or validated. A spoofed RCODE here is harmless:
 /// at worst it makes the race try another server, and the eventual response is
 /// still validated by [`check_response`].
-pub(super) fn server_failure_rcode(data: &[u8]) -> Option<RCODE> {
+pub(super) fn retryable_failure_rcode(data: &[u8]) -> Option<RCODE> {
     // `header_buffer::rcode` indexes `data[2..4]` without a bounds check, so a
     // response shorter than a DNS header would panic. This runs on raw,
     // unvalidated bytes before `check_response`, so guard the length here.
@@ -106,9 +112,45 @@ pub(super) fn server_failure_rcode(data: &[u8]) -> Option<RCODE> {
         return None;
     }
     match header_buffer::rcode(data) {
-        Ok(rcode @ (RCODE::ServerFailure | RCODE::Refused)) => Some(rcode),
+        Ok(rcode @ (RCODE::ServerFailure | RCODE::Refused | RCODE::FormatError)) => Some(rcode),
         _ => None,
     }
+}
+
+/// Returns whether `data` is a response with a FORMERR (format error) RCODE.
+///
+/// A FORMERR from a server or middlebox often means it could not parse our
+/// query, commonly because of the EDNS(0) OPT record; the caller retries the
+/// same server without EDNS (see [`strip_edns`]) before moving on. Reads only
+/// the header RCODE, so it runs on raw bytes before full validation.
+pub(super) fn is_format_error(data: &[u8]) -> bool {
+    data.len() >= DNS_HEADER_LEN && matches!(header_buffer::rcode(data), Ok(RCODE::FormatError))
+}
+
+/// Rebuilds `query` without its EDNS(0) OPT record, or `None` if it has none.
+///
+/// RFC 6891 Section 6.2.2 calls for retrying without EDNS when a server rejects
+/// the OPT record. The transaction ID, flags, and question are preserved so the
+/// response to the stripped query still passes [`check_response`].
+pub(super) fn strip_edns(query: &[u8]) -> Option<Vec<u8>> {
+    let mut packet = Packet::parse(query).ok()?;
+    packet.opt()?;
+    *packet.opt_mut() = None;
+    packet.build_bytes_vec().ok()
+}
+
+/// Derives the RFC 2308 negative-caching TTL from a response's authority SOA.
+///
+/// On a NODATA or NXDOMAIN answer an authoritative server includes an SOA record
+/// in the authority section; the negative result should be cached for no longer
+/// than `min(SOA MINIMUM, SOA record TTL)`. Returns `None` when no SOA is
+/// present, so the caller can fall back to a fixed default.
+pub(super) fn negative_ttl(data: &[u8]) -> Option<u32> {
+    let packet = Packet::parse(data).ok()?;
+    packet.name_servers.iter().find_map(|rr| match &rr.rdata {
+        RData::SOA(soa) => Some(rr.ttl.min(soa.minimum)),
+        _ => None,
+    })
 }
 
 /// Maximum CNAME chain depth to prevent infinite loops.
@@ -475,6 +517,76 @@ mod tests {
     }
 
     #[test]
+    fn strip_edns_removes_opt_and_preserves_question() {
+        let (id, bytes) = build_query("example.com", TYPE::A).unwrap();
+        assert!(Packet::parse(&bytes).unwrap().opt().is_some());
+
+        let stripped = strip_edns(&bytes).expect("query has EDNS to strip");
+        let packet = Packet::parse(&stripped).unwrap();
+        assert!(packet.opt().is_none(), "OPT should be removed");
+        assert_eq!(packet.id(), id, "transaction ID preserved");
+        let question = &packet.questions[0];
+        assert_eq!(question.qname, Name::new_unchecked("example.com"));
+        assert_eq!(question.qtype, QTYPE::TYPE(TYPE::A));
+
+        // A query already without EDNS yields None.
+        assert!(strip_edns(&stripped).is_none());
+    }
+
+    #[test]
+    fn formerr_is_detected_and_retryable() {
+        let (id, _) = make_query("example.com");
+        let mut resp = a_response(id, "example.com", &[Ipv4Addr::new(1, 2, 3, 4)]);
+        // A NoError response is neither a FORMERR nor otherwise retryable.
+        assert!(!is_format_error(&resp));
+        assert_eq!(retryable_failure_rcode(&resp), None);
+
+        // The RCODE is the low nibble of header byte 3. FORMERR = 1.
+        resp[3] = (resp[3] & 0xF0) | 0x01;
+        assert!(is_format_error(&resp));
+        assert_eq!(retryable_failure_rcode(&resp), Some(RCODE::FormatError));
+
+        // SERVFAIL (2) and REFUSED (5) are retryable but not FORMERR.
+        resp[3] = (resp[3] & 0xF0) | 0x02;
+        assert!(!is_format_error(&resp));
+        assert_eq!(retryable_failure_rcode(&resp), Some(RCODE::ServerFailure));
+    }
+
+    #[test]
+    fn negative_ttl_is_min_of_soa_ttl_and_minimum() {
+        let (id, _) = make_query("nx.example.com");
+        let mut packet = Packet::new_reply(id);
+        packet.set_flags(PacketFlag::RESPONSE);
+        packet.questions.push(Question::new(
+            Name::new_unchecked("nx.example.com"),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        packet.name_servers.push(ResourceRecord::new(
+            Name::new_unchecked("example.com"),
+            CLASS::IN,
+            900,
+            RData::SOA(simple_dns::rdata::SOA {
+                mname: Name::new_unchecked("ns.example.com"),
+                rname: Name::new_unchecked("hostmaster.example.com"),
+                serial: 1,
+                refresh: 3600,
+                retry: 600,
+                expire: 604800,
+                minimum: 300,
+            }),
+        ));
+        let bytes = packet.build_bytes_vec().unwrap();
+        // min(record TTL 900, SOA minimum 300) = 300.
+        assert_eq!(negative_ttl(&bytes), Some(300));
+
+        // A response with no SOA in the authority section yields None.
+        let plain = a_response(id, "example.com", &[Ipv4Addr::new(1, 2, 3, 4)]);
+        assert_eq!(negative_ttl(&plain), None);
+    }
+
+    #[test]
     fn parse_a_no_cname() {
         let (id, _) = make_query("example.com");
         let resp = a_response(id, "example.com", &[Ipv4Addr::new(1, 2, 3, 4)]);
@@ -790,7 +902,8 @@ mod tests {
     #[test]
     fn header_helpers_do_not_panic_on_short_input() {
         for data in [&[][..], &[0][..], &[0, 0][..], &[0, 0, 0][..]] {
-            assert_eq!(server_failure_rcode(data), None);
+            assert_eq!(retryable_failure_rcode(data), None);
+            assert!(!is_format_error(data));
             assert!(!is_truncated(data));
         }
     }

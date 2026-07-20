@@ -1,6 +1,6 @@
 //! The [`Builder`] for configuring a [`DnsResolver`].
 
-use std::net::SocketAddr;
+use std::{net::SocketAddr, time::Duration};
 
 use crate::DnsResolver;
 
@@ -36,6 +36,13 @@ pub struct Builder {
     pub(crate) nameservers: Vec<Nameserver>,
     pub(crate) fallback: FallbackMode,
     pub(crate) fallback_nameservers: Option<Vec<Nameserver>>,
+    /// When set, serve an expired cached answer within this window if live
+    /// resolution fails (serve-stale, RFC 8767). `None` disables it.
+    pub(crate) serve_stale: Option<Duration>,
+    /// When set, floor every cached positive TTL to at least this long, so a
+    /// burst of very-low-TTL answers does not re-query on every lookup. `None`
+    /// keeps the server-supplied TTL.
+    pub(crate) cache_min_ttl: Option<Duration>,
     #[cfg(with_rustls)]
     pub(crate) tls_client_config: Option<rustls::ClientConfig>,
 }
@@ -47,6 +54,8 @@ impl Default for Builder {
             nameservers: Vec::new(),
             fallback: FallbackMode::default(),
             fallback_nameservers: None,
+            serve_stale: None,
+            cache_min_ttl: None,
             #[cfg(with_rustls)]
             tls_client_config: None,
         }
@@ -160,6 +169,32 @@ impl Builder {
     #[must_use]
     pub fn tls_client_config(mut self, config: rustls::ClientConfig) -> Self {
         self.tls_client_config = Some(config);
+        self
+    }
+
+    /// Serves an expired cached answer when live resolution fails (serve-stale,
+    /// RFC 8767).
+    ///
+    /// When every nameserver fails or times out, a positive answer that expired
+    /// no more than `max_age` ago is returned instead of an error, so a brief
+    /// upstream outage does not break resolution. Only positive answers are
+    /// served stale; an authoritative NXDOMAIN is never overridden. Off by
+    /// default.
+    #[must_use]
+    pub fn serve_stale(mut self, max_age: Duration) -> Self {
+        self.serve_stale = Some(max_age);
+        self
+    }
+
+    /// Floors every cached positive TTL to at least `min_ttl`.
+    ///
+    /// Absorbs bursts of lookups for records with very low (or zero) TTLs by
+    /// holding them for at least this long, at the cost of serving a slightly
+    /// staler answer. Off by default, since it trades freshness for fewer
+    /// queries; leave it unset for records that change frequently.
+    #[must_use]
+    pub fn cache_min_ttl(mut self, min_ttl: Duration) -> Self {
+        self.cache_min_ttl = Some(min_ttl);
         self
     }
 
