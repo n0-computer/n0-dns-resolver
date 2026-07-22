@@ -12,6 +12,8 @@
 //! nameserver, so they exercise the full lookup path (search-list expansion,
 //! CNAME following, parsing, and caching) rather than an internal function.
 
+#[cfg(feature = "dnssec")]
+mod dnssec;
 mod resolver;
 
 use std::{

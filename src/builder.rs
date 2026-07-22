@@ -45,6 +45,8 @@ pub struct Builder {
     pub(crate) cache_min_ttl: Option<Duration>,
     #[cfg(with_rustls)]
     pub(crate) tls_client_config: Option<rustls::ClientConfig>,
+    #[cfg(feature = "dnssec")]
+    pub(crate) validate_dnssec: bool,
 }
 
 impl Default for Builder {
@@ -58,6 +60,8 @@ impl Default for Builder {
             cache_min_ttl: None,
             #[cfg(with_rustls)]
             tls_client_config: None,
+            #[cfg(feature = "dnssec")]
+            validate_dnssec: false,
         }
     }
 }
@@ -195,6 +199,36 @@ impl Builder {
     #[must_use]
     pub fn cache_min_ttl(mut self, min_ttl: Duration) -> Self {
         self.cache_min_ttl = Some(min_ttl);
+        self
+    }
+
+    /// Validates every answer against the DNSSEC chain of trust before returning it.
+    ///
+    /// With this set, the resolver requests DNSSEC records (it sets the EDNS DO
+    /// bit), and before returning an answer it fetches the signing zone's DNSKEY
+    /// RRset and the DS chain up to the embedded root anchors, then walks that
+    /// chain. The lookup fails with the `Dnssec` error variant when the chain
+    /// does not validate.
+    ///
+    /// Validation is fail-closed. A wildcard-expanded answer validates only when
+    /// the response also proves, with an NSEC or NSEC3 record, that no closer
+    /// non-wildcard match exists. A delegation that publishes no DS is accepted as
+    /// Insecure (its zone is unsigned) when the response proves the DS is truly
+    /// absent; otherwise it stays Bogus. A NODATA answer (the name exists but has
+    /// no record of the queried type) is authenticated against the signing zone's
+    /// NSEC or NSEC3 and accepted only when the denial is proven. NXDOMAIN is
+    /// surfaced as the `NxDomain` error before validation runs, so it is not
+    /// authenticated. Enable this for names you expect to be signed.
+    ///
+    /// Only the final answer RRset is validated; intermediate CNAME hops in a
+    /// chain are followed but not individually validated.
+    #[cfg(any(feature = "dnssec", doc))]
+    #[must_use]
+    pub fn validate_dnssec(mut self) -> Self {
+        #[cfg(feature = "dnssec")]
+        {
+            self.validate_dnssec = true;
+        }
         self
     }
 
