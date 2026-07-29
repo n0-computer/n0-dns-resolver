@@ -4,13 +4,16 @@ use std::fmt;
 
 use n0_error::stack_error;
 
+#[cfg(feature = "dnssec")]
+use crate::dnssec::DnssecError;
 use crate::resolver::TransportError;
 
 /// An error returned while resolving a DNS record.
 ///
 /// Each variant is a distinct, matchable failure reason. A transport-level
 /// failure carries a typed [`TransportError`] source you can match on for the
-/// specific cause, rather than an opaque error.
+/// specific cause, rather than an opaque error. With the `dnssec` feature, a
+/// validation failure likewise carries a typed source.
 #[stack_error(derive, add_meta, std_sources)]
 #[non_exhaustive]
 pub enum Error {
@@ -50,6 +53,19 @@ pub enum Error {
     Transport {
         /// The specific transport failure.
         source: TransportError,
+    },
+    /// DNSSEC validation rejected the answer (fail-closed).
+    ///
+    /// Only returned when the resolver was built with
+    /// [`crate::Builder::validate_dnssec`]. The [`DnssecError`] source names the
+    /// specific reason the answer could not be proven secure. An authenticated
+    /// NODATA is accepted; NXDOMAIN is surfaced as [`Error::NxDomain`] before
+    /// validation runs.
+    #[cfg(feature = "dnssec")]
+    #[error("DNSSEC validation failed")]
+    Dnssec {
+        /// The specific reason validation failed.
+        source: DnssecError,
     },
 }
 

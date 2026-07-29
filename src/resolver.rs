@@ -27,6 +27,8 @@ use crate::{
 };
 
 mod cache;
+#[cfg(feature = "dnssec")]
+mod dnssec_validate;
 mod pool;
 mod query;
 mod rtt_map;
@@ -142,6 +144,15 @@ pub struct DnsResolver {
     /// Pooled TCP/DoT connections, reused across queries.
     conn_pool: ConnPool,
     cache: DnsCache,
+    /// When set, every answer is validated against the DNSSEC chain of trust
+    /// before it is returned. See [`Builder::validate_dnssec`].
+    #[cfg(feature = "dnssec")]
+    validate_dnssec: bool,
+    /// Caches validated per-zone trust results so repeated validations and
+    /// shared ancestors do not re-fetch the whole chain. See
+    /// [`Self::trusted_keys_for_zone`].
+    #[cfg(feature = "dnssec")]
+    dnssec_cache: dnssec_validate::DnssecCache,
     /// The settings this resolver was built from, kept so [`Self::reset`] can
     /// rebuild against a changed network, and used to compute `state`.
     builder: Builder,
@@ -278,6 +289,10 @@ impl DnsResolver {
             https_client: Mutex::new(None),
             conn_pool: ConnPool::new(),
             cache,
+            #[cfg(feature = "dnssec")]
+            validate_dnssec: builder.validate_dnssec,
+            #[cfg(feature = "dnssec")]
+            dnssec_cache: dnssec_validate::DnssecCache::new(),
             builder,
             state: OnceLock::new(),
         }
@@ -664,7 +679,14 @@ impl DnsResolver {
                     name: current_host.clone()
                 })
             })?;
-            let (id, query_bytes) = query::build_query(&current_host, qtype)?;
+            #[cfg_attr(not(feature = "dnssec"), allow(unused_mut))]
+            let (id, mut query_bytes) = query::build_query(&current_host, qtype)?;
+            // With validation on, request the RRSIG records by setting the DO bit
+            // so the answer carries the signatures the chain walk needs.
+            #[cfg(feature = "dnssec")]
+            if self.validate_dnssec {
+                query::set_do_bit(&mut query_bytes);
+            }
             let response = self.send_query(&query_bytes).await?;
             let packet =
                 simple_dns::Packet::parse(&response).map_err(|_| e!(Error::InvalidResponse))?;
@@ -680,11 +702,27 @@ impl DnsResolver {
                 .any(|rr| rr.rdata.type_code() == qtype);
 
             if has_answer {
+                // Validate the answer before trusting it. Fail-closed: an
+                // unsigned or bogus answer becomes an error rather than a result.
+                #[cfg(feature = "dnssec")]
+                if self.validate_dnssec {
+                    self.validate_answer(&current_host, qtype, &response)
+                        .await?;
+                }
                 return Ok(response);
             }
 
             // No records of the requested type -- follow CNAME if present.
             let Some(target) = query::cname_target(&packet, &current_host) else {
+                // An empty answer (NODATA) carries no record to validate, but
+                // under DNSSEC it must still be authenticated: a forged or
+                // unsigned empty answer for a signed name would otherwise suppress
+                // a real record. Fail-closed if the denial cannot be proven.
+                #[cfg(feature = "dnssec")]
+                if self.validate_dnssec {
+                    self.validate_nodata(&current_host, qtype, &response)
+                        .await?;
+                }
                 return Ok(response);
             };
             debug!(from = %current_host, to = %target, "following CNAME");
@@ -1370,6 +1408,46 @@ mod tests {
             .await
             .map(|i| i.collect::<Vec<_>>());
         assert!(err.is_err(), "expected NXDOMAIN, got {err:?}");
+    }
+
+    /// End to end validation of a known DNSSEC-signed name against a public
+    /// resolver. `cloudflare.com` is signed, so the chain from the root anchors
+    /// down must validate and the lookup must succeed.
+    #[cfg(feature = "dnssec")]
+    #[tokio::test]
+    #[ignore = "requires network access"]
+    async fn validate_dnssec_signed_name() {
+        let resolver = DnsResolver::builder()
+            .without_system_defaults()
+            .disable_fallback()
+            .nameserver(CLOUDFLARE_DNS, DnsProtocol::Udp)
+            .validate_dnssec()
+            .build();
+        assert_resolves_ipv4(&resolver, "cloudflare.com").await;
+    }
+
+    /// End to end authentication of a NODATA denial (finding D3). `cloudflare.com`
+    /// is signed and publishes no SRV record at its apex, so an SRV query returns
+    /// an authenticated NODATA. The resolver must prove the denial and return a
+    /// normal empty or NXDOMAIN result, never `Dnssec`. A regression that
+    /// failed closed on a valid NSEC or NSEC3 would surface here as Bogus.
+    #[cfg(feature = "dnssec")]
+    #[tokio::test]
+    #[ignore = "requires network access"]
+    async fn validate_dnssec_authenticated_nodata() {
+        let resolver = DnsResolver::builder()
+            .without_system_defaults()
+            .disable_fallback()
+            .nameserver(CLOUDFLARE_DNS, DnsProtocol::Udp)
+            .validate_dnssec()
+            .build();
+        let result = resolver
+            .lookup_record("cloudflare.com".to_string(), RecordKind::Srv)
+            .await;
+        assert!(
+            !matches!(result, Err(crate::Error::Dnssec { .. })),
+            "an authenticated NODATA must not be Bogus, got {result:?}"
+        );
     }
 
     mod search_names {

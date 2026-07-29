@@ -12,6 +12,10 @@
 //! or with [`DnsResolver::builder`] to configure the nameservers and fallback
 //! behavior. See [`Builder`] for the available settings.
 //!
+//! With the optional `dnssec` feature, [`Builder::validate_dnssec`] makes the
+//! resolver validate every answer against the DNSSEC chain of trust before
+//! returning it, failing closed on a bogus or unprovable result.
+//!
 //! [`simple-dns`]: https://docs.rs/simple-dns
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]
@@ -19,6 +23,8 @@
 
 mod builder;
 mod config;
+#[cfg(feature = "dnssec")]
+mod dnssec;
 mod error;
 mod records;
 mod resolver;
@@ -27,6 +33,8 @@ mod system_config;
 #[cfg(test)]
 mod tests;
 
+#[cfg(feature = "dnssec")]
+pub use self::dnssec::DnssecError;
 #[cfg(any(target_os = "android", doc))]
 pub use self::system_config::install_android_jni_context;
 pub use self::{
