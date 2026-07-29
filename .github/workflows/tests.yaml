@@ -111,6 +111,8 @@ jobs:
         cargo nextest run --workspace ${{ env.FEATURES }} --lib --bins --tests --run-ignored ${{ inputs.flaky && 'all' || 'default' }} --no-fail-fast --message-format ${{ inputs.flaky && 'libtest-json' || 'human' }} > output/${{ matrix.name }}_${{ matrix.features }}_${{ matrix.rust }}.json
       env:
         RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG'}}
+        # Required for --message-format libtest-json, used by the flaky runs.
+        NEXTEST_EXPERIMENTAL_LIBTEST_JSON: 1
 
     - name: doctests
       if: ${{ (matrix.features == 'all') && ! inputs.flaky }}
