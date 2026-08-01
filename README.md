@@ -16,31 +16,37 @@ yet fully-featured DNS resolver. It does not perform recursive resolution.
   queried only when the primary tier cannot answer.
 - Consults the system hosts file (`/etc/hosts` and the Windows equivalent)
   ahead of the network.
-- Follows `CNAME` chains, applies `search`/`ndots` expansion, and honours TTLs
-  with a small positive cache.
-- Races nameservers happy-eyeballs style, ordered by measured round-trip time,
-  and falls back from UDP to TCP on truncation.
-- With a crypto provider enabled, also speaks DNS-over-TLS and
-  DNS-over-HTTPS, pooling and reusing connections.
+- Resolves A, AAAA, TXT, NS, SRV, MX, CAA, SVCB, and HTTPS records, follows
+  `CNAME` chains, and applies `search`/`ndots` expansion.
+- Caches positive results by TTL and negative results (NODATA, NXDOMAIN) per
+  RFC 2308, deriving the negative TTL from the authority SOA. Optionally
+  serves expired entries when every nameserver fails (RFC 8767 serve-stale)
+  and floors very low TTLs, both off by default.
+- Races nameservers happy-eyeballs style, ordered by measured round-trip time.
+  A truncated or failed UDP query falls back to TCP on the same server, so
+  lookups survive networks that block UDP/53, and a FORMERR triggers a retry
+  without EDNS before the next server is tried.
+- Speaks DNS-over-TLS and DNS-over-HTTPS (on by default, see feature flags),
+  pooling and reusing connections.
 
-It does not currently perform DNSSEC validation or negative caching.
+It does not perform DNSSEC validation.
 
 ## Usage
 
 ```rust,no_run
 use std::net::SocketAddr;
 
-use n0_dns_resolver::{DnsProtocol, SimpleDnsResolver};
+use n0_dns_resolver::{DnsProtocol, DnsResolver};
 
 # async fn run() -> Result<(), n0_dns_resolver::Error> {
 // Cross-platform defaults: the system configuration, then the public-resolver
 // fallback.
-let resolver = SimpleDnsResolver::new();
+let resolver = DnsResolver::new();
 let addrs: Vec<_> = resolver.lookup_ipv4("example.com".to_string()).await?.collect();
 
 // Or query a single explicit nameserver, with no system config and no fallback.
 let ns: SocketAddr = "1.1.1.1:53".parse().unwrap();
-let resolver = SimpleDnsResolver::builder()
+let resolver = DnsResolver::builder()
     .without_system_defaults()
     .disable_fallback()
     .nameserver(ns, DnsProtocol::Udp)
@@ -56,12 +62,19 @@ fallback alongside the primary servers, `disable_fallback` removes it, and
 
 ## Feature flags
 
-- `tls-ring`: enables DNS-over-TLS and DNS-over-HTTPS using the `ring` crypto
-  provider.
-- `tls-aws-lc-rs`: the same, using the `aws-lc-rs` provider.
+Plain DNS over UDP and TCP is always available. The encrypted transports are
+feature-gated:
 
-Neither is enabled by default; without a crypto provider the resolver speaks
-plain DNS over UDP and TCP only.
+- `transport-tls`: DNS-over-TLS, via rustls.
+- `transport-https`: DNS-over-HTTPS, via reqwest with rustls.
+- `tls-ring` / `tls-aws-lc-rs`: the rustls crypto provider used to build the
+  default TLS client config when none is supplied on the builder.
+
+The default features are `transport-tls`, `transport-https`, and `tls-ring`,
+so DoT and DoH work out of the box. With `default-features = false` the
+resolver speaks plain DNS only. Enabling a transport without a crypto
+provider also works, but then a TLS client config must be supplied on the
+builder.
 
 
 ## License
