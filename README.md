@@ -18,10 +18,10 @@ yet fully-featured DNS resolver. It does not perform recursive resolution.
   ahead of the network.
 - Resolves A, AAAA, TXT, NS, SRV, MX, CAA, SVCB, and HTTPS records, follows
   `CNAME` chains, and applies `search`/`ndots` expansion.
-- Caches positive results by TTL and negative results (NODATA, NXDOMAIN) per
-  RFC 2308, deriving the negative TTL from the authority SOA. Optionally
-  serves expired entries when every nameserver fails (RFC 8767 serve-stale)
-  and floors very low TTLs, both off by default.
+- Caches positive results by TTL. Negative caching (NODATA, NXDOMAIN) is off
+  by default; enable it with `Builder::negative_max_ttl`. Optionally serves
+  expired entries when every nameserver fails (RFC 8767 serve-stale) and
+  floors very low TTLs, both off by default.
 - Races nameservers happy-eyeballs style, ordered by measured round-trip time.
   A truncated or failed UDP query falls back to TCP on the same server, so
   lookups survive networks that block UDP/53, and a FORMERR triggers a retry

@@ -1,12 +1,12 @@
 //! End-to-end resolver scenarios ported from hickory-resolver, driven through
 //! the public API against a mock UDP nameserver.
 
-use std::net::Ipv4Addr;
+use std::{net::Ipv4Addr, time::Duration};
 
 use simple_dns::RCODE;
 
 use super::{a, caa, cname, mx, ns, qname, reply, resolver_for, spawn_mock, srv, txt};
-use crate::{Record, RecordKind};
+use crate::{DnsProtocol, DnsResolver, Record, RecordKind};
 
 /// A CNAME that only the second query resolves: the first response carries the
 /// CNAME alone, so the resolver follows it and queries the target name, which
@@ -94,6 +94,28 @@ async fn nodata_answer_returns_empty_result() {
     assert!(records.is_empty());
 }
 
+/// By default negatives are not cached. A second NODATA lookup hits the
+/// nameserver again.
+#[tokio::test]
+async fn negative_results_are_not_cached_by_default() {
+    let server = spawn_mock(|query| Some(reply(query, RCODE::NoError, vec![]))).await;
+
+    let resolver = resolver_for(server.addr());
+    for _ in 0..2 {
+        let records = resolver
+            .lookup_record("nodata.example".to_string(), RecordKind::A)
+            .await
+            .expect("NODATA is an empty result");
+        assert!(records.is_empty());
+    }
+
+    assert_eq!(
+        server.query_count(),
+        2,
+        "the default resolver must not cache NODATA"
+    );
+}
+
 /// A negative (NODATA) result is cached, so a second lookup for the same name is
 /// served from the cache and never reaches the nameserver.
 ///
@@ -103,7 +125,13 @@ async fn nodata_answer_returns_empty_result() {
 async fn negative_caching_collapses_second_lookup() {
     let server = spawn_mock(|query| Some(reply(query, RCODE::NoError, vec![]))).await;
 
-    let resolver = resolver_for(server.addr());
+    // Negative caching is off by default; enable it for this scenario.
+    let resolver = DnsResolver::builder()
+        .without_system_defaults()
+        .disable_fallback()
+        .negative_max_ttl(Duration::from_secs(30))
+        .nameserver(server.addr(), DnsProtocol::Udp)
+        .build();
     for _ in 0..2 {
         let records = resolver
             .lookup_record("nodata.example".to_string(), RecordKind::A)

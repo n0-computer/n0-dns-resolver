@@ -408,6 +408,21 @@ impl DnsResolver {
             .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
     }
 
+    /// TTL in seconds to use when caching a NODATA or NXDOMAIN answer, or 0 to
+    /// skip the cache.
+    fn negative_cache_ttl_secs(&self, soa_ttl: Option<u32>) -> u32 {
+        let Some(max) = self.builder.negative_max_ttl else {
+            return 0;
+        };
+        let max_secs = u32::try_from(max.as_secs())
+            .unwrap_or(u32::MAX)
+            .min(NEGATIVE_TTL_MAX_SECS);
+        if max_secs == 0 {
+            return 0;
+        }
+        soa_ttl.unwrap_or(NEGATIVE_TTL_SECS).min(max_secs)
+    }
+
     /// Run a transport future with a per-attempt `timeout`.
     ///
     /// Callers pass [`UDP_TIMEOUT`] for datagram queries and [`STREAM_TIMEOUT`]
@@ -697,9 +712,10 @@ impl DnsResolver {
     ///
     /// This is the one generic lookup path. It checks the cache, expands search
     /// domains, races the nameservers, parses the response into [`Record`]s of
-    /// the requested [`RecordKind`], and caches a positive result. The typed
-    /// methods ([`Self::lookup_ipv4`], [`Self::lookup_ipv6`], [`Self::lookup_txt`])
-    /// are thin wrappers over it.
+    /// the requested [`RecordKind`], and caches a positive result. Negative
+    /// answers are not cached unless [`Builder::negative_max_ttl`] was set. The
+    /// typed methods ([`Self::lookup_ipv4`], [`Self::lookup_ipv6`],
+    /// [`Self::lookup_txt`]) are thin wrappers over it.
     ///
     /// Unlike the typed methods, this does not apply the RFC 6761 `localhost`
     /// rule or the hosts-file override; those are specific to A and AAAA lookups
@@ -763,7 +779,7 @@ impl DnsResolver {
                         Err(Error::NxDomain { .. }) => query::negative_ttl(&response),
                         _ => None,
                     };
-                    (parsed, soa.map(|ttl| ttl.min(NEGATIVE_TTL_MAX_SECS)))
+                    (parsed, soa)
                 }
                 Err(e) => (Err(e), None),
             };
@@ -780,7 +796,7 @@ impl DnsResolver {
                 Ok(_) => {
                     if first_negative.is_none() {
                         first_negative = Some(CachedResult::NoData);
-                        negative_ttl_secs = soa_negative_ttl.unwrap_or(NEGATIVE_TTL_SECS);
+                        negative_ttl_secs = self.negative_cache_ttl_secs(soa_negative_ttl);
                     }
                 }
                 Err(e @ Error::NxDomain { .. }) => {
@@ -788,7 +804,7 @@ impl DnsResolver {
                     trace!(%search_name, ?kind, remaining, reason = %e, "lookup failed");
                     if first_negative.is_none() {
                         first_negative = Some(CachedResult::NxDomain);
-                        negative_ttl_secs = soa_negative_ttl.unwrap_or(NEGATIVE_TTL_SECS);
+                        negative_ttl_secs = self.negative_cache_ttl_secs(soa_negative_ttl);
                     }
                     last_err = Some(e);
                 }
@@ -820,8 +836,8 @@ impl DnsResolver {
         }
 
         // No candidate held records. Report the first authoritative negative in
-        // search order (NODATA is a successful empty result, NXDOMAIN an error),
-        // and cache it briefly to blunt a thundering herd. Skip the cache when a
+        // search order (NODATA is a successful empty result, NXDOMAIN an error).
+        // Negative caching is off by default; when enabled, skip it if a
         // candidate failed indeterminately, since the negative may be wrong.
         match first_negative {
             Some(CachedResult::NoData) => {
