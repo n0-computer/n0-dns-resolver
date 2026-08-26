@@ -43,6 +43,9 @@ pub struct Builder {
     /// burst of very-low-TTL answers does not re-query on every lookup. `None`
     /// keeps the server-supplied TTL.
     pub(crate) cache_min_ttl: Option<Duration>,
+    /// Cap on how long NXDOMAIN/NODATA is cached. `None` disables negative
+    /// caching.
+    pub(crate) negative_max_ttl: Option<Duration>,
     #[cfg(with_rustls)]
     pub(crate) tls_client_config: Option<rustls::ClientConfig>,
 }
@@ -56,6 +59,7 @@ impl Default for Builder {
             fallback_nameservers: None,
             serve_stale: None,
             cache_min_ttl: None,
+            negative_max_ttl: None,
             #[cfg(with_rustls)]
             tls_client_config: None,
         }
@@ -195,6 +199,17 @@ impl Builder {
     #[must_use]
     pub fn cache_min_ttl(mut self, min_ttl: Duration) -> Self {
         self.cache_min_ttl = Some(min_ttl);
+        self
+    }
+
+    /// Caps how long NXDOMAIN and NODATA answers are cached.
+    ///
+    /// Off by default, so a first NXDOMAIN does not hide a name that starts
+    /// resolving a moment later. Pass a positive duration to cache negatives,
+    /// capped by this value and by the response's SOA (RFC 2308).
+    #[must_use]
+    pub fn negative_max_ttl(mut self, max_ttl: Duration) -> Self {
+        self.negative_max_ttl = Some(max_ttl);
         self
     }
 
