@@ -25,6 +25,10 @@ env:
   SCCACHE_CACHE_SIZE: "50G"
   CRATES_LIST: "n0-dns-resolver"
 
+# Default to read-only; jobs that need more grant it explicitly.
+permissions:
+  contents: read
+
 jobs:
   build_and_test_nix:
     timeout-minutes: 30
@@ -53,22 +57,23 @@ jobs:
       RUSTC_WRAPPER: "sccache"
     steps:
     - name: Checkout
-      uses: actions/checkout@v5
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       with:
+        persist-credentials: false
         ref: ${{ inputs.git-ref }}
 
     - name: Install ${{ matrix.rust }} rust
-      uses: dtolnay/rust-toolchain@master
+      uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
       with:
         toolchain: ${{ matrix.rust }}
 
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@v2
+      uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
       with:
         tool: nextest@0.9.80
 
     - name: Install sccache
-      uses: mozilla-actions/sccache-action@v0.0.9
+      uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
 
     - name: Select features
       run: |
@@ -92,36 +97,39 @@ jobs:
         for i in ${CRATES_LIST//,/ }
         do
           echo "Checking $i $FEATURES"
-          cargo check -p $i $FEATURES --lib --bins
+          cargo check --locked -p $i $FEATURES --lib --bins
         done
       env:
         RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG'}}
 
     - name: build tests
       run: |
-        cargo nextest run --workspace ${{ env.FEATURES }} --lib --bins --tests --no-run
+        cargo nextest run --locked --workspace $FEATURES --lib --bins --tests --no-run
 
     - name: list ignored tests
       run: |
-        cargo nextest list --workspace ${{ env.FEATURES }} --lib --bins --tests --run-ignored ignored-only
+        cargo nextest list --locked --workspace $FEATURES --lib --bins --tests --run-ignored ignored-only
 
     - name: run tests
-      run: |
-        mkdir -p output
-        cargo nextest run --workspace ${{ env.FEATURES }} --lib --bins --tests --run-ignored ${{ inputs.flaky && 'all' || 'default' }} --no-fail-fast --message-format ${{ inputs.flaky && 'libtest-json' || 'human' }} > output/${{ matrix.name }}_${{ matrix.features }}_${{ matrix.rust }}.json
       env:
         RUST_LOG: ${{ runner.debug && 'TRACE' || 'DEBUG'}}
         # Required for --message-format libtest-json, used by the flaky runs.
         NEXTEST_EXPERIMENTAL_LIBTEST_JSON: 1
+        RUN_IGNORED: ${{ inputs.flaky && 'all' || 'default' }}
+        MSG_FORMAT: ${{ inputs.flaky && 'libtest-json' || 'human' }}
+        OUT_NAME: ${{ matrix.name }}_${{ matrix.features }}_${{ matrix.rust }}
+      run: |
+        mkdir -p output
+        cargo nextest run --locked --workspace $FEATURES --lib --bins --tests --run-ignored "$RUN_IGNORED" --no-fail-fast --message-format "$MSG_FORMAT" > "output/$OUT_NAME.json"
 
     - name: doctests
       if: ${{ (matrix.features == 'all') && ! inputs.flaky }}
       run: |
-        cargo test --workspace --all-features --doc
+        cargo test --locked --workspace --all-features --doc
 
     - name: upload results
       if: ${{ failure() && inputs.flaky }}
-      uses: actions/upload-artifact@v6
+      uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f # v6.0.0
       with:
         name: libtest_run_${{ github.run_number }}-${{ github.run_attempt }}-${{ matrix.name }}_${{ matrix.features }}_${{ matrix.rust }}.json
         path: output

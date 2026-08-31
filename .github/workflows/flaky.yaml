@@ -34,6 +34,10 @@ concurrency:
   group: flaky-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
+# Default to read-only; jobs that need more grant it explicitly.
+permissions:
+  contents: read
+
 jobs:
   tests:
     if: "contains(github.event.pull_request.labels.*.name, 'flaky-test') || github.event_name == 'workflow_dispatch' || github.event_name == 'schedule'"
@@ -47,13 +51,15 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Extract test results
+        env:
+          NEEDS_JSON: ${{ toJSON(needs) }}
         run: |
-          printf '${{ toJSON(needs) }}\n'
-          result=$(echo '${{ toJSON(needs) }}' | jq -r .tests.result)
+          printf '%s\n' "$NEEDS_JSON"
+          result=$(echo "$NEEDS_JSON" | jq -r .tests.result)
           echo TESTS_RESULT=$result
           echo "TESTS_RESULT=$result" >>"$GITHUB_ENV"
       - name: download nextest reports
-        uses: actions/download-artifact@v6
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53 # v6.0.0
         with:
           pattern: libtest_run_${{ github.run_number }}-${{ github.run_attempt }}-*
           merge-multiple: true
@@ -75,10 +81,10 @@ jobs:
             echo "$failure" >> $GITHUB_OUTPUT
           done
           echo "" >> $GITHUB_OUTPUT
-          echo "See https://github.com/${{ github.repository }}/actions/workflows/flaky.yaml" >> $GITHUB_OUTPUT
+          echo "See https://github.com/$GITHUB_REPOSITORY/actions/workflows/flaky.yaml" >> $GITHUB_OUTPUT
           echo "$EOF" >> $GITHUB_OUTPUT
       - name: Notify discord on failure
-        uses: n0-computer/discord-webhook-notify@v1
+        uses: n0-computer/discord-webhook-notify@1399c1b2d57cc05894d506d2cfdc33c5f012b993 # v1.1.1
         if: ${{ env.TESTS_RESULT == 'failure' || env.TESTS_RESULT == 'success' }}
         with:
           text: "Flaky tests in **${{ github.repository }}**:"
