@@ -20,7 +20,6 @@ use std::{
 };
 
 use derive_more::Display;
-
 use hickory_resolver::{
     TokioResolver,
     config::{ResolverConfig, ResolverOpts},
