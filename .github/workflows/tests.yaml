@@ -25,6 +25,10 @@ env:
   SCCACHE_CACHE_SIZE: "50G"
   CRATES_LIST: "n0-dns-resolver"
 
+# Default to read-only; jobs that need more grant it explicitly.
+permissions:
+  contents: read
+
 jobs:
   build_and_test_nix:
     timeout-minutes: 30
@@ -55,6 +59,7 @@ jobs:
     - name: Checkout
       uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
       with:
+        persist-credentials: false
         ref: ${{ inputs.git-ref }}
 
     - name: Install ${{ matrix.rust }} rust
