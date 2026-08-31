@@ -56,6 +56,8 @@ tls-ring = ["rustls?/ring"]
 tls-aws-lc-rs = ["rustls?/aws-lc-rs"]
 
 [dev-dependencies]
+hickory-resolver = { version = "0.26.0", features = ["tokio", "system-config"] }
+iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 tokio = { version = "1", features = ["macros", "rt"] }
 tracing-subscriber = "0.3.23"
 
@@ -72,3 +74,7 @@ allowed_external_types = [
     # TransportError exposes the reqwest error behind DNS-over-HTTPS failures.
     "reqwest::error::Error",
 ]
+
+[[example]]
+name = "compare_iroh_lookups"
+required-features = ["transport-https", "tls-ring"]
