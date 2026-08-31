@@ -24,6 +24,7 @@ env:
   RUSTDOCFLAGS: -Dwarnings
   SCCACHE_CACHE_SIZE: "50G"
   CRATES_LIST: "n0-dns-resolver"
+  NEXTEST_VERSION: "0.9.80"
 
 # Default to read-only; jobs that need more grant it explicitly.
 permissions:
@@ -70,7 +71,7 @@ jobs:
     - name: Install cargo-nextest
       uses: taiki-e/install-action@ba47c86ac325773530516bb756137ac718732518 # v2.86.5
       with:
-        tool: nextest@0.9.80
+        tool: nextest@${{ env.NEXTEST_VERSION }}
 
     - name: Install sccache
       uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
@@ -169,10 +170,25 @@ jobs:
         rustup target add $env:RUST_TARGET
         rustup set default-host $env:RUST_TARGET
 
-    - name: Install cargo-nextest
-      uses: taiki-e/install-action@82cd3e7658a6f96c86c0234aeeda1748937cb0a1 # v2.85.13
+    # taiki-e/install-action bootstraps through bash, which resolves to a broken
+    # WSL shim on the self-hosted windows runners and mangles the action path.
+    # Install nextest by direct download instead, like noq does.
+    - name: Cache cargo-nextest
+      id: cache-nextest
+      uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
       with:
-        tool: nextest@0.9.80
+        path: ~/.cargo/bin/cargo-nextest.exe
+        key: nextest-windows-${{ env.NEXTEST_VERSION }}
+
+    - name: Install cargo-nextest
+      if: steps.cache-nextest.outputs.cache-hit != 'true'
+      shell: powershell
+      run: |
+        $tmp = New-TemporaryFile | Rename-Item -NewName { $_ -replace 'tmp$', 'zip' } -PassThru
+        Invoke-WebRequest -OutFile $tmp https://get.nexte.st/${{ env.NEXTEST_VERSION }}/windows
+        $outputDir = if ($Env:CARGO_HOME) { Join-Path $Env:CARGO_HOME "bin" } else { "~/.cargo/bin" }
+        $tmp | Expand-Archive -DestinationPath $outputDir -Force
+        $tmp | Remove-Item
 
     - name: Install sccache
       uses: mozilla-actions/sccache-action@7d986dd989559c6ecdb630a3fd2557667be217ad # v0.0.9
