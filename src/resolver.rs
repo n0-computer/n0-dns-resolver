@@ -378,17 +378,17 @@ impl DnsResolver {
     /// `reqwest::Client` uses an inner `Arc`, so cloning is cheap.
     #[cfg(transport_https)]
     fn get_or_init_https_client(&self) -> Result<reqwest::Client, Error> {
-        // DoH needs a TLS client config, like the DoT path. Without one, reqwest
-        // (built with `rustls-no-provider`) would fall back to a process-default
-        // crypto provider and panic when none is installed.
-        let tls_config = self
-            .tls_config
-            .as_ref()
-            .ok_or_else(|| e!(Error::MissingTlsConfig))?;
         let mut guard = self.https_client.lock().expect("poisoned");
         match guard.as_ref() {
             Some(client) => Ok(client.clone()),
             None => {
+                // DoH needs a TLS client config, like the DoT path. Without one, reqwest
+                // (built with `rustls-no-provider`) would fall back to a process-default
+                // crypto provider and panic when none is installed.
+                let tls_config = self
+                    .tls_config
+                    .as_ref()
+                    .ok_or_else(|| e!(Error::MissingTlsConfig))?;
                 // Pin each named DoH server to its address so reqwest does not
                 // recursively resolve the hostname.
                 let resolves: Vec<(String, std::net::SocketAddr)> = self
