@@ -1,32 +1,33 @@
-//! The [`Builder`] for configuring a [`DnsResolver`].
+//! The [`Builder`] for a [`DnsResolver`], and the types it configures.
 
 use std::{net::SocketAddr, time::Duration};
 
 use crate::{DnsResolver, public_resolvers};
 
-/// Builds a [`DnsResolver`].
+/// A builder for a [`DnsResolver`].
 ///
-/// A fresh builder is empty: it queries no nameservers and does not read the
-/// host system, so every source is opted into explicitly. Get one from
-/// [`DnsResolver::builder`], add nameservers, adjust the setters, and finish
-/// with [`Builder::build`]. For the common case — the system configuration with
-/// the public resolvers behind it — use [`DnsResolver::system_with_fallback`]
-/// instead of assembling it by hand.
+/// A fresh builder is empty: it queries no nameservers and reads nothing from
+/// the host, so every source is opted into explicitly. Get one from
+/// [`DnsResolver::builder`], add the sources you want, then call
+/// [`Builder::build`]. For the common case, the system configuration with the
+/// public resolvers behind it, [`DnsResolver::system_with_fallback`] does the
+/// assembly for you.
 ///
-/// # Nameserver tiers
-///
-/// Nameservers form two tiers. The *primary* tier is what
+/// Nameservers form two tiers, both empty to start. The *primary* tier is what
 /// [`Builder::use_system_config`], [`Builder::nameserver`] and
 /// [`Builder::nameservers`] add. The *fallback* tier is what
 /// [`Builder::fallback_nameservers`] and
-/// [`Builder::default_fallback_nameservers`] add; both tiers start empty.
-/// [`Builder::fallback_mode`] decides how the two relate: by default the
-/// fallback tier is queried only once the primary tier cannot answer.
+/// [`Builder::default_fallback_nameservers`] add. [`Builder::fallback_mode`]
+/// decides how the two relate: by default the fallback tier is queried only
+/// once the primary tier cannot answer.
 ///
 /// # Examples
 ///
 /// ```
-/// use n0_dns_resolver::{DnsResolver, public_resolvers, public_resolvers::Provider};
+/// use n0_dns_resolver::{
+///     DnsResolver,
+///     public_resolvers::{self, Provider},
+/// };
 ///
 /// // The system configuration, with Quad9 behind it as a fallback.
 /// let resolver = DnsResolver::builder()
@@ -40,15 +41,11 @@ pub struct Builder {
     pub(crate) nameservers: Vec<Nameserver>,
     pub(crate) fallback_nameservers: Vec<Nameserver>,
     pub(crate) fallback: FallbackMode,
-    /// When set, serve an expired cached answer within this window if live
-    /// resolution fails (serve-stale, RFC 8767). `None` disables it.
+    /// Serve-stale window, or `None` to disable serving expired answers.
     pub(crate) serve_stale: Option<Duration>,
-    /// When set, floor every cached positive TTL to at least this long, so a
-    /// burst of very-low-TTL answers does not re-query on every lookup. `None`
-    /// keeps the server-supplied TTL.
+    /// Floor for cached positive TTLs, or `None` to keep the server's TTL.
     pub(crate) cache_min_ttl: Option<Duration>,
-    /// Cap on how long NXDOMAIN/NODATA is cached. `None` disables negative
-    /// caching.
+    /// Cap on how long NXDOMAIN and NODATA are cached, or `None` to disable.
     pub(crate) negative_max_ttl: Option<Duration>,
     #[cfg(with_rustls)]
     pub(crate) tls_client_config: Option<rustls::ClientConfig>,
@@ -57,9 +54,9 @@ pub struct Builder {
 impl Builder {
     /// Reads the host system's DNS configuration into the primary tier.
     ///
-    /// This adds the system's nameservers, and makes the resolver honor the
-    /// system's `search` domains and `ndots` setting and consult the system
-    /// hosts file. Without it none of the host's configuration is read.
+    /// The system's nameservers join the primary tier, and the resolver honors
+    /// the system's `search` domains and `ndots` setting and consults the
+    /// system hosts file. Without this, nothing is read from the host.
     #[must_use]
     pub fn use_system_config(mut self) -> Self {
         self.use_system_config = true;
@@ -79,9 +76,10 @@ impl Builder {
 
     /// Adds several primary nameservers.
     ///
-    /// Appends, and takes the same [`Nameserver`] list as
-    /// [`Self::fallback_nameservers`], so a selection of public resolvers can be
-    /// the primary tier just as well as the fallback one.
+    /// Appends, so it can be called repeatedly. It takes the same
+    /// [`Nameserver`] list as [`Self::fallback_nameservers`], so a selection of
+    /// public resolvers can serve as the primary tier just as well as the
+    /// fallback one.
     #[must_use]
     pub fn nameservers(mut self, nameservers: impl IntoIterator<Item = Nameserver>) -> Self {
         self.nameservers.extend(nameservers);
@@ -102,9 +100,10 @@ impl Builder {
     /// Adds `nameservers` to the fallback tier.
     ///
     /// Appends, so it can be called repeatedly and combines with
-    /// [`Self::default_fallback_nameservers`]. Build the list for a selection of
-    /// public resolvers with [`public_resolvers::default_order`], or assemble your
-    /// own from [`Provider::nameservers`] and [`Nameserver::interleave`].
+    /// [`Self::default_fallback_nameservers`]. Build the list for a selection
+    /// of public resolvers with [`public_resolvers::default_order`], or
+    /// assemble your own from [`Provider::nameservers`] and
+    /// [`Nameserver::interleave`].
     ///
     /// [`Provider::nameservers`]: public_resolvers::Provider::nameservers
     #[must_use]
@@ -120,8 +119,8 @@ impl Builder {
     ///
     /// Shorthand for [`Self::fallback_nameservers`] with
     /// [`public_resolvers::default_order`] over [`Provider::ALL`]: Cloudflare,
-    /// Google and Quad9, over UDP and DNS-over-HTTPS, on both address families.
-    /// That function documents the order and the reasoning behind it.
+    /// Google and Quad9, reached over UDP and DNS-over-HTTPS on both address
+    /// families. That function documents the order and the reasoning for it.
     ///
     /// [`Provider::ALL`]: public_resolvers::Provider::ALL
     #[must_use]
@@ -143,14 +142,13 @@ impl Builder {
         self
     }
 
-    /// Serves an expired cached answer when live resolution fails (serve-stale,
-    /// RFC 8767).
+    /// Serves an expired cached answer when live resolution fails.
     ///
     /// When every nameserver fails or times out, a positive answer that expired
     /// no more than `max_age` ago is returned instead of an error, so a brief
-    /// upstream outage does not break resolution. Only positive answers are
-    /// served stale; an authoritative NXDOMAIN is never overridden. Off by
-    /// default.
+    /// upstream outage does not break resolution. This is serve-stale, RFC
+    /// 8767. Only positive answers are served stale; an authoritative NXDOMAIN
+    /// is never overridden. Off by default.
     #[must_use]
     pub fn serve_stale(mut self, max_age: Duration) -> Self {
         self.serve_stale = Some(max_age);
@@ -180,7 +178,7 @@ impl Builder {
         self
     }
 
-    /// Builds the resolver.
+    /// Consumes the builder and returns the configured [`DnsResolver`].
     pub fn build(self) -> DnsResolver {
         DnsResolver::from_builder(self)
     }
@@ -188,38 +186,40 @@ impl Builder {
 
 /// How the resolver uses its fallback nameservers relative to the primary ones.
 ///
-/// The *primary* nameservers come from [`Builder::use_system_config`] and
-/// [`Builder::nameserver`]; the *fallback* nameservers from
+/// The primary nameservers come from [`Builder::use_system_config`] and
+/// [`Builder::nameserver`]; the fallback nameservers from
 /// [`Builder::fallback_nameservers`]. Set the mode with
-/// [`Builder::fallback_mode`]. An empty fallback tier is unaffected by the mode:
-/// to query no fallback at all, add none.
+/// [`Builder::fallback_mode`]. An empty fallback tier is unaffected by the
+/// mode: to query no fallback at all, add none.
 #[derive(Debug, Default, Copy, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum FallbackMode {
-    /// Race the fallback nameservers alongside the primary ones from the start.
+    /// Races the fallback nameservers alongside the primary ones from the start.
     Eager,
-    /// Use the fallback nameservers only when the system DNS configuration
-    /// yielded no nameservers, whether because it could not be read or because
-    /// it listed none.
+    /// Uses the fallback nameservers only when the system configuration is empty.
     ///
-    /// A system configuration that did yield nameservers is never supplemented:
-    /// if those nameservers fail at query time the lookup fails rather than
-    /// escalating. Without [`Builder::use_system_config`] there is no system
-    /// configuration at all, which counts as empty, so this behaves like
-    /// [`Self::Eager`].
+    /// A system configuration counts as empty when it yields no nameservers,
+    /// whether because it could not be read or because it listed none. One that
+    /// did yield nameservers is never supplemented: if those fail at query time
+    /// the lookup fails rather than escalating. Without
+    /// [`Builder::use_system_config`] there is no configuration at all, which
+    /// also counts as empty, so this behaves like [`Self::Eager`].
     IfSystemEmpty,
-    /// Keep the fallback nameservers as a lower-priority tier, queried only once
-    /// every primary nameserver has failed or timed out. This is the default.
+    /// Queries the fallback nameservers only after every primary one has failed.
+    ///
+    /// This is the default. The fallback stays a lower-priority second tier
+    /// rather than joining the initial race, so a working primary nameserver
+    /// always answers first.
     #[default]
     Deferred,
 }
 
-/// A configured nameserver: its address, transport, and an optional TLS server
-/// name for DNS-over-TLS / DNS-over-HTTPS.
+/// A nameserver to query: an address, a transport, and an optional TLS name.
 ///
-/// The connection is always made to `addr`. When `server_name` is set it is
-/// used for the TLS SNI and certificate validation (and as the DoH URL
-/// authority, with the address pinned); otherwise DoT/DoH are addressed by IP.
+/// The connection is always made to the address. When a TLS server name is set
+/// it drives the SNI and certificate validation, and serves as the DoH URL
+/// authority with the address pinned. Otherwise DoT and DoH are addressed by
+/// IP.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Nameserver {
     pub(crate) addr: SocketAddr,
@@ -230,7 +230,7 @@ pub struct Nameserver {
 }
 
 impl Nameserver {
-    /// A nameserver addressed by IP, with no TLS server name.
+    /// Creates a nameserver addressed by IP, with no TLS server name.
     pub const fn new(addr: SocketAddr, protocol: DnsProtocol) -> Self {
         Self {
             addr,
@@ -240,14 +240,16 @@ impl Nameserver {
         }
     }
 
-    /// Merges nameserver lists round-robin: every list's first entry, then
-    /// every list's second, and so on, with exhausted lists skipped.
+    /// Merges nameserver lists round-robin.
     ///
-    /// Nameserver order is query order (see [`Builder::fallback_mode`] for how
-    /// the tiers are raced), so interleaving per-provider lists spreads the
-    /// early attempts across providers instead of exhausting one before trying
-    /// the next. It applies no other policy — for this crate's opinionated
-    /// order over the public resolvers, see [`public_resolvers::default_order`].
+    /// Takes every list's first entry, then every list's second, and so on,
+    /// skipping lists that have run out. Nameserver order is query order, so
+    /// interleaving per-provider lists spreads the early attempts across
+    /// providers instead of exhausting one provider before trying the next. No
+    /// other policy is applied. For this crate's opinionated order over the
+    /// public resolvers, see [`public_resolvers::default_order`].
+    ///
+    /// # Examples
     ///
     /// ```
     /// use n0_dns_resolver::{DnsProtocol, Nameserver, public_resolvers::Provider};
@@ -278,26 +280,30 @@ impl Nameserver {
         .collect()
     }
 
-    /// The address this nameserver is queried at.
+    /// Returns the address this nameserver is queried at.
     pub fn addr(&self) -> SocketAddr {
         self.addr
     }
 
-    /// The transport this nameserver is queried over.
+    /// Returns the transport this nameserver is queried over.
     pub fn protocol(&self) -> DnsProtocol {
         self.protocol
     }
 
-    /// The TLS server name this nameserver's certificate is validated against,
-    /// or `None` when it is addressed by IP.
+    /// Returns the TLS server name, or `None` when addressed by IP.
     ///
-    /// Only ever set by [`Self::with_server_name`], and only used for DoT/DoH.
+    /// Set only by [`Self::with_server_name`], and used only for DNS-over-TLS
+    /// and DNS-over-HTTPS.
     #[cfg(any(with_rustls, doc))]
     pub fn server_name(&self) -> Option<&str> {
         self.server_name.as_deref()
     }
 
-    /// A DoT/DoH nameserver addressed by IP but validated against `server_name`.
+    /// Creates a DoT or DoH nameserver validated against `server_name`.
+    ///
+    /// The connection is made to `addr`, while `server_name` drives the TLS SNI
+    /// and certificate validation. Use this for providers whose certificates
+    /// cover a hostname rather than the IP address.
     #[cfg(any(with_rustls, doc))]
     pub fn with_server_name(
         addr: SocketAddr,
@@ -312,29 +318,29 @@ impl Nameserver {
     }
 }
 
-/// Protocols over which DNS records can be resolved.
+/// A protocol over which DNS records can be resolved.
 #[derive(Debug, Default, Copy, Clone, Eq, PartialEq, Hash)]
 #[non_exhaustive]
 pub enum DnsProtocol {
-    /// DNS over UDP
+    /// DNS over UDP.
     ///
-    /// This is the classic DNS protocol and supported by most DNS servers.
+    /// The classic DNS transport, supported by essentially every DNS server.
     #[default]
     Udp,
-    /// DNS over TCP
+    /// DNS over TCP.
     ///
-    /// This is specified in the original DNS RFCs, but is not supported by all DNS servers.
+    /// Specified in the original DNS RFCs, but not supported by every server.
     Tcp,
-    /// DNS over TLS (DoT)
+    /// DNS over TLS (DoT), as defined in [RFC 7858].
     ///
-    /// Performs DNS lookups over TLS-encrypted TCP connections, as defined in [RFC 7858].
+    /// Runs the DNS protocol over a TLS-encrypted TCP connection.
     ///
     /// [RFC 7858]: https://www.rfc-editor.org/rfc/rfc7858.html
     #[cfg(transport_tls)]
     Tls,
-    /// DNS over HTTPS (DoH)
+    /// DNS over HTTPS (DoH), as defined in [RFC 8484].
     ///
-    /// Performs DNS lookups over HTTPS, as defined in [RFC 8484].
+    /// Carries DNS messages inside HTTPS requests.
     ///
     /// [RFC 8484]: https://www.rfc-editor.org/rfc/rfc8484.html
     #[cfg(transport_https)]
@@ -342,11 +348,12 @@ pub enum DnsProtocol {
 }
 
 impl DnsProtocol {
-    /// The IANA-registered default port for this protocol: 53 for plain DNS
-    /// over UDP or TCP, 853 for DNS-over-TLS, 443 for DNS-over-HTTPS.
+    /// Returns the port this protocol is served on by default.
     ///
-    /// A [`Nameserver`] carries its own port, which need not be this one; this
-    /// is what to use when only an IP address is known.
+    /// Plain DNS over UDP or TCP uses 53, DNS-over-TLS uses 853, and
+    /// DNS-over-HTTPS uses 443. A [`Nameserver`] carries its own port, which
+    /// need not be the default; this is what to reach for when all you have is
+    /// an IP address.
     pub const fn port(self) -> u16 {
         match self {
             // Do53, the classic DNS port.

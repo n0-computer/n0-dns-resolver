@@ -154,8 +154,8 @@ fn read_system_dns_jni() -> Result<DnsConfig, std::io::Error> {
 ///
 /// If this function is not called, fetching the configured nameservers will
 /// fail, and a resolver built with [`Builder::use_system_config`] falls back to
-/// whatever its fallback tier holds — for [`DnsResolver::system_with_fallback`],
-/// the public resolvers.
+/// whatever its fallback tier holds. For [`DnsResolver::system_with_fallback`]
+/// that is the public resolvers.
 ///
 /// [`Builder::use_system_config`]: crate::Builder::use_system_config
 /// [`DnsResolver::system_with_fallback`]: crate::DnsResolver::system_with_fallback

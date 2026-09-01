@@ -12,8 +12,9 @@ yet fully-featured DNS resolver. It does not perform recursive resolution.
 - Reads the system DNS configuration on request: `/etc/resolv.conf` on Unix,
   the SystemConfiguration framework on Apple platforms, the network adapters on
   Windows, and a JNI call on Android. The system nameservers form a primary
-  tier; a fallback tier — the public resolvers (Cloudflare, Google, Quad9), or
-  your own — is queried only when the primary tier cannot answer.
+  tier. Behind it sits a fallback tier, either the public resolvers
+  (Cloudflare, Google, Quad9) or your own, queried only when the primary tier
+  cannot answer.
 - Consults the system hosts file (`/etc/hosts` and the Windows equivalent)
   ahead of the network, when the system configuration is read.
 - Resolves A, AAAA, TXT, NS, SRV, MX, CAA, SVCB, and HTTPS records, follows
@@ -46,8 +47,8 @@ use n0_dns_resolver::{
 let resolver = DnsResolver::system_with_fallback();
 let addrs: Vec<_> = resolver.lookup_ipv4("example.com".to_string()).await?.collect();
 
-// The builder starts empty — no system configuration, no nameservers — so
-// each source is added explicitly. Here: a single explicit nameserver.
+// The builder starts empty, with no system configuration and no nameservers,
+// so each source is added explicitly. Here it is a single nameserver.
 let ns = Nameserver::new("1.1.1.1:53".parse().unwrap(), DnsProtocol::Udp);
 let resolver = DnsResolver::builder().nameserver(ns).build();
 

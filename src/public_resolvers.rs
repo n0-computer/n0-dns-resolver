@@ -1,10 +1,12 @@
 //! The public DNS resolvers offered as ready-made fallback nameservers.
 //!
-//! [`Provider`] names one public resolver operator and hands out its addresses
-//! and nameservers; it holds no ordering policy beyond "primary address first".
-//! [`Nameserver::interleave`] merges per-provider lists round-robin, and
+//! [`Provider`] names one public resolver operator and hands out its
+//! nameservers, holding no ordering policy beyond "primary address first".
+//! [`Nameserver::interleave`] merges per-provider lists round-robin.
 //! [`default_order`] is this crate's opinionated order for a selection of
-//! providers — the one [`Builder::default_fallback_nameservers`] installs.
+//! providers, and the one [`Builder::default_fallback_nameservers`] installs.
+//!
+//! # Examples
 //!
 //! ```
 //! use n0_dns_resolver::{
@@ -32,9 +34,9 @@ use crate::{DnsProtocol, Nameserver};
 ///
 /// Each provider runs an anycast service on two IPv4 and two IPv6 addresses,
 /// reachable over every [`DnsProtocol`] this crate speaks. The encrypted
-/// entries are addressed by IP (see `transport::https_query`): all three
-/// providers list the anycast IPs used here as `iPAddress` SANs in their
-/// certificates, so IP-addressed DoT and DoH validate without a hostname.
+/// entries are addressed by IP rather than by hostname, which works because all
+/// three providers list the anycast addresses used here as `iPAddress` SANs in
+/// their certificates. DoT and DoH therefore validate without a server name.
 #[derive(Debug, Copy, Clone, Eq, PartialEq)]
 #[non_exhaustive]
 pub enum Provider {
@@ -50,7 +52,7 @@ impl Provider {
     /// Every provider this crate knows about.
     pub const ALL: &'static [Provider] = &[Provider::Cloudflare, Provider::Google, Provider::Quad9];
 
-    /// The provider's IPv4 addresses, primary first.
+    /// Returns the provider's IPv4 addresses, primary first.
     fn ipv4_addrs(self) -> [Ipv4Addr; 2] {
         match self {
             Provider::Cloudflare => [Ipv4Addr::new(1, 1, 1, 1), Ipv4Addr::new(1, 0, 0, 1)],
@@ -59,7 +61,7 @@ impl Provider {
         }
     }
 
-    /// The provider's IPv6 addresses, primary first.
+    /// Returns the provider's IPv6 addresses, primary first.
     fn ipv6_addrs(self) -> [Ipv6Addr; 2] {
         match self {
             Provider::Cloudflare => [
@@ -77,12 +79,12 @@ impl Provider {
         }
     }
 
-    /// The provider's nameservers reachable over `protocol`, ordered IPv4
-    /// primary, IPv6 primary, IPv4 secondary, IPv6 secondary.
+    /// Returns the provider's nameservers reachable over `protocol`.
     ///
-    /// All three providers answer on every protocol this crate speaks, so the
-    /// list is always four entries long. It is empty for a provider that does
-    /// not offer `protocol`.
+    /// Ordered IPv4 primary, IPv6 primary, IPv4 secondary, IPv6 secondary. All
+    /// three providers answer on every protocol this crate speaks, so the list
+    /// is always four entries long. It is empty for a provider that does not
+    /// offer `protocol`.
     pub fn nameservers(self, protocol: DnsProtocol) -> Vec<Nameserver> {
         let [v4_primary, v4_secondary] = self.ipv4_addrs().map(IpAddr::V4);
         let [v6_primary, v6_secondary] = self.ipv6_addrs().map(IpAddr::V6);
@@ -96,22 +98,23 @@ impl Provider {
 /// Returns this crate's default nameserver order for `providers`.
 ///
 /// This is the order [`Builder::default_fallback_nameservers`] installs, over
-/// [`Provider::ALL`]. It is one opinion, not the only sensible one; the pieces
-/// it is assembled from are public, so a caller who disagrees can build their
-/// own order with [`Provider::nameservers`] and [`Nameserver::interleave`].
+/// [`Provider::ALL`]. It is one opinion rather than the only sensible one, and
+/// the pieces it is assembled from are public: a caller who disagrees can build
+/// their own order with [`Provider::nameservers`] and
+/// [`Nameserver::interleave`].
 ///
-/// The opinion is this. Plain DNS across the providers, round-robin, comes
-/// first, because on a working network UDP answers in a few milliseconds. But
-/// the resolver keeps only `MAX_CONCURRENT_QUERIES` (3) attempts in flight, and
-/// a nameserver that silently drops UDP/53 holds its slot for `UDP_TIMEOUT`
-/// plus the TCP retry behind it — several seconds. Three UDP entries would
-/// therefore fill the first raced wave and stall every encrypted attempt behind
-/// them. So one DNS-over-HTTPS entry per provider is spliced in after the first
-/// two UDP entries, where it lands inside that first wave: on a filtered
-/// network DoH is racing within 200ms, and on a working network the UDP entries
-/// have answered long before the staggered DoH attempts start. The resolver
-/// tracks per-server round-trip time, so whatever works on the current network
-/// floats to the front from the second lookup onwards.
+/// Plain DNS across the providers, round-robin, comes first, because on a
+/// working network UDP answers in a few milliseconds. On a network that filters
+/// port 53 that ordering alone would fail badly. The resolver keeps only three
+/// attempts in flight, and a nameserver silently dropping UDP/53 holds its slot
+/// for the UDP timeout plus the TCP retry behind it, several seconds in total.
+/// Three UDP entries would fill the first raced wave and stall every encrypted
+/// attempt behind them. So one DNS-over-HTTPS entry per provider is spliced in
+/// after the first two UDP entries, which puts it inside that first wave: on a
+/// filtered network DoH is racing within 200ms, and on a working network the
+/// UDP entries answer long before the staggered DoH attempts start. From the
+/// second lookup onwards the resolver's per-server round-trip tracking takes
+/// over, floating whatever works on the current network to the front.
 ///
 /// Duplicate providers are not filtered; pass each one once.
 ///
@@ -138,9 +141,12 @@ pub fn default_order(providers: Vec<Provider>) -> Vec<Nameserver> {
 mod tests {
     use super::*;
 
-    /// The default order over every provider is the crate's default fallback
-    /// list. Pinned in full: it is load-bearing (see [`default_order`])
-    /// and easy to perturb by accident when the assembly changes.
+    /// Pins the default order over every provider, entry by entry.
+    ///
+    /// This list is the crate's default fallback tier. Its exact order is what
+    /// keeps DoH reachable on a network that filters UDP/53 (see
+    /// [`default_order`]), and it is easy to perturb by accident when the
+    /// assembly changes.
     #[test]
     fn default_order_for_all_providers() {
         let actual: Vec<String> = default_order(Provider::ALL.to_vec())
@@ -170,8 +176,10 @@ mod tests {
         assert_eq!(actual, expected);
     }
 
-    /// A selection of one provider still yields all four of its addresses, and
-    /// nothing from the others.
+    /// Checks that a one-provider selection is self-contained.
+    ///
+    /// It must still yield all four of that provider's addresses, and nothing
+    /// from any other provider.
     #[test]
     fn single_provider_selection_is_self_contained() {
         let servers = default_order(vec![Provider::Quad9]);
@@ -185,8 +193,10 @@ mod tests {
         assert!(!ips.contains(&IpAddr::V4(Provider::Google.ipv4_addrs()[0])));
     }
 
-    /// Every protocol yields four entries on the provider's own addresses, at
-    /// the port that protocol is served on.
+    /// Checks that every protocol yields four entries per provider.
+    ///
+    /// Each entry must sit on one of that provider's own addresses, at the port
+    /// the protocol is served on.
     #[test]
     fn nameservers_per_protocol_cover_all_addresses() {
         let protocols = [
@@ -208,10 +218,12 @@ mod tests {
         }
     }
 
-    /// DoH must land in the first raced wave (`MAX_CONCURRENT_QUERIES`, 3),
-    /// otherwise a network that silently drops UDP/53 stalls it behind several
-    /// seconds of UDP timeout. This has to hold for a selection of any size,
-    /// since callers pick their own providers.
+    /// Checks that DoH lands in the first raced wave, for any selection size.
+    ///
+    /// The wave is `MAX_CONCURRENT_QUERIES` (3) entries wide. If no DoH entry
+    /// falls inside it, a network that silently drops UDP/53 stalls DoH behind
+    /// several seconds of UDP timeout. Callers pick their own providers, so
+    /// this has to hold for every selection size, not just for all three.
     #[cfg(transport_https)]
     #[test]
     fn doh_lands_in_first_wave() {

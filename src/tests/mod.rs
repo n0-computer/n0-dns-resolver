@@ -64,8 +64,9 @@ impl MockServer {
     }
 }
 
-/// Binds a mock UDP nameserver on a loopback port and answers each query with
-/// the bytes `handler` returns for it.
+/// Binds a mock UDP nameserver on a loopback port.
+///
+/// Each query is answered with the bytes `handler` returns for it.
 ///
 /// `handler` receives the parsed query packet and returns the response bytes to
 /// send, or `None` to drop the query without replying. Build the response with
@@ -111,8 +112,10 @@ pub(crate) fn resolver_for(addr: SocketAddr) -> DnsResolver {
         .build()
 }
 
-/// Builds response bytes for `query`: echoes its question, sets `rcode`, and
-/// attaches `answers` to the answer section.
+/// Builds response bytes for `query`.
+///
+/// Echoes the question, sets `rcode`, and attaches `answers` to the answer
+/// section.
 ///
 /// The question echo is what [`crate::resolver`] validates the response against,
 /// so a reply built here passes the id, question, and class checks.

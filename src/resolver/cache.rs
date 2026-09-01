@@ -49,8 +49,9 @@ pub(super) enum CachedResult {
     NxDomain,
 }
 
-/// Normalizes a host to its cache-key form: lowercased, with any single trailing
-/// dot removed.
+/// Normalizes a host to its cache-key form.
+///
+/// The key is the host lowercased, with any single trailing dot removed.
 ///
 /// DNS names are case-insensitive, and a fully-qualified name with a trailing dot
 /// denotes the same node as the bare name. Normalizing here keeps

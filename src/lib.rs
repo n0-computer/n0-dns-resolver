@@ -12,9 +12,9 @@
 //! Construct a resolver with [`DnsResolver::system_with_fallback`] for
 //! cross-platform defaults: the system configuration, backed by the public
 //! resolvers in [`public_resolvers`]. Every other setup goes through
-//! [`DnsResolver::builder`], which starts empty — no system configuration and no
-//! nameservers — so each source is added explicitly. See [`Builder`] for the
-//! available settings.
+//! [`DnsResolver::builder`], which starts empty, with no system configuration
+//! and no nameservers, so that each source is added explicitly. See [`Builder`]
+//! for the available settings.
 //!
 //! [`simple-dns`]: https://docs.rs/simple-dns
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]

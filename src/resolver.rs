@@ -131,7 +131,7 @@ fn is_localhost(host: &str) -> bool {
 ///
 /// See the [crate] docs for an overview. Construct one with
 /// [`Self::system_with_fallback`] for cross-platform defaults, or with
-/// [`Self::builder`] to configure the nameservers and fallback behavior.
+/// [`Self::builder`] to configure the nameservers and the fallback behavior.
 #[derive(Debug)]
 pub struct DnsResolver {
     #[cfg(with_rustls)]
@@ -156,8 +156,10 @@ pub struct DnsResolver {
 /// configuration, built lazily by [`DnsResolver::state`].
 #[derive(Debug)]
 struct ResolverState {
-    /// The effective configuration: the assembled nameserver list, the search
-    /// list, `ndots`, and the hosts file.
+    /// The effective configuration this resolver runs on.
+    ///
+    /// Holds the assembled nameserver list, the search list, `ndots`, and the
+    /// hosts file.
     ///
     /// `config.nameservers` holds the primary nameservers followed by the
     /// fallback ones, split at `primary_count`; see
@@ -172,8 +174,9 @@ struct ResolverState {
 }
 
 impl ResolverState {
-    /// Reads the system DNS configuration (when enabled) and assembles the
-    /// effective configuration and the RTT map.
+    /// Assembles the effective configuration and the RTT map.
+    ///
+    /// Reads the system DNS configuration first when the builder enabled it.
     ///
     /// This is the IO-performing part of building a resolver: the platform
     /// readers read the nameservers, search list, and hosts file.
@@ -229,14 +232,13 @@ impl ResolverState {
 }
 
 impl DnsResolver {
-    /// Creates a resolver on the system's DNS configuration, with the default
-    /// public resolvers behind it.
+    /// Creates a resolver on the system configuration, backed by public resolvers.
     ///
-    /// This is the cross-platform default: the host's nameservers, search
+    /// This is the cross-platform default. The host's nameservers, search
     /// domains, `ndots` and hosts file are used first, and the public resolvers
     /// (Cloudflare, Google, Quad9) are queried only when the system
-    /// configuration cannot be read or its nameservers do not answer.
-    /// Equivalent to
+    /// configuration cannot be read or its nameservers do not answer. It is
+    /// equivalent to
     /// `DnsResolver::builder().use_system_config().default_fallback_nameservers().build()`.
     ///
     /// Every other configuration goes through [`Self::builder`].
@@ -249,7 +251,8 @@ impl DnsResolver {
 
     /// Returns an empty [`Builder`] for configuring a resolver.
     ///
-    /// The builder queries nothing until nameservers are added; see [`Builder`].
+    /// The builder reads nothing from the host and queries nothing until
+    /// nameservers are added. See [`Builder`] for the available settings.
     pub fn builder() -> Builder {
         Builder::default()
     }
@@ -321,8 +324,9 @@ impl DnsResolver {
             .get_or_init(|| ResolverState::build(&self.builder))
     }
 
-    /// Returns the list of candidate names to try for a given hostname,
-    /// applying search domain expansion per resolv.conf(5) semantics.
+    /// Returns the candidate names to try for `host`.
+    ///
+    /// Applies search domain expansion per resolv.conf(5) semantics.
     ///
     /// - If the name ends with `.` (FQDN), it is used as-is.
     /// - If the name has more labels than `ndots`, try the bare name first,
@@ -558,8 +562,10 @@ impl DnsResolver {
         order
     }
 
-    /// Sends a query, trying the primary nameservers first and escalating to the
-    /// fallback tier only if every primary nameserver fails or times out.
+    /// Sends a query, trying the primary nameservers before the fallback tier.
+    ///
+    /// The fallback tier is reached only once every primary nameserver has
+    /// failed or timed out.
     ///
     /// The two tiers are the leading `primary_count` entries of `nameservers`
     /// and the rest. Only [`FallbackMode::Deferred`] with a non-empty fallback
@@ -588,10 +594,12 @@ impl DnsResolver {
         }
     }
 
-    /// Races the nameservers named by `indices` happy-eyeballs style: tries the
-    /// historically fastest first, starts the next either [`QUERY_ATTEMPT_DELAY`]
-    /// later or as soon as the in-flight attempt fails (fail-fast), and caps
-    /// in-flight attempts at [`MAX_CONCURRENT_QUERIES`].
+    /// Races the nameservers named by `indices` happy-eyeballs style.
+    ///
+    /// The historically fastest server goes first. The next attempt starts
+    /// either [`QUERY_ATTEMPT_DELAY`] later or as soon as the in-flight one
+    /// fails, whichever comes first, and in-flight attempts are capped at
+    /// [`MAX_CONCURRENT_QUERIES`].
     ///
     /// The first successful response wins; UDP queries are retried per
     /// nameserver on failure. Per-server success and failure update the
@@ -1049,7 +1057,7 @@ impl DnsResolver {
         Ok(records.into_iter())
     }
 
-    /// Clears the positive DNS cache.
+    /// Clears the positive DNS cache, dropping every cached answer.
     pub fn clear_cache(&self) {
         self.cache.clear();
     }
@@ -1059,8 +1067,8 @@ impl DnsResolver {
     /// This is the assembled list the resolver queries: the system
     /// configuration (when [`Builder::use_system_config`] was set) and the
     /// explicitly added nameservers, followed by the fallback tier unless
-    /// [`FallbackMode`] excluded it. Reading it builds the resolver's state,
-    /// which on the first call reads the host's DNS configuration.
+    /// [`FallbackMode`] excluded it. The first call builds the resolver's
+    /// state, which reads the host's DNS configuration.
     pub fn nameservers(&self) -> Vec<Nameserver> {
         self.state().config.nameservers.clone()
     }

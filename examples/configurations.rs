@@ -1,9 +1,9 @@
 //! Five ways to configure a [`DnsResolver`], resolved side by side.
 //!
 //! The builder starts empty: it reads nothing from the host and queries no
-//! nameservers until you add them. This example walks from the ready-made
-//! default down to a hand-assembled nameserver list, running the same lookup
-//! through each so the differences are visible rather than theoretical.
+//! nameservers until you add them. This walks from the ready-made default down
+//! to a hand-assembled nameserver list, running the same lookup through each so
+//! the differences are visible rather than theoretical.
 //!
 //! Run with:
 //!
@@ -29,7 +29,7 @@ async fn main() -> Result<(), Error> {
     let system_with_fallback = DnsResolver::system_with_fallback();
 
     // The same thing spelled out on the builder, but with the fallback tier
-    // narrowed to Quad9 and Cloudflare — no Google. `default_order` applies this
+    // narrowed to Quad9 and Cloudflare, with no Google. `default_order` applies
     // crate's order to whichever providers you pick, so the selection keeps the
     // property that makes the default work: a DNS-over-HTTPS entry inside the
     // first raced wave, for networks that silently drop UDP/53.
@@ -43,8 +43,8 @@ async fn main() -> Result<(), Error> {
 
     // No system configuration at all: Quad9 over plain UDP, as the primary
     // tier. Nothing is read from /etc/resolv.conf or /etc/hosts, and no other
-    // provider is ever contacted — useful when resolution must behave the same
-    // regardless of the host it runs on.
+    // provider is ever contacted. This is useful when resolution must behave
+    // the same regardless of the host it runs on.
     let quad9_only = DnsResolver::builder()
         .nameservers(Provider::Quad9.nameservers(DnsProtocol::Udp))
         .build();
