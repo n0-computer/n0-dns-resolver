@@ -12,17 +12,50 @@ use std::{
 
 use tracing::warn;
 
-/// The A and AAAA addresses mapped to a single name.
+/// The addresses of one family mapped to a single name.
+///
+/// Effectively a `Vec` that holds its first element inline. Hosts files are
+/// overwhelmingly one address per name per family, so a `Vec` here would mean
+/// one heap allocation per name. That is the single largest cost of parsing a
+/// large hosts file: the ad-blocking lists people install run to a few hundred
+/// thousand names, and storing the first address inline cuts the parse roughly
+/// in half.
 #[derive(Debug, Default, Clone)]
-struct Entry {
-    a: Vec<Ipv4Addr>,
-    aaaa: Vec<Ipv6Addr>,
+enum Addrs<T> {
+    #[default]
+    None,
+    One(T),
+    Many(Vec<T>),
+}
+
+impl<T: Copy> Addrs<T> {
+    /// Appends `addr`, promoting to a heap vector on the second address.
+    fn push(&mut self, addr: T) {
+        *self = match self {
+            Addrs::None => Addrs::One(addr),
+            Addrs::One(first) => Addrs::Many(vec![*first, addr]),
+            Addrs::Many(addrs) => {
+                addrs.push(addr);
+                return;
+            }
+        };
+    }
+
+    /// Returns the addresses, or `None` when this name has none of this family.
+    fn to_vec(&self) -> Option<Vec<T>> {
+        match self {
+            Addrs::None => None,
+            Addrs::One(addr) => Some(vec![*addr]),
+            Addrs::Many(addrs) => Some(addrs.clone()),
+        }
+    }
 }
 
 /// Static host-to-address mappings parsed from the system hosts file.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Hosts {
-    by_name: HashMap<String, Entry>,
+    a: HashMap<String, Addrs<Ipv4Addr>>,
+    aaaa: HashMap<String, Addrs<Ipv6Addr>>,
 }
 
 impl Hosts {
@@ -43,7 +76,15 @@ impl Hosts {
     /// lowercased; comments (`#` to end of line) and unparsable addresses are
     /// skipped.
     fn parse(content: &str) -> Self {
-        let mut by_name: HashMap<String, Entry> = HashMap::new();
+        // Only the A map is pre-sized, so that a large file does not rehash its
+        // way up from nothing. Hosts files are overwhelmingly IPv4, and lines
+        // average well under this many bytes, so the estimate over-reserves
+        // slightly rather than growing repeatedly. An IPv6-heavy file simply
+        // grows its map as it goes.
+        const BYTES_PER_ENTRY: usize = 32;
+        let mut a: HashMap<String, Addrs<Ipv4Addr>> =
+            HashMap::with_capacity(content.len() / BYTES_PER_ENTRY);
+        let mut aaaa: HashMap<String, Addrs<Ipv6Addr>> = HashMap::new();
         // An editor may save the hosts file with a UTF-8 byte order mark (BOM),
         // which would otherwise fuse onto the first address token and make it
         // unparsable, dropping the first entry.
@@ -66,14 +107,13 @@ impl Hosts {
                 continue;
             };
             for name in fields {
-                let entry = by_name.entry(name.to_ascii_lowercase()).or_default();
                 match addr {
-                    IpAddr::V4(ip) => entry.a.push(ip),
-                    IpAddr::V6(ip) => entry.aaaa.push(ip),
+                    IpAddr::V4(ip) => a.entry(name.to_ascii_lowercase()).or_default().push(ip),
+                    IpAddr::V6(ip) => aaaa.entry(name.to_ascii_lowercase()).or_default().push(ip),
                 }
             }
         }
-        Self { by_name }
+        Self { a, aaaa }
     }
 
     /// Normalizes a query name to the hosts-file key form: lowercased, with any
@@ -84,14 +124,12 @@ impl Hosts {
 
     /// Returns the mapped IPv4 addresses for `name`, if any.
     pub(crate) fn lookup_ipv4(&self, name: &str) -> Option<Vec<Ipv4Addr>> {
-        let entry = self.by_name.get(&Self::normalize(name))?;
-        (!entry.a.is_empty()).then(|| entry.a.clone())
+        self.a.get(&Self::normalize(name))?.to_vec()
     }
 
     /// Returns the mapped IPv6 addresses for `name`, if any.
     pub(crate) fn lookup_ipv6(&self, name: &str) -> Option<Vec<Ipv6Addr>> {
-        let entry = self.by_name.get(&Self::normalize(name))?;
-        (!entry.aaaa.is_empty()).then(|| entry.aaaa.clone())
+        self.aaaa.get(&Self::normalize(name))?.to_vec()
     }
 
     /// Builds a hosts map directly from file content, for tests.
@@ -166,10 +204,16 @@ mod tests {
 
     #[test]
     fn multiple_addresses_accumulate() {
-        let hosts = Hosts::parse("10.0.0.1 host\n10.0.0.2 host\n");
+        // Three addresses, so the third exercises the push onto an already
+        // promoted list rather than only the promotion itself.
+        let hosts = Hosts::parse("10.0.0.1 host\n10.0.0.2 host\n10.0.0.3 host\n");
         assert_eq!(
             hosts.lookup_ipv4("host"),
-            Some(vec![Ipv4Addr::new(10, 0, 0, 1), Ipv4Addr::new(10, 0, 0, 2)])
+            Some(vec![
+                Ipv4Addr::new(10, 0, 0, 1),
+                Ipv4Addr::new(10, 0, 0, 2),
+                Ipv4Addr::new(10, 0, 0, 3)
+            ])
         );
     }
 
