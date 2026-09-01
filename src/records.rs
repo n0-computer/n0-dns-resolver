@@ -149,15 +149,17 @@ impl SvcbRecordData {
 
     /// Returns the application protocol identifiers from the `alpn` parameter.
     ///
-    /// Empty when the parameter is absent.
-    pub fn alpn(&self) -> Vec<String> {
+    /// Empty when the parameter is absent. Each identifier is allocated as it is
+    /// yielded, because `simple_dns` keeps them in a `CharacterString` that does
+    /// not expose its bytes; the other parameter accessors borrow or copy.
+    pub fn alpn(&self) -> impl Iterator<Item = String> + '_ {
         self.0
             .iter_params()
-            .find_map(|param| match param {
-                SVCParam::Alpn(ids) => Some(ids.iter().map(|id| id.to_string()).collect()),
+            .filter_map(|param| match param {
+                SVCParam::Alpn(ids) => Some(ids.iter().map(|id| id.to_string())),
                 _ => None,
             })
-            .unwrap_or_default()
+            .flatten()
     }
 
     /// Returns the port from the `port` parameter, if present.
@@ -171,27 +173,27 @@ impl SvcbRecordData {
     /// Returns the IPv4 addresses from the `ipv4hint` parameter.
     ///
     /// Empty when the parameter is absent.
-    pub fn ipv4hint(&self) -> Vec<Ipv4Addr> {
+    pub fn ipv4hint(&self) -> impl Iterator<Item = Ipv4Addr> + '_ {
         self.0
             .iter_params()
-            .find_map(|param| match param {
-                SVCParam::Ipv4Hint(ips) => Some(ips.iter().map(|ip| Ipv4Addr::from(*ip)).collect()),
+            .filter_map(|param| match param {
+                SVCParam::Ipv4Hint(ips) => Some(ips.iter().map(|ip| Ipv4Addr::from(*ip))),
                 _ => None,
             })
-            .unwrap_or_default()
+            .flatten()
     }
 
     /// Returns the IPv6 addresses from the `ipv6hint` parameter.
     ///
     /// Empty when the parameter is absent.
-    pub fn ipv6hint(&self) -> Vec<Ipv6Addr> {
+    pub fn ipv6hint(&self) -> impl Iterator<Item = Ipv6Addr> + '_ {
         self.0
             .iter_params()
-            .find_map(|param| match param {
-                SVCParam::Ipv6Hint(ips) => Some(ips.iter().map(|ip| Ipv6Addr::from(*ip)).collect()),
+            .filter_map(|param| match param {
+                SVCParam::Ipv6Hint(ips) => Some(ips.iter().map(|ip| Ipv6Addr::from(*ip))),
                 _ => None,
             })
-            .unwrap_or_default()
+            .flatten()
     }
 
     /// Returns the Encrypted ClientHello (ECH) config list, if present.
@@ -199,9 +201,9 @@ impl SvcbRecordData {
     /// The bytes are the raw `ECHConfigList` from the `ech` parameter, returned
     /// for a TLS client to consume. RFC 9460 registers the parameter but leaves
     /// the value opaque to DNS.
-    pub fn ech(&self) -> Option<Vec<u8>> {
+    pub fn ech(&self) -> Option<&[u8]> {
         self.0.iter_params().find_map(|param| match param {
-            SVCParam::Ech(config) => Some(config.to_vec()),
+            SVCParam::Ech(config) => Some(config.as_ref()),
             _ => None,
         })
     }
@@ -211,14 +213,14 @@ impl SvcbRecordData {
     /// In ascending order, and empty when the parameter is absent. A client
     /// that does not understand every key listed here must treat the record as
     /// unusable (RFC 9460 Section 8).
-    pub fn mandatory(&self) -> Vec<u16> {
+    pub fn mandatory(&self) -> impl Iterator<Item = u16> + '_ {
         self.0
             .iter_params()
-            .find_map(|param| match param {
-                SVCParam::Mandatory(keys) => Some(keys.iter().copied().collect()),
+            .filter_map(|param| match param {
+                SVCParam::Mandatory(keys) => Some(keys.iter().copied()),
                 _ => None,
             })
-            .unwrap_or_default()
+            .flatten()
     }
 
     /// Returns whether the `no-default-alpn` parameter is set.
@@ -317,7 +319,7 @@ impl HttpsRecordData {
     /// Exactly as the record carries them, and empty when the parameter is
     /// absent. See [`Self::effective_alpn`] for the set with the HTTPS default
     /// applied.
-    pub fn alpn(&self) -> Vec<String> {
+    pub fn alpn(&self) -> impl Iterator<Item = String> + '_ {
         self.data.alpn()
     }
 
@@ -328,11 +330,15 @@ impl HttpsRecordData {
     /// the mechanism and Section 9.5 the `http/1.1` default. The default is not
     /// added when `http/1.1` is already listed. An AliasMode record describes no
     /// endpoint, so this is empty for it.
+    ///
+    /// Returns a `Vec` rather than an iterator, unlike [`Self::alpn`]: merging
+    /// the scheme default in requires knowing whether the record already lists
+    /// it, so the set cannot be produced lazily.
     pub fn effective_alpn(&self) -> Vec<String> {
         if self.is_alias() {
             return Vec::new();
         }
-        let mut protocols = self.data.alpn();
+        let mut protocols: Vec<String> = self.data.alpn().collect();
         if !self.data.no_default_alpn() && !protocols.iter().any(|p| p == "http/1.1") {
             protocols.push("http/1.1".to_string());
         }
@@ -341,16 +347,19 @@ impl HttpsRecordData {
 
     /// Returns whether this endpoint advertises HTTP/2 (ALPN `h2`).
     ///
-    /// Accounts for the HTTPS default ALPN.
+    /// Searches [`Self::alpn`] rather than [`Self::effective_alpn`]. The two
+    /// agree here, because the only identifier the effective set adds is the
+    /// `http/1.1` scheme default, and searching the raw list stops at the first
+    /// match instead of building the merged set.
     pub fn supports_http2(&self) -> bool {
-        self.effective_alpn().iter().any(|p| p == "h2")
+        !self.is_alias() && self.alpn().any(|protocol| protocol == "h2")
     }
 
     /// Returns whether this endpoint advertises HTTP/3 (ALPN `h3`).
     ///
-    /// Accounts for the HTTPS default ALPN.
+    /// Searches [`Self::alpn`] for the same reason as [`Self::supports_http2`].
     pub fn supports_http3(&self) -> bool {
-        self.effective_alpn().iter().any(|p| p == "h3")
+        !self.is_alias() && self.alpn().any(|protocol| protocol == "h3")
     }
 
     /// The port from the `port` parameter, if present.
@@ -359,24 +368,24 @@ impl HttpsRecordData {
     }
 
     /// The IPv4 address hints from the `ipv4hint` parameter.
-    pub fn ipv4hint(&self) -> Vec<Ipv4Addr> {
+    pub fn ipv4hint(&self) -> impl Iterator<Item = Ipv4Addr> + '_ {
         self.data.ipv4hint()
     }
 
     /// The IPv6 address hints from the `ipv6hint` parameter.
-    pub fn ipv6hint(&self) -> Vec<Ipv6Addr> {
+    pub fn ipv6hint(&self) -> impl Iterator<Item = Ipv6Addr> + '_ {
         self.data.ipv6hint()
     }
 
     /// The Encrypted ClientHello config list from the `ech` parameter, if present.
-    pub fn ech(&self) -> Option<Vec<u8>> {
+    pub fn ech(&self) -> Option<&[u8]> {
         self.data.ech()
     }
 
     /// Returns the SvcParamKeys the `mandatory` parameter marks as required.
     ///
     /// See RFC 9460 Section 8.
-    pub fn mandatory(&self) -> Vec<u16> {
+    pub fn mandatory(&self) -> impl Iterator<Item = u16> + '_ {
         self.data.mandatory()
     }
 
