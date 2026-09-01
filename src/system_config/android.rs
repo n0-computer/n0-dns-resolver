@@ -35,11 +35,11 @@ use jni::{
 use tracing::{trace, warn};
 
 #[cfg(target_os = "android")]
-use super::{DnsConfig, DnsProtocol, Hosts, Nameserver};
+use super::{Config, DnsProtocol, Hosts, Nameserver};
 
 /// Reads the active network's DNS configuration via JNI, plus the hosts file.
 #[cfg(target_os = "android")]
-pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
+pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
     match catch_unwind(AssertUnwindSafe(read_system_dns_jni)) {
         Ok(res) => res,
         Err(_) => Err(std::io::Error::other(
@@ -50,7 +50,7 @@ pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
 
 /// Reads the active network's DNS servers through JNI.
 #[cfg(target_os = "android")]
-fn read_system_dns_jni() -> Result<DnsConfig, std::io::Error> {
+fn read_system_dns_jni() -> Result<Config, std::io::Error> {
     let ctx = ndk_context::android_context();
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
     let nameservers = vm
@@ -138,7 +138,7 @@ fn read_system_dns_jni() -> Result<DnsConfig, std::io::Error> {
         })
         .map_err(|e: jni::errors::Error| std::io::Error::other(e.to_string()))?;
 
-    Ok(DnsConfig {
+    Ok(Config {
         nameservers,
         search_domains: Vec::new(),
         ndots: None,

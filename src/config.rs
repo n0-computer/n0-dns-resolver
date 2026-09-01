@@ -1,6 +1,6 @@
 //! The parsed DNS configuration.
 //!
-//! [`DnsConfig`] is the nameservers plus resolv.conf options the resolver runs
+//! [`Config`] is the nameservers plus resolv.conf options the resolver runs
 //! on. It is produced by the platform readers in [`crate::system_config`] and
 //! consumed by the resolver, so it lives in its own module rather than beside
 //! either one.

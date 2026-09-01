@@ -4,7 +4,7 @@
 //! SystemConfiguration framework on Apple platforms, the network adapters on
 //! Windows, and a Java Native Interface (JNI) call on Android. The per-platform
 //! readers live in the submodules; this module dispatches to them via
-//! [`read_system`]. The [`DnsConfig`] they produce lives in [`crate::config`].
+//! [`read_system`]. The [`Config`] they produce lives in [`crate::config`].
 
 use tracing::warn;
 
