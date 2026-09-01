@@ -15,7 +15,10 @@
 
 use std::{
     future::Future,
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU32, Ordering},
+    },
     time::{Duration, Instant},
 };
 
@@ -28,9 +31,10 @@ use hickory_resolver::{
 };
 use iroh_base::SecretKey;
 use n0_dns_resolver::DnsResolver;
+use n0_error::StdResultExt;
 use n0_future::time;
 use simple_dns::{CLASS, Name, Packet, ResourceRecord};
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Production DNS discovery origin (`iroh_dns::N0_DNS_ENDPOINT_ORIGIN_PROD`).
 const DNS_ORIGIN_PROD: &str = "dns.iroh.link.";
@@ -46,6 +50,7 @@ const RELAY_HOSTS: &[&str] = &[
 #[tokio::main(flavor = "current_thread")]
 async fn main() {
     tracing_subscriber::fmt::init();
+    debug!("start");
 
     let mut args = std::env::args().skip(1);
     let mut origin = args.next().unwrap_or_else(|| DNS_ORIGIN_PROD.to_string());
@@ -55,10 +60,13 @@ async fn main() {
     let z32s: Vec<String> = args.collect();
 
     let hickory = build_hickory_resolver();
+    debug!("hickory built");
     let n0 = DnsResolver::system_with_fallback();
+    debug!("n0 built");
     // Force the lazy system-config read so the first timed lookup does not
     // include it (hickory reads the config eagerly above).
     let _ = n0.configured_nameservers();
+    debug!("n0 init");
 
     let mut queries = Vec::new();
     for host in RELAY_HOSTS {
@@ -68,9 +76,13 @@ async fn main() {
         queries.push(Query::new(RecordType::TXT, format!("_iroh.{z32}.{origin}")));
     }
     if z32s.is_empty() {
-        let name = publish_iroh_txt(&origin).await;
-        wait_for_txt(&n0, &hickory, &name).await;
-        queries.push(Query::new(RecordType::TXT, name));
+        if let Ok(name) = publish_iroh_txt(&origin)
+            .await
+            .inspect_err(|err| warn!("pkarr PUT failed, skipping TXT query: {err:#}"))
+        {
+            wait_for_txt(&n0, &hickory, &name).await;
+            queries.push(Query::new(RecordType::TXT, name));
+        }
     }
 
     println!(
@@ -179,7 +191,15 @@ fn fmt_duration(duration: Duration) -> String {
     }
 }
 
+fn id() -> u32 {
+    static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
+    id
+}
+
+#[tracing::instrument(name = "query", skip_all, fields(r = %"n0", q=id()))]
 async fn lookup_n0(resolver: &DnsResolver, query: &Query) -> Outcome {
+    debug!("query {query}");
     let name = query.name.clone();
     let records: Result<Vec<String>, _> = match query.kind {
         RecordType::A => resolver
@@ -224,7 +244,9 @@ fn build_hickory_resolver() -> TokioResolver {
     builder.build().expect("config works")
 }
 
+#[tracing::instrument(name = "query", skip_all, fields(r = %"hi", q=id()))]
 async fn lookup_hickory(resolver: &TokioResolver, query: &Query) -> Outcome {
+    debug!("query {query}");
     match resolver.lookup(query.name.clone(), query.kind).await {
         Ok(lookup) => Outcome::records(
             lookup
@@ -246,7 +268,8 @@ async fn lookup_hickory(resolver: &TokioResolver, query: &Query) -> Outcome {
 
 /// Publish an `_iroh` TXT the same way default discovery does: a pkarr PUT to
 /// the relay served at `origin`. Returns the FQDN to look up.
-async fn publish_iroh_txt(origin: &str) -> String {
+async fn publish_iroh_txt(origin: &str) -> n0_error::Result<String> {
+    debug!("publishing pkarr TXT record to {origin}");
     const TXT_VALUE: &str = "relay=https://use1-1.relay.n0.iroh.link.";
 
     let secret = SecretKey::generate();
@@ -287,18 +310,20 @@ async fn publish_iroh_txt(origin: &str) -> String {
     let client = reqwest::Client::builder()
         .use_preconfigured_tls(tls)
         .build()
-        .expect("https client");
+        .std_context("Failed to build reqwest client")?;
 
     let url = format!("https://{}/pkarr/{z32}", origin.trim_end_matches('.'));
-    let status = client
+    let _res = client
         .put(&url)
         .body(body)
         .send()
         .await
-        .unwrap_or_else(|err| panic!("pkarr PUT {url}: {err}"))
-        .status();
-    assert!(status.is_success(), "pkarr PUT {url} failed: {status}");
-    format!("_iroh.{z32}.{origin}")
+        .with_std_context(|_| format!("pkarr PUT {url}: failed to receive response"))?
+        .error_for_status()
+        .with_std_context(|_| format!("pkarr PUT {url}: bad response"))?;
+    let name = format!("_iroh.{z32}.{origin}");
+    debug!("TXT record published under {name}");
+    Ok(name)
 }
 
 /// Waits until both resolvers see the freshly published TXT, then clears both
