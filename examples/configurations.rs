@@ -14,7 +14,7 @@
 use std::env;
 
 use n0_dns_resolver::{
-    DnsProtocol, DnsResolver, Error, FallbackMode, Nameserver,
+    DnsProtocol, DnsResolver, Error, FallbackMode, interleave_nameservers,
     public_resolvers::{self, Provider},
 };
 
@@ -56,8 +56,8 @@ async fn main() -> Result<(), Error> {
     // whenever it works, and unencrypted DNS is the last resort rather than the
     // first attempt.
     let providers = [Provider::Quad9, Provider::Cloudflare];
-    let encrypted = Nameserver::interleave(providers.map(|p| p.nameservers(DnsProtocol::Tls)));
-    let plain = Nameserver::interleave(providers.map(|p| p.nameservers(DnsProtocol::Udp)));
+    let encrypted = interleave_nameservers(providers.map(|p| p.nameservers(DnsProtocol::Tls)));
+    let plain = interleave_nameservers(providers.map(|p| p.nameservers(DnsProtocol::Udp)));
     let dot_first = DnsResolver::builder()
         .nameservers(encrypted)
         .fallback_nameservers(plain)

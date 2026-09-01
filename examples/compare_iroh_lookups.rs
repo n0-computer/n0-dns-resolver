@@ -58,7 +58,7 @@ async fn main() {
     let n0 = DnsResolver::system_with_fallback();
     // Force the lazy system-config read so the first timed lookup does not
     // include it (hickory reads the config eagerly above).
-    let _ = n0.nameservers();
+    let _ = n0.configured_nameservers();
 
     let mut queries = Vec::new();
     for host in RELAY_HOSTS {

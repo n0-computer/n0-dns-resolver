@@ -2,7 +2,7 @@
 //!
 //! [`Provider`] names one public resolver operator and hands out its
 //! nameservers, holding no ordering policy beyond "primary address first".
-//! [`Nameserver::interleave`] merges per-provider lists round-robin.
+//! [`interleave_nameservers`] merges per-provider lists round-robin.
 //! [`default_order`] is this crate's opinionated order for a selection of
 //! providers, and the one [`Builder::default_fallback_nameservers`] installs.
 //!
@@ -10,7 +10,7 @@
 //!
 //! ```
 //! use n0_dns_resolver::{
-//!     DnsProtocol, Nameserver,
+//!     DnsProtocol, interleave_nameservers,
 //!     public_resolvers::{self, Provider},
 //! };
 //!
@@ -18,7 +18,7 @@
 //! let servers = public_resolvers::default_order(vec![Provider::Quad9, Provider::Cloudflare]);
 //!
 //! // Or pick the transport and the order yourself: DNS-over-TLS only.
-//! let servers = Nameserver::interleave([
+//! let servers = interleave_nameservers([
 //!     Provider::Quad9.nameservers(DnsProtocol::Tls),
 //!     Provider::Cloudflare.nameservers(DnsProtocol::Tls),
 //! ]);
@@ -28,7 +28,7 @@
 
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 
-use crate::{DnsProtocol, Nameserver};
+use crate::{DnsProtocol, Nameserver, interleave_nameservers};
 
 /// A public DNS resolver operator.
 ///
@@ -81,10 +81,9 @@ impl Provider {
 
     /// Returns the provider's nameservers reachable over `protocol`.
     ///
-    /// Ordered IPv4 primary, IPv6 primary, IPv4 secondary, IPv6 secondary. All
-    /// three providers answer on every protocol this crate speaks, so the list
-    /// is always four entries long. It is empty for a provider that does not
-    /// offer `protocol`.
+    /// Ordered IPv4 primary, IPv6 primary, IPv4 secondary, IPv6 secondary.
+    /// Every provider answers on every protocol this crate speaks, so the list
+    /// holds all four of that provider's addresses.
     pub fn nameservers(self, protocol: DnsProtocol) -> Vec<Nameserver> {
         let [v4_primary, v4_secondary] = self.ipv4_addrs().map(IpAddr::V4);
         let [v6_primary, v6_secondary] = self.ipv6_addrs().map(IpAddr::V6);
@@ -101,7 +100,7 @@ impl Provider {
 /// [`Provider::ALL`]. It is one opinion rather than the only sensible one, and
 /// the pieces it is assembled from are public: a caller who disagrees can build
 /// their own order with [`Provider::nameservers`] and
-/// [`Nameserver::interleave`].
+/// [`interleave_nameservers`].
 ///
 /// Plain DNS across the providers, round-robin, comes first, because on a
 /// working network UDP answers in a few milliseconds. On a network that filters
@@ -122,7 +121,7 @@ impl Provider {
 pub fn default_order(providers: Vec<Provider>) -> Vec<Nameserver> {
     #[cfg_attr(not(transport_https), allow(unused_mut))]
     let mut servers =
-        Nameserver::interleave(providers.iter().map(|p| p.nameservers(DnsProtocol::Udp)));
+        interleave_nameservers(providers.iter().map(|p| p.nameservers(DnsProtocol::Udp)));
     // One DoH entry per provider, at the provider's primary IPv4 address,
     // placed just inside the first raced wave.
     #[cfg(transport_https)]

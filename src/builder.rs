@@ -103,7 +103,7 @@ impl Builder {
     /// [`Self::default_fallback_nameservers`]. Build the list for a selection
     /// of public resolvers with [`public_resolvers::default_order`], or
     /// assemble your own from [`Provider::nameservers`] and
-    /// [`Nameserver::interleave`].
+    /// [`interleave_nameservers`].
     ///
     /// [`Provider::nameservers`]: public_resolvers::Provider::nameservers
     #[must_use]
@@ -179,6 +179,7 @@ impl Builder {
     }
 
     /// Consumes the builder and returns the configured [`DnsResolver`].
+    #[must_use]
     pub fn build(self) -> DnsResolver {
         DnsResolver::from_builder(self)
     }
@@ -214,6 +215,46 @@ pub enum FallbackMode {
     Deferred,
 }
 
+/// Merges nameserver lists round-robin.
+///
+/// Takes every list's first entry, then every list's second, and so on,
+/// skipping lists that have run out. Nameserver order is query order, so
+/// interleaving per-provider lists spreads the early attempts across providers
+/// instead of exhausting one provider before trying the next. No other policy
+/// is applied. For this crate's opinionated order over the public resolvers,
+/// see [`public_resolvers::default_order`].
+///
+/// # Examples
+///
+/// ```
+/// use n0_dns_resolver::{DnsProtocol, interleave_nameservers, public_resolvers::Provider};
+///
+/// // DNS-over-TLS to Quad9 and Cloudflare, alternating between them.
+/// let servers = interleave_nameservers([
+///     Provider::Quad9.nameservers(DnsProtocol::Tls),
+///     Provider::Cloudflare.nameservers(DnsProtocol::Tls),
+/// ]);
+/// ```
+pub fn interleave_nameservers<L>(lists: impl IntoIterator<Item = L>) -> Vec<Nameserver>
+where
+    L: IntoIterator<Item = Nameserver>,
+{
+    // Fused so that a list which has run dry stays dry, whatever the caller's
+    // iterator does after returning `None`.
+    let mut lists: Vec<_> = lists.into_iter().map(|l| l.into_iter().fuse()).collect();
+    // Each round takes one entry from every list that still has one, so the
+    // rounds shrink as lists run out and an empty round ends the merge.
+    std::iter::repeat_with(|| {
+        lists
+            .iter_mut()
+            .filter_map(Iterator::next)
+            .collect::<Vec<_>>()
+    })
+    .take_while(|round| !round.is_empty())
+    .flatten()
+    .collect()
+}
+
 /// A nameserver to query: an address, a transport, and an optional TLS name.
 ///
 /// The connection is always made to the address. When a TLS server name is set
@@ -238,46 +279,6 @@ impl Nameserver {
             #[cfg(any(with_rustls, doc))]
             server_name: None,
         }
-    }
-
-    /// Merges nameserver lists round-robin.
-    ///
-    /// Takes every list's first entry, then every list's second, and so on,
-    /// skipping lists that have run out. Nameserver order is query order, so
-    /// interleaving per-provider lists spreads the early attempts across
-    /// providers instead of exhausting one provider before trying the next. No
-    /// other policy is applied. For this crate's opinionated order over the
-    /// public resolvers, see [`public_resolvers::default_order`].
-    ///
-    /// # Examples
-    ///
-    /// ```
-    /// use n0_dns_resolver::{DnsProtocol, Nameserver, public_resolvers::Provider};
-    ///
-    /// // DNS-over-TLS to Quad9 and Cloudflare, alternating between them.
-    /// let servers = Nameserver::interleave([
-    ///     Provider::Quad9.nameservers(DnsProtocol::Tls),
-    ///     Provider::Cloudflare.nameservers(DnsProtocol::Tls),
-    /// ]);
-    /// ```
-    pub fn interleave<L>(lists: impl IntoIterator<Item = L>) -> Vec<Nameserver>
-    where
-        L: IntoIterator<Item = Nameserver>,
-    {
-        // Fused so that a list which has run dry stays dry, whatever the
-        // caller's iterator does after returning `None`.
-        let mut lists: Vec<_> = lists.into_iter().map(|l| l.into_iter().fuse()).collect();
-        // Each round takes one entry from every list that still has one, so the
-        // rounds shrink as lists run out and an empty round ends the merge.
-        std::iter::repeat_with(|| {
-            lists
-                .iter_mut()
-                .filter_map(Iterator::next)
-                .collect::<Vec<_>>()
-        })
-        .take_while(|round| !round.is_empty())
-        .flatten()
-        .collect()
     }
 
     /// Returns the address this nameserver is queried at.

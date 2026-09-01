@@ -1069,7 +1069,7 @@ impl DnsResolver {
     /// explicitly added nameservers, followed by the fallback tier unless
     /// [`FallbackMode`] excluded it. The first call builds the resolver's
     /// state, which reads the host's DNS configuration.
-    pub fn nameservers(&self) -> Vec<Nameserver> {
+    pub fn configured_nameservers(&self) -> Vec<Nameserver> {
         self.state().config.nameservers.clone()
     }
 

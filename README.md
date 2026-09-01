@@ -36,7 +36,7 @@ It does not perform DNSSEC validation.
 
 ```rust,no_run
 use n0_dns_resolver::{
-    DnsProtocol, DnsResolver, Nameserver,
+    DnsProtocol, DnsResolver, Nameserver, interleave_nameservers,
     public_resolvers::{self, Provider},
 };
 
@@ -65,7 +65,7 @@ let resolver = DnsResolver::builder()
 // Or assemble the list yourself: DNS-over-TLS to both, alternating between
 // them. `default_order` is one opinion, built from these same public pieces.
 let resolver = DnsResolver::builder()
-    .nameservers(Nameserver::interleave([
+    .nameservers(interleave_nameservers([
         Provider::Quad9.nameservers(DnsProtocol::Tls),
         Provider::Cloudflare.nameservers(DnsProtocol::Tls),
     ]))

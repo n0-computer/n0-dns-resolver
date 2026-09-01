@@ -35,7 +35,7 @@ mod tests;
 #[cfg(any(target_os = "android", doc))]
 pub use self::system_config::install_android_jni_context;
 pub use self::{
-    builder::{Builder, DnsProtocol, FallbackMode, Nameserver},
+    builder::{Builder, DnsProtocol, FallbackMode, Nameserver, interleave_nameservers},
     error::{Error, ResponseCode},
     records::{
         CaaRecordData, HttpsRecord, MxRecordData, Record, RecordKind, SrvRecordData,
