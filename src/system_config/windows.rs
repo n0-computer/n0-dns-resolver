@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-use super::{DNS_PORT, DnsConfig, DnsProtocol, Hosts, Nameserver};
+use super::{Config, DnsProtocol, Hosts, Nameserver};
 
 /// Deprecated IPv6 site-local anycast addresses still configured by Windows.
 ///
@@ -20,7 +20,7 @@ const WINDOWS_BAD_SITE_LOCAL_DNS_SERVERS: [IpAddr; 3] = [
 
 /// Reads the DNS servers from the Windows network adapter configuration, plus
 /// the hosts file.
-pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
+pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
     let adapters = ipconfig::get_adapters().map_err(std::io::Error::other)?;
 
     let mut servers = Vec::new();
@@ -33,7 +33,7 @@ pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
             let ip = IpAddr::from(*dns_server);
             if !WINDOWS_BAD_SITE_LOCAL_DNS_SERVERS.contains(&ip) {
                 servers.push(Nameserver::new(
-                    SocketAddr::new(ip, DNS_PORT),
+                    SocketAddr::new(ip, DnsProtocol::Udp.port()),
                     DnsProtocol::Udp,
                 ));
             }
@@ -63,7 +63,7 @@ pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
         search_domains
     };
 
-    Ok(DnsConfig {
+    Ok(Config {
         nameservers: servers,
         search_domains,
         ndots: None,

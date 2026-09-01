@@ -35,11 +35,11 @@ use jni::{
 use tracing::{trace, warn};
 
 #[cfg(target_os = "android")]
-use super::{DNS_PORT, DnsConfig, DnsProtocol, Hosts, Nameserver};
+use super::{Config, DnsProtocol, Hosts, Nameserver};
 
 /// Reads the active network's DNS configuration via JNI, plus the hosts file.
 #[cfg(target_os = "android")]
-pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
+pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
     match catch_unwind(AssertUnwindSafe(read_system_dns_jni)) {
         Ok(res) => res,
         Err(_) => Err(std::io::Error::other(
@@ -50,7 +50,7 @@ pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
 
 /// Reads the active network's DNS servers through JNI.
 #[cfg(target_os = "android")]
-fn read_system_dns_jni() -> Result<DnsConfig, std::io::Error> {
+fn read_system_dns_jni() -> Result<Config, std::io::Error> {
     let ctx = ndk_context::android_context();
     let vm = unsafe { jni::JavaVM::from_raw(ctx.vm().cast()) };
     let nameservers = vm
@@ -128,7 +128,7 @@ fn read_system_dns_jni() -> Result<DnsConfig, std::io::Error> {
                     }
                 };
                 nameservers.push(Nameserver::new(
-                    SocketAddr::new(ip, DNS_PORT),
+                    SocketAddr::new(ip, DnsProtocol::Udp.port()),
                     DnsProtocol::Udp,
                 ));
             }
@@ -138,7 +138,7 @@ fn read_system_dns_jni() -> Result<DnsConfig, std::io::Error> {
         })
         .map_err(|e: jni::errors::Error| std::io::Error::other(e.to_string()))?;
 
-    Ok(DnsConfig {
+    Ok(Config {
         nameservers,
         search_domains: Vec::new(),
         ndots: None,
@@ -152,8 +152,13 @@ fn read_system_dns_jni() -> Result<DnsConfig, std::io::Error> {
 /// `JavaVM` and Application Context to Rust code so that we can use JNI.
 /// This is required to get the configured nameservers on Android.
 ///
-/// If this function is not called, fetching the configured nameservers will fail
-/// and the default [`DnsResolver`] will use fallback nameservers instead.
+/// If this function is not called, fetching the configured nameservers will
+/// fail, and a resolver built with [`Builder::use_system_config`] falls back to
+/// whatever its fallback tier holds. For [`DnsResolver::system_with_fallback`]
+/// that is the public resolvers.
+///
+/// [`Builder::use_system_config`]: crate::Builder::use_system_config
+/// [`DnsResolver::system_with_fallback`]: crate::DnsResolver::system_with_fallback
 ///
 /// If you call [`ndk_context::initialize_android_context`] already somewhere
 /// up the stack in your app, or use a crate like `ndk-glue` or `android-activity`

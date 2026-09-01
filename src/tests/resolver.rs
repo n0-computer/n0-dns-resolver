@@ -6,11 +6,12 @@ use std::{net::Ipv4Addr, time::Duration};
 use simple_dns::RCODE;
 
 use super::{a, caa, cname, mx, ns, qname, reply, resolver_for, spawn_mock, srv, txt};
-use crate::{DnsProtocol, DnsResolver, Record, RecordKind};
+use crate::{DnsProtocol, DnsResolver, Nameserver, Record, RecordKind};
 
-/// A CNAME that only the second query resolves: the first response carries the
-/// CNAME alone, so the resolver follows it and queries the target name, which
-/// then answers with an address.
+/// A CNAME that only the second query resolves.
+///
+/// The first response carries the CNAME alone, so the resolver follows it and
+/// queries the target name, which then answers with an address.
 ///
 /// Modeled on hickory-resolver `caching_client.rs::test_multi_hop_cname_preserves_final_sections`,
 /// which walks a CNAME chain to the record at its end.
@@ -38,9 +39,10 @@ async fn cname_chain_resolves_across_hops() {
     assert_eq!(server.query_count(), 2, "one query per CNAME hop");
 }
 
-/// A record attached to an intermediate name in the CNAME chain, not the query
-/// name or the final canonical name, is still collected, the way a recursive
-/// resolver extracts from the whole chain in a single response.
+/// A record on an intermediate name in the CNAME chain is still collected.
+///
+/// The name is neither the query name nor the final canonical name, but a
+/// recursive resolver extracts from the whole chain in a single response.
 ///
 /// Modeled on hickory-resolver `caching_client.rs::test_multi_hop_cname_preserves_final_sections`,
 /// exercised end-to-end.
@@ -75,9 +77,10 @@ async fn records_attach_to_intermediate_cname_name() {
     );
 }
 
-/// A NoError response with no matching records is NODATA: the name exists but
-/// has no records of the requested kind, so the lookup returns an empty result
-/// rather than an error.
+/// A NoError response with no matching records is NODATA, not an error.
+///
+/// The name exists but has no records of the requested kind, so the lookup
+/// returns an empty result.
 ///
 /// Modeled on hickory-resolver `caching_client.rs::test_empty_cache`, where an
 /// empty answer surfaces as a no-records outcome under NoError.
@@ -116,8 +119,9 @@ async fn negative_results_are_not_cached_by_default() {
     );
 }
 
-/// A negative (NODATA) result is cached, so a second lookup for the same name is
-/// served from the cache and never reaches the nameserver.
+/// A cached NODATA result answers the second lookup without another query.
+///
+/// The negative is served from the cache and never reaches the nameserver.
 ///
 /// Modeled on hickory-resolver `caching_client.rs::test_from_cache`, where a
 /// cached result answers the second lookup without another query.
@@ -127,10 +131,8 @@ async fn negative_caching_collapses_second_lookup() {
 
     // Negative caching is off by default; enable it for this scenario.
     let resolver = DnsResolver::builder()
-        .without_system_defaults()
-        .disable_fallback()
         .negative_max_ttl(Duration::from_secs(30))
-        .nameserver(server.addr(), DnsProtocol::Udp)
+        .nameserver(Nameserver::new(server.addr(), DnsProtocol::Udp))
         .build();
     for _ in 0..2 {
         let records = resolver
@@ -147,8 +149,10 @@ async fn negative_caching_collapses_second_lookup() {
     );
 }
 
-/// Search-list expansion walks the search domains, skips a suffix that does not
-/// resolve, and falls through to the bare name, which answers.
+/// Search-list expansion falls through to the bare name.
+///
+/// It walks the search domains, skips a suffix that does not resolve, and
+/// reaches the bare name, which answers.
 ///
 /// Modeled on hickory-resolver `resolver.rs::search_list_test`, which loops over
 /// the search list past a non-resolving suffix to reach a name that answers.
@@ -183,10 +187,11 @@ async fn search_list_expansion_reaches_bare_name() {
     assert_eq!(addrs, [Ipv4Addr::new(10, 1, 1, 1)]);
 }
 
-/// When the intended (bare) name is NXDOMAIN but an appended search candidate
-/// is NODATA, the bare name's NXDOMAIN wins. The first authoritative negative in
-/// search order is the answer, so an appended candidate's empty result never
-/// masks a name that genuinely does not exist.
+/// A bare name's NXDOMAIN wins over an appended candidate's NODATA.
+///
+/// The first authoritative negative in search order is the answer, so an
+/// appended candidate's empty result never masks a name that genuinely does not
+/// exist.
 ///
 /// Guards the negative-answer precedence in [`DnsResolver::lookup_record`]
 /// against a regression found in adversarial review, where any NODATA across the
@@ -222,10 +227,12 @@ async fn bare_nxdomain_wins_over_appended_nodata() {
     );
 }
 
-/// A transient failure (SERVFAIL) on one search candidate must not let a later
-/// candidate's negative answer be cached: we never learned whether the flaky
-/// name exists, so pinning the queried name as absent would suppress it once the
-/// failure clears. The second lookup must reach the network again.
+/// A transient failure on one search candidate blocks negative caching.
+///
+/// After a SERVFAIL we never learned whether the flaky name exists, so caching
+/// a later candidate's negative answer would pin the queried name as absent and
+/// suppress it once the failure clears. The second lookup must reach the
+/// network again.
 ///
 /// Guards the no-cache-on-indeterminate rule in
 /// [`DnsResolver::lookup_record`], added after adversarial review.
@@ -356,8 +363,9 @@ async fn caa_lookup_end_to_end() {
     assert_eq!(&*data.value, b"letsencrypt.org");
 }
 
-/// An NS lookup returns the nameserver name via the generic
-/// [`DnsResolver::lookup_record`] path.
+/// An NS lookup returns the nameserver name.
+///
+/// The lookup goes through the generic [`DnsResolver::lookup_record`] path.
 ///
 /// Modeled on hickory-resolver `caching_client.rs::test_single_ns_query_response`.
 ///

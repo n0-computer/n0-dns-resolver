@@ -28,7 +28,7 @@ use simple_dns::{
 };
 use tokio::{net::UdpSocket, task::JoinHandle};
 
-use crate::{DnsProtocol, DnsResolver};
+use crate::{DnsProtocol, DnsResolver, Nameserver};
 
 /// TTL, in seconds, stamped on every answer the mock nameserver returns.
 const ANSWER_TTL: u32 = 300;
@@ -64,8 +64,9 @@ impl MockServer {
     }
 }
 
-/// Binds a mock UDP nameserver on a loopback port and answers each query with
-/// the bytes `handler` returns for it.
+/// Binds a mock UDP nameserver on a loopback port.
+///
+/// Each query is answered with the bytes `handler` returns for it.
 ///
 /// `handler` receives the parsed query packet and returns the response bytes to
 /// send, or `None` to drop the query without replying. Build the response with
@@ -102,18 +103,19 @@ where
     }
 }
 
-/// Builds a resolver that queries only `addr` over UDP, with no system defaults
-/// and no fallback tier, so the lookup is hermetic and hits only the mock.
+/// Builds a resolver that queries only `addr` over UDP. A default builder adds
+/// no system config and no fallback tier, so the lookup is hermetic and hits
+/// only the mock.
 pub(crate) fn resolver_for(addr: SocketAddr) -> DnsResolver {
     DnsResolver::builder()
-        .without_system_defaults()
-        .disable_fallback()
-        .nameserver(addr, DnsProtocol::Udp)
+        .nameserver(Nameserver::new(addr, DnsProtocol::Udp))
         .build()
 }
 
-/// Builds response bytes for `query`: echoes its question, sets `rcode`, and
-/// attaches `answers` to the answer section.
+/// Builds response bytes for `query`.
+///
+/// Echoes the question, sets `rcode`, and attaches `answers` to the answer
+/// section.
 ///
 /// The question echo is what [`crate::resolver`] validates the response against,
 /// so a reply built here passes the id, question, and class checks.

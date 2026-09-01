@@ -41,8 +41,10 @@ pub enum Error {
         /// The hostname that could not be used as a DNS name.
         name: String,
     },
-    /// A DNS-over-TLS or DNS-over-HTTPS nameserver was configured without a TLS
-    /// client config, and none could be built from a crypto provider.
+    /// A DoT or DoH nameserver was configured without a TLS client config.
+    ///
+    /// None could be built from a crypto provider either, so the query has no
+    /// TLS settings to run with.
     #[error("no TLS config for DNS-over-TLS or DNS-over-HTTPS")]
     MissingTlsConfig {},
     /// A network or transport-level failure while talking to a nameserver.

@@ -91,8 +91,9 @@ pub(super) fn build_query(host: &str, qtype: TYPE) -> Result<(u16, Vec<u8>), Que
     Ok((id, bytes))
 }
 
-/// Returns the RCODE if `data` is a failure that warrants trying another
-/// nameserver (SERVFAIL, REFUSED, or FORMERR), otherwise `None`.
+/// Returns the RCODE if `data` is a failure worth trying another nameserver for.
+///
+/// Those are SERVFAIL, REFUSED, and FORMERR. Any other response yields `None`.
 ///
 /// SERVFAIL and REFUSED mean the server cannot answer for the name. A FORMERR
 /// means it rejected the query itself, usually the EDNS(0) OPT record; the
@@ -156,8 +157,10 @@ pub(super) fn negative_ttl(data: &[u8]) -> Option<u32> {
 /// Maximum CNAME chain depth to prevent infinite loops.
 pub(super) const MAX_CNAME_DEPTH: usize = 8;
 
-/// Returns every name in the CNAME chain starting at `start_name`: the start
-/// name, then each CNAME target, ending at the final canonical name.
+/// Returns every name in the CNAME chain starting at `start_name`.
+///
+/// The start name comes first, then each CNAME target, ending at the final
+/// canonical name.
 ///
 /// Records of the queried type can be attached to any name along the chain, not
 /// just the final one, so extraction matches against the whole chain the way a
@@ -190,8 +193,10 @@ fn resolve_cname_chain<'a>(packet: &'a Packet<'a>, start_name: &Name<'a>) -> Nam
     chain.pop().unwrap_or_else(|| start_name.clone())
 }
 
-/// Returns the CNAME target for a query name, if the response contains a CNAME
-/// but no final records of the requested type for that name.
+/// Returns the CNAME target for a query name, if the chain is unresolved.
+///
+/// That is the case when the response carries a CNAME but no records of the
+/// requested type for that name.
 ///
 /// This is used for recursive CNAME following: when the server returns only a
 /// CNAME without the final record, the caller issues a new query for the target.
@@ -950,8 +955,10 @@ mod tests {
     const TYPE_SVCB: u16 = 64;
     const TYPE_HTTPS: u16 = 65;
 
-    /// Assembles a minimal DNS response with one question and one answer, giving
-    /// a test full control over the answer's raw name bytes, type, and rdata.
+    /// Assembles a minimal DNS response with one question and one answer.
+    ///
+    /// Gives a test full control over the answer's raw name bytes, type, and
+    /// rdata.
     ///
     /// The builder in `simple_dns` will not emit malformed or non-canonical wire
     /// forms, so tests that need RFC Appendix D rdata vectors, a wrong rdlength,

@@ -9,13 +9,14 @@ yet fully-featured DNS resolver. It does not perform recursive resolution.
 
 ## Features
 
-- Reads the system DNS configuration: `/etc/resolv.conf` on Unix, the
-  SystemConfiguration framework on Apple platforms, the network adapters on
+- Reads the system DNS configuration on request: `/etc/resolv.conf` on Unix,
+  the SystemConfiguration framework on Apple platforms, the network adapters on
   Windows, and a JNI call on Android. The system nameservers form a primary
-  tier; a fallback tier of public resolvers (Cloudflare, Google, Quad9) is
-  queried only when the primary tier cannot answer.
+  tier. Behind it sits a fallback tier, either the public resolvers
+  (Cloudflare, Google, Quad9) or your own, queried only when the primary tier
+  cannot answer.
 - Consults the system hosts file (`/etc/hosts` and the Windows equivalent)
-  ahead of the network.
+  ahead of the network, when the system configuration is read.
 - Resolves A, AAAA, TXT, NS, SRV, MX, CAA, SVCB, and HTTPS records, follows
   `CNAME` chains, and applies `search`/`ndots` expansion.
 - Caches positive results by TTL. Negative caching (NODATA, NXDOMAIN) is off
@@ -34,31 +35,52 @@ It does not perform DNSSEC validation.
 ## Usage
 
 ```rust,no_run
-use std::net::SocketAddr;
-
-use n0_dns_resolver::{DnsProtocol, DnsResolver};
+use n0_dns_resolver::{
+    DnsProtocol, DnsResolver, Nameserver, interleave_nameservers,
+    public_resolvers::{self, Provider},
+};
 
 # async fn run() -> Result<(), n0_dns_resolver::Error> {
 // Cross-platform defaults: the system configuration, then the public-resolver
-// fallback.
-let resolver = DnsResolver::new();
+// fallback. This is the only constructor; everything else goes through the
+// builder.
+let resolver = DnsResolver::system_with_fallback();
 let addrs: Vec<_> = resolver.lookup_ipv4("example.com".to_string()).await?.collect();
 
-// Or query a single explicit nameserver, with no system config and no fallback.
-let ns: SocketAddr = "1.1.1.1:53".parse().unwrap();
+// The builder starts empty, with no system configuration and no nameservers,
+// so each source is added explicitly. Here it is a single nameserver.
+let ns = Nameserver::new("1.1.1.1:53".parse().unwrap(), DnsProtocol::Udp);
+let resolver = DnsResolver::builder().nameserver(ns).build();
+
+// The system configuration, with Quad9 and Cloudflare (but not Google) behind
+// it as a fallback tier.
 let resolver = DnsResolver::builder()
-    .without_system_defaults()
-    .disable_fallback()
-    .nameserver(ns, DnsProtocol::Udp)
+    .use_system_config()
+    .fallback_nameservers(public_resolvers::default_order(vec![
+        Provider::Quad9,
+        Provider::Cloudflare,
+    ]))
+    .build();
+
+// Or assemble the list yourself: DNS-over-TLS to both, alternating between
+// them. `default_order` is one opinion, built from these same public pieces.
+let resolver = DnsResolver::builder()
+    .nameservers(interleave_nameservers([
+        Provider::Quad9.nameservers(DnsProtocol::Tls),
+        Provider::Cloudflare.nameservers(DnsProtocol::Tls),
+    ]))
     .build();
 # Ok(())
 # }
 ```
 
+See `examples/configurations.rs` for these and other setups side by side.
+
 By default the fallback tier is used only when the primary nameservers fail or
-time out. Change that on the builder: `always_use_fallback` races the
-fallback alongside the primary servers, `disable_fallback` removes it, and
-`fallback_nameservers` replaces the default public resolvers with your own.
+time out. `Builder::fallback_mode` changes that: `FallbackMode::Eager` races
+the fallback alongside the primary servers, and `FallbackMode::IfSystemEmpty`
+uses it only when the system configuration yielded no nameservers. To query no
+fallback at all, add none.
 
 ## Feature flags
 
