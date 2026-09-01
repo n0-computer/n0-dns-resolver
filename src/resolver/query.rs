@@ -9,7 +9,7 @@ use simple_dns::{
 };
 
 use crate::{
-    CaaRecordData, HttpsRecord, MxRecordData, Record, RecordKind, ResponseCode, SrvRecordData,
+    CaaRecordData, HttpsRecordData, MxRecordData, Record, RecordKind, ResponseCode, SrvRecordData,
     SvcbRecordData, TxtRecordData,
 };
 
@@ -342,7 +342,7 @@ pub(super) fn parse_records(
             _ => None,
         }),
         RecordKind::Https => parse_response(data, |name, rdata| match rdata {
-            RData::HTTPS(https) => Some(Record::Https(HttpsRecord::new(
+            RData::HTTPS(https) => Some(Record::Https(HttpsRecordData::new(
                 name.to_string(),
                 extract_svcb(&https.0),
             ))),
@@ -865,13 +865,13 @@ mod tests {
         assert_sample_svcb(https.svcb());
     }
 
-    /// The [`HttpsRecord`] helpers apply the RFC 9460 rules a raw parameter read
+    /// The [`HttpsRecordData`] helpers apply the RFC 9460 rules a raw parameter read
     /// would miss: AliasMode vs ServiceMode, the root-target-uses-owner rule
     /// (Section 2.5.2), and the default `http/1.1` ALPN (Sections 7.1.1 and 9.5).
     #[test]
     fn https_record_helpers() {
         // Parse one HTTPS record from raw rdata; the owner is EXAMPLE_WIRE.
-        fn https(rdata: &[u8]) -> HttpsRecord {
+        fn https(rdata: &[u8]) -> HttpsRecordData {
             let resp = raw_response(TYPE_HTTPS, EXAMPLE_WIRE, EXAMPLE_WIRE, TYPE_HTTPS, rdata);
             let (records, _) = parse_records(&resp, RecordKind::Https).expect("vector parses");
             match records.as_slice() {
@@ -885,7 +885,7 @@ mod tests {
         let svc = https(b"\x00\x01\x00\x00\x01\x00\x03\x02h2");
         assert!(svc.is_service() && !svc.is_alias());
         assert_eq!(svc.alpn(), ["h2"]);
-        assert_eq!(svc.alpn_protocols(), ["h2", "http/1.1"]);
+        assert_eq!(svc.effective_alpn(), ["h2", "http/1.1"]);
         assert!(svc.supports_http2());
         assert!(!svc.supports_http3());
         assert_eq!(svc.effective_target(), "example.com");
@@ -893,12 +893,12 @@ mod tests {
         // no-default-alpn suppresses the http/1.1 default.
         let no_default = https(b"\x00\x01\x00\x00\x01\x00\x03\x02h2\x00\x02\x00\x00");
         assert!(no_default.no_default_alpn());
-        assert_eq!(no_default.alpn_protocols(), ["h2"]);
+        assert_eq!(no_default.effective_alpn(), ["h2"]);
 
         // AliasMode (priority 0): no endpoint, so no ALPN; the target is used as-is.
         let alias = https(b"\x00\x00\x03svc\x07example\x03com\x00");
         assert!(alias.is_alias());
-        assert!(alias.alpn_protocols().is_empty());
+        assert!(alias.effective_alpn().is_empty());
         assert_eq!(alias.effective_target(), "svc.example.com");
     }
 

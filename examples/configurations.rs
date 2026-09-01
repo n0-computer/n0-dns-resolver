@@ -81,11 +81,8 @@ async fn main() -> Result<(), Error> {
     ];
 
     for (label, resolver) in resolvers {
-        match resolver.lookup_ipv4(host.clone()).await {
-            Ok(addrs) => {
-                let addrs: Vec<_> = addrs.collect();
-                println!("{label:<32} {addrs:?}");
-            }
+        match resolver.lookup_ipv4(&host).await {
+            Ok(addrs) => println!("{label:<32} {addrs:?}"),
             Err(err) => println!("{label:<32} failed: {err:#}"),
         }
     }

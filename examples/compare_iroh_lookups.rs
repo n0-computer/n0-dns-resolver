@@ -205,15 +205,15 @@ async fn lookup_n0(resolver: &DnsResolver, query: &Query) -> Outcome {
         RecordType::A => resolver
             .lookup_ipv4(name)
             .await
-            .map(|addrs| addrs.map(|addr| addr.to_string()).collect()),
+            .map(|addrs| addrs.iter().map(|addr| addr.to_string()).collect()),
         RecordType::AAAA => resolver
             .lookup_ipv6(name)
             .await
-            .map(|addrs| addrs.map(|addr| addr.to_string()).collect()),
+            .map(|addrs| addrs.iter().map(|addr| addr.to_string()).collect()),
         RecordType::TXT => resolver
             .lookup_txt(name)
             .await
-            .map(|records| records.map(|txt| txt_repr(txt.iter())).collect()),
+            .map(|records| records.iter().map(|txt| txt_repr(txt.iter())).collect()),
         kind => unreachable!("unsupported record type {kind}"),
     };
     match records {

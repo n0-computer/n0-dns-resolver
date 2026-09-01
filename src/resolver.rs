@@ -22,7 +22,7 @@ use tracing::{debug, trace};
 #[cfg(test)]
 use crate::system_config::Hosts;
 use crate::{
-    Builder, DnsProtocol, Error, FallbackMode, HttpsRecord, MxRecordData, Nameserver, Record,
+    Builder, DnsProtocol, Error, FallbackMode, HttpsRecordData, MxRecordData, Nameserver, Record,
     RecordKind, SrvRecordData, SvcbRecordData, TxtRecordData, config::Config, system_config,
 };
 
@@ -740,9 +740,10 @@ impl DnsResolver {
     /// [`Error`] variants when every nameserver fails to answer.
     pub async fn lookup_record(
         &self,
-        name: String,
+        name: impl Into<String>,
         kind: RecordKind,
     ) -> Result<Vec<Record>, Error> {
+        let name = name.into();
         match self.cache.get(&name, kind) {
             Some(CachedResult::Positive(records)) => {
                 trace!(%name, records = records.len(), ?kind, "cache hit");
@@ -886,28 +887,24 @@ impl DnsResolver {
         }
     }
 
-    /// Looks up the IPv4 (A) records for `host`.
-    pub async fn lookup_ipv4(
-        &self,
-        host: String,
-    ) -> Result<impl Iterator<Item = Ipv4Addr> + use<>, Error> {
+    /// Looks up the IPv4 (A) records for `name`.
+    pub async fn lookup_ipv4(&self, name: impl Into<String>) -> Result<Vec<Ipv4Addr>, Error> {
+        let name = name.into();
         // RFC 6761: localhost always resolves to loopback.
-        if is_localhost(&host) {
-            return Ok(vec![Ipv4Addr::LOCALHOST].into_iter());
+        if is_localhost(&name) {
+            return Ok(vec![Ipv4Addr::LOCALHOST]);
         }
         // A hosts-file entry overrides DNS, so check it ahead of the cache.
         if let Some(addrs) = self
-            .search_names(&host)
+            .search_names(&name)
             .iter()
             .find_map(|name| self.state().config.hosts.lookup_ipv4(name))
         {
-            trace!(%host, ?addrs, "resolved from hosts file");
-            return Ok(addrs.into_iter());
+            trace!(%name, ?addrs, "resolved from hosts file");
+            return Ok(addrs);
         }
-        // Collect into a `Vec` so this path returns the same iterator type as the
-        // localhost and hosts-file short-circuits above.
         let addrs: Vec<Ipv4Addr> = self
-            .lookup_record(host, RecordKind::A)
+            .lookup_record(name, RecordKind::A)
             .await?
             .into_iter()
             .filter_map(|r| match r {
@@ -915,31 +912,27 @@ impl DnsResolver {
                 _ => None,
             })
             .collect();
-        Ok(addrs.into_iter())
+        Ok(addrs)
     }
 
-    /// Looks up the IPv6 (AAAA) records for `host`.
-    pub async fn lookup_ipv6(
-        &self,
-        host: String,
-    ) -> Result<impl Iterator<Item = Ipv6Addr> + use<>, Error> {
+    /// Looks up the IPv6 (AAAA) records for `name`.
+    pub async fn lookup_ipv6(&self, name: impl Into<String>) -> Result<Vec<Ipv6Addr>, Error> {
+        let name = name.into();
         // RFC 6761: localhost always resolves to loopback.
-        if is_localhost(&host) {
-            return Ok(vec![Ipv6Addr::LOCALHOST].into_iter());
+        if is_localhost(&name) {
+            return Ok(vec![Ipv6Addr::LOCALHOST]);
         }
         // A hosts-file entry overrides DNS, so check it ahead of the cache.
         if let Some(addrs) = self
-            .search_names(&host)
+            .search_names(&name)
             .iter()
             .find_map(|name| self.state().config.hosts.lookup_ipv6(name))
         {
-            trace!(%host, ?addrs, "resolved from hosts file");
-            return Ok(addrs.into_iter());
+            trace!(%name, ?addrs, "resolved from hosts file");
+            return Ok(addrs);
         }
-        // Collect into a `Vec` so this path returns the same iterator type as the
-        // localhost and hosts-file short-circuits above.
         let addrs: Vec<Ipv6Addr> = self
-            .lookup_record(host, RecordKind::Aaaa)
+            .lookup_record(name, RecordKind::Aaaa)
             .await?
             .into_iter()
             .filter_map(|r| match r {
@@ -947,16 +940,14 @@ impl DnsResolver {
                 _ => None,
             })
             .collect();
-        Ok(addrs.into_iter())
+        Ok(addrs)
     }
 
-    /// Looks up the TXT records for `host`.
-    pub async fn lookup_txt(
-        &self,
-        host: String,
-    ) -> Result<impl Iterator<Item = TxtRecordData> + use<>, Error> {
+    /// Looks up the TXT records for `name`.
+    pub async fn lookup_txt(&self, name: impl Into<String>) -> Result<Vec<TxtRecordData>, Error> {
+        let name = name.into();
         let records: Vec<TxtRecordData> = self
-            .lookup_record(host, RecordKind::Txt)
+            .lookup_record(name, RecordKind::Txt)
             .await?
             .into_iter()
             .filter_map(|r| match r {
@@ -964,16 +955,14 @@ impl DnsResolver {
                 _ => None,
             })
             .collect();
-        Ok(records.into_iter())
+        Ok(records)
     }
 
-    /// Looks up the MX (mail exchange) records for `host`.
-    pub async fn lookup_mx(
-        &self,
-        host: String,
-    ) -> Result<impl Iterator<Item = MxRecordData> + use<>, Error> {
+    /// Looks up the MX (mail exchange) records for `name`.
+    pub async fn lookup_mx(&self, name: impl Into<String>) -> Result<Vec<MxRecordData>, Error> {
+        let name = name.into();
         let records: Vec<MxRecordData> = self
-            .lookup_record(host, RecordKind::Mx)
+            .lookup_record(name, RecordKind::Mx)
             .await?
             .into_iter()
             .filter_map(|r| match r {
@@ -981,16 +970,14 @@ impl DnsResolver {
                 _ => None,
             })
             .collect();
-        Ok(records.into_iter())
+        Ok(records)
     }
 
-    /// Looks up the SVCB (service binding) records for `host`.
-    pub async fn lookup_svcb(
-        &self,
-        host: String,
-    ) -> Result<impl Iterator<Item = SvcbRecordData> + use<>, Error> {
+    /// Looks up the SVCB (service binding) records for `name`.
+    pub async fn lookup_svcb(&self, name: impl Into<String>) -> Result<Vec<SvcbRecordData>, Error> {
+        let name = name.into();
         let records: Vec<SvcbRecordData> = self
-            .lookup_record(host, RecordKind::Svcb)
+            .lookup_record(name, RecordKind::Svcb)
             .await?
             .into_iter()
             .filter_map(|r| match r {
@@ -998,20 +985,21 @@ impl DnsResolver {
                 _ => None,
             })
             .collect();
-        Ok(records.into_iter())
+        Ok(records)
     }
 
-    /// Looks up the HTTPS service binding records for `host`.
+    /// Looks up the HTTPS service binding records for `name`.
     ///
-    /// Returns [`HttpsRecord`]s, which layer HTTPS-specific helpers (the
+    /// Returns [`HttpsRecordData`]s, which layer HTTPS-specific helpers (the
     /// AliasMode/ServiceMode distinction, the effective target name, and the
     /// default `http/1.1` ALPN) over the raw service binding.
     pub async fn lookup_https(
         &self,
-        host: String,
-    ) -> Result<impl Iterator<Item = HttpsRecord> + use<>, Error> {
-        let records: Vec<HttpsRecord> = self
-            .lookup_record(host, RecordKind::Https)
+        name: impl Into<String>,
+    ) -> Result<Vec<HttpsRecordData>, Error> {
+        let name = name.into();
+        let records: Vec<HttpsRecordData> = self
+            .lookup_record(name, RecordKind::Https)
             .await?
             .into_iter()
             .filter_map(|r| match r {
@@ -1019,17 +1007,15 @@ impl DnsResolver {
                 _ => None,
             })
             .collect();
-        Ok(records.into_iter())
+        Ok(records)
     }
 
-    /// Looks up the NS (name server) records for `host`, returning the name of
+    /// Looks up the NS (name server) records for `name`, returning the name of
     /// each authoritative name server.
-    pub async fn lookup_ns(
-        &self,
-        host: String,
-    ) -> Result<impl Iterator<Item = String> + use<>, Error> {
+    pub async fn lookup_ns(&self, name: impl Into<String>) -> Result<Vec<String>, Error> {
+        let name = name.into();
         let records: Vec<String> = self
-            .lookup_record(host, RecordKind::Ns)
+            .lookup_record(name, RecordKind::Ns)
             .await?
             .into_iter()
             .filter_map(|r| match r {
@@ -1037,16 +1023,14 @@ impl DnsResolver {
                 _ => None,
             })
             .collect();
-        Ok(records.into_iter())
+        Ok(records)
     }
 
-    /// Looks up the SRV (service location) records for `host`.
-    pub async fn lookup_srv(
-        &self,
-        host: String,
-    ) -> Result<impl Iterator<Item = SrvRecordData> + use<>, Error> {
+    /// Looks up the SRV (service location) records for `name`.
+    pub async fn lookup_srv(&self, name: impl Into<String>) -> Result<Vec<SrvRecordData>, Error> {
+        let name = name.into();
         let records: Vec<SrvRecordData> = self
-            .lookup_record(host, RecordKind::Srv)
+            .lookup_record(name, RecordKind::Srv)
             .await?
             .into_iter()
             .filter_map(|r| match r {
@@ -1054,7 +1038,7 @@ impl DnsResolver {
                 _ => None,
             })
             .collect();
-        Ok(records.into_iter())
+        Ok(records)
     }
 
     /// Clears the positive DNS cache, dropping every cached answer.
@@ -1157,11 +1141,7 @@ mod tests {
     }
 
     async fn assert_resolves_ipv4(resolver: &DnsResolver, host: &str) {
-        let addrs: Vec<_> = resolver
-            .lookup_ipv4(host.to_string())
-            .await
-            .unwrap()
-            .collect();
+        let addrs = resolver.lookup_ipv4(host).await.unwrap();
         assert!(!addrs.is_empty(), "{host} should have IPv4 addresses");
     }
 
@@ -1209,11 +1189,7 @@ mod tests {
         });
 
         let resolver = with_proto(addr, DnsProtocol::Udp);
-        let addrs: Vec<_> = resolver
-            .lookup_ipv4("example.com".to_string())
-            .await
-            .unwrap()
-            .collect();
+        let addrs = resolver.lookup_ipv4("example.com").await.unwrap();
         assert_eq!(addrs, [expected]);
         handle.await.unwrap();
     }
@@ -1262,11 +1238,7 @@ mod tests {
         // Nothing listens on UDP at `addr`, so the UDP attempts time out and the
         // resolver falls back to TCP.
         let resolver = with_proto(addr, DnsProtocol::Udp);
-        let addrs: Vec<_> = resolver
-            .lookup_ipv4("example.com".to_string())
-            .await
-            .unwrap()
-            .collect();
+        let addrs = resolver.lookup_ipv4("example.com").await.unwrap();
         assert_eq!(addrs, [expected]);
         server.await.unwrap();
     }
@@ -1294,11 +1266,7 @@ mod tests {
             Duration::from_secs(5),
         );
 
-        let addrs: Vec<_> = resolver
-            .lookup_ipv4("stale.test".to_string())
-            .await
-            .unwrap()
-            .collect();
+        let addrs = resolver.lookup_ipv4("stale.test").await.unwrap();
         assert_eq!(addrs, [expected]);
     }
 
@@ -1310,11 +1278,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_ipv6_udp() {
         let resolver = with_proto(GOOGLE_DNS, DnsProtocol::Udp);
-        let addrs: Vec<_> = resolver
-            .lookup_ipv6("google.com".to_string())
-            .await
-            .unwrap()
-            .collect();
+        let addrs = resolver.lookup_ipv6("google.com").await.unwrap();
         assert!(!addrs.is_empty());
     }
 
@@ -1342,11 +1306,7 @@ mod tests {
     #[tokio::test]
     async fn resolve_txt_udp() {
         let resolver = with_proto(GOOGLE_DNS, DnsProtocol::Udp);
-        let records: Vec<_> = resolver
-            .lookup_txt("google.com".to_string())
-            .await
-            .unwrap()
-            .collect();
+        let records = resolver.lookup_txt("google.com").await.unwrap();
         assert!(!records.is_empty());
     }
 
@@ -1369,26 +1329,17 @@ mod tests {
         let resolver = with_proto(GOOGLE_DNS, DnsProtocol::Udp);
 
         info!("--- resolving example.com (first, expect network query) ---");
-        let addrs: Vec<_> = resolver
-            .lookup_ipv4("example.com".to_string())
-            .await
-            .unwrap()
-            .collect();
+        let addrs = resolver.lookup_ipv4("example.com").await.unwrap();
         assert!(!addrs.is_empty());
 
         info!("--- resolving example.com (second, expect cache hit) ---");
-        let addrs2: Vec<_> = resolver
-            .lookup_ipv4("example.com".to_string())
-            .await
-            .unwrap()
-            .collect();
+        let addrs2 = resolver.lookup_ipv4("example.com").await.unwrap();
         assert_eq!(addrs, addrs2);
 
         info!("--- resolving nonexistent domain (expect NXDOMAIN) ---");
         let err = resolver
-            .lookup_ipv4("this-domain-does-not-exist.example.invalid".to_string())
-            .await
-            .map(|i| i.collect::<Vec<_>>());
+            .lookup_ipv4("this-domain-does-not-exist.example.invalid")
+            .await;
         assert!(err.is_err(), "expected NXDOMAIN, got {err:?}");
     }
 
@@ -1554,11 +1505,7 @@ mod tests {
             ])
             .build();
 
-        let addrs: Vec<_> = resolver
-            .lookup_ipv4("test.example".to_string())
-            .await
-            .unwrap()
-            .collect();
+        let addrs = resolver.lookup_ipv4("test.example").await.unwrap();
         assert_eq!(addrs, [IpAddr::V4(Ipv4Addr::new(10, 1, 2, 3))]);
 
         bad_handle.await.unwrap();
@@ -1654,11 +1601,7 @@ mod tests {
             .fallback_nameservers([Nameserver::new(good, DnsProtocol::Udp)])
             .build();
 
-        let addrs: Vec<_> = resolver
-            .lookup_ipv4("test.example".to_string())
-            .await
-            .unwrap()
-            .collect();
+        let addrs = resolver.lookup_ipv4("test.example").await.unwrap();
         assert_eq!(addrs, [IpAddr::V4(Ipv4Addr::new(10, 4, 5, 6))]);
 
         bad_handle.await.unwrap();
@@ -1674,19 +1617,11 @@ mod tests {
             "10.0.1.10 myrelay.test\n::1 myrelay.test\n",
         ));
 
-        let v4: Vec<_> = resolver
-            .lookup_ipv4("myrelay.test".to_string())
-            .await
-            .unwrap()
-            .collect();
+        let v4 = resolver.lookup_ipv4("myrelay.test").await.unwrap();
         assert_eq!(v4, [Ipv4Addr::new(10, 0, 1, 10)]);
 
         // A trailing dot (FQDN form) still matches the hosts entry.
-        let v6: Vec<_> = resolver
-            .lookup_ipv6("myrelay.test.".to_string())
-            .await
-            .unwrap()
-            .collect();
+        let v6 = resolver.lookup_ipv6("myrelay.test.").await.unwrap();
         assert_eq!(v6, [Ipv6Addr::LOCALHOST]);
     }
 

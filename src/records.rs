@@ -50,7 +50,7 @@ pub enum RecordKind {
 ///
 /// [`DnsResolver::lookup_record`]: crate::DnsResolver::lookup_record
 /// [`non_exhaustive`]: https://doc.rust-lang.org/reference/attributes/type_system.html
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum Record {
     /// An IPv4 address from an A record.
@@ -70,13 +70,13 @@ pub enum Record {
     /// The service binding of an SVCB record.
     Svcb(SvcbRecordData),
     /// The service binding of an HTTPS record.
-    Https(HttpsRecord),
+    Https(HttpsRecordData),
 }
 
 /// Record data for an SRV record, as defined in [RFC 2782].
 ///
 /// [RFC 2782]: https://datatracker.ietf.org/doc/html/rfc2782
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SrvRecordData {
     /// The priority of this target; lower values are preferred.
     pub priority: u16,
@@ -91,7 +91,7 @@ pub struct SrvRecordData {
 /// Record data for an MX record, as defined in [RFC 1035 Section 3.3.9].
 ///
 /// [RFC 1035 Section 3.3.9]: https://datatracker.ietf.org/doc/html/rfc1035#section-3.3.9
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MxRecordData {
     /// The preference given to this mail exchange; lower values are preferred.
     pub preference: u16,
@@ -105,7 +105,7 @@ pub struct MxRecordData {
 /// validate or interpret the `tag` or `value`.
 ///
 /// [RFC 8659]: https://datatracker.ietf.org/doc/html/rfc8659
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CaaRecordData {
     /// The flags byte, whose high bit marks the record as critical.
     pub flag: u8,
@@ -123,7 +123,7 @@ pub struct CaaRecordData {
 /// a record is returned with its [`target`](Self::target) as-is.
 ///
 /// [RFC 9460]: https://datatracker.ietf.org/doc/html/rfc9460
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SvcbRecordData(SVCB<'static>);
 
 impl SvcbRecordData {
@@ -244,16 +244,15 @@ impl SvcbRecordData {
 ///
 /// [RFC 9460]: https://datatracker.ietf.org/doc/html/rfc9460
 /// [`DnsResolver::lookup_https`]: crate::DnsResolver::lookup_https
-#[derive(Debug, Clone)]
-pub struct HttpsRecord {
-    /// Returns the record's owner name.
-    ///
-    /// Needed to resolve a `"."` target (RFC 9460 Section 2.5.2).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpsRecordData {
+    /// The record's owner name, needed to resolve a `"."` target (RFC 9460
+    /// Section 2.5.2).
     owner: String,
     data: SvcbRecordData,
 }
 
-impl HttpsRecord {
+impl HttpsRecordData {
     /// Wraps `data` with the `owner` name the record was found at.
     pub(crate) fn new(owner: String, data: SvcbRecordData) -> Self {
         Self { owner, data }
@@ -316,7 +315,7 @@ impl HttpsRecord {
     /// Returns the ALPN protocol identifiers from the `alpn` parameter.
     ///
     /// Exactly as the record carries them, and empty when the parameter is
-    /// absent. See [`Self::alpn_protocols`] for the set with the HTTPS default
+    /// absent. See [`Self::effective_alpn`] for the set with the HTTPS default
     /// applied.
     pub fn alpn(&self) -> Vec<String> {
         self.data.alpn()
@@ -329,7 +328,7 @@ impl HttpsRecord {
     /// the mechanism and Section 9.5 the `http/1.1` default. The default is not
     /// added when `http/1.1` is already listed. An AliasMode record describes no
     /// endpoint, so this is empty for it.
-    pub fn alpn_protocols(&self) -> Vec<String> {
+    pub fn effective_alpn(&self) -> Vec<String> {
         if self.is_alias() {
             return Vec::new();
         }
@@ -344,14 +343,14 @@ impl HttpsRecord {
     ///
     /// Accounts for the HTTPS default ALPN.
     pub fn supports_http2(&self) -> bool {
-        self.alpn_protocols().iter().any(|p| p == "h2")
+        self.effective_alpn().iter().any(|p| p == "h2")
     }
 
     /// Returns whether this endpoint advertises HTTP/3 (ALPN `h3`).
     ///
     /// Accounts for the HTTPS default ALPN.
     pub fn supports_http3(&self) -> bool {
-        self.alpn_protocols().iter().any(|p| p == "h3")
+        self.effective_alpn().iter().any(|p| p == "h3")
     }
 
     /// The port from the `port` parameter, if present.
@@ -398,7 +397,7 @@ impl HttpsRecord {
 /// If you want to process each character string individually, use [`Self::iter`].
 ///
 /// [RFC 1035 Section 3.3.14]: https://datatracker.ietf.org/doc/html/rfc1035#section-3.3.14
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TxtRecordData(Box<[Box<[u8]>]>);
 
 impl TxtRecordData {
@@ -414,6 +413,15 @@ impl TxtRecordData {
     /// per-string allocation that [`Self::iter`] followed by `collect` incurs.
     pub fn into_boxed_slices(self) -> Box<[Box<[u8]>]> {
         self.0
+    }
+}
+
+impl<'a> IntoIterator for &'a TxtRecordData {
+    type Item = &'a [u8];
+    type IntoIter = std::iter::Map<std::slice::Iter<'a, Box<[u8]>>, fn(&'a Box<[u8]>) -> &'a [u8]>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.0.iter().map(|s| s.as_ref())
     }
 }
 

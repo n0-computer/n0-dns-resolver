@@ -251,14 +251,13 @@ mod tests {
         CachedResult::Positive(vec![Record::A(ADDR)])
     }
 
-    /// `Record` is not `PartialEq` (part of the public API), so assert a single-A
-    /// positive hit by unwrapping the one record and checking its address.
+    /// Asserts that `result` is a positive hit holding exactly one A record for
+    /// `expected`.
     fn assert_single_a(result: Option<CachedResult>, expected: Ipv4Addr) {
         match result {
-            Some(CachedResult::Positive(records)) => match records.as_slice() {
-                [Record::A(ip)] => assert_eq!(*ip, expected),
-                other => panic!("expected one A record for {expected}, got {other:?}"),
-            },
+            Some(CachedResult::Positive(records)) => {
+                assert_eq!(records, [Record::A(expected)])
+            }
             other => panic!("expected a positive result for {expected}, got {other:?}"),
         }
     }
