@@ -27,7 +27,7 @@ use system_configuration::{
 };
 use tracing::warn;
 
-use super::{DNS_PORT, DnsConfig, DnsProtocol, Hosts, Nameserver};
+use super::{DnsConfig, DnsProtocol, Hosts, Nameserver};
 
 /// Reads the primary system DNS configuration from SystemConfiguration, plus
 /// the hosts file.
@@ -46,7 +46,7 @@ pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
         .into_iter()
         .filter_map(|s| match IpAddr::from_str(&s) {
             Ok(ip) => Some(Nameserver::new(
-                SocketAddr::new(ip, DNS_PORT),
+                SocketAddr::new(ip, DnsProtocol::Udp.port()),
                 DnsProtocol::Udp,
             )),
             Err(err) => {

@@ -55,7 +55,7 @@ async fn main() {
     let z32s: Vec<String> = args.collect();
 
     let hickory = build_hickory_resolver();
-    let n0 = DnsResolver::new();
+    let n0 = DnsResolver::system_with_fallback();
     // Force the lazy system-config read so the first timed lookup does not
     // include it (hickory reads the config eagerly above).
     let _ = n0.nameservers();

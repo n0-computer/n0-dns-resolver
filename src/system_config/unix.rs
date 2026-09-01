@@ -2,11 +2,11 @@
 
 use std::net::{IpAddr, SocketAddr};
 
-use super::{DNS_PORT, DnsConfig, DnsProtocol, Hosts, Nameserver};
+use super::{Config, DnsProtocol, Hosts, Nameserver};
 
 /// Reads the nameservers and search domains from `/etc/resolv.conf`, plus the
 /// hosts file.
-pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
+pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
     let content = std::fs::read_to_string("/etc/resolv.conf")?;
     let mut config = parse_resolv_conf(&content);
     config.hosts = Hosts::from_system();
@@ -29,7 +29,7 @@ pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
 /// per-nameserver attempt budget, orders nameservers by measured round-trip
 /// time (which subsumes `rotate`), and selects addresses itself (which subsumes
 /// `sortlist`), so honoring these would have no observable effect.
-fn parse_resolv_conf(content: &str) -> DnsConfig {
+fn parse_resolv_conf(content: &str) -> Config {
     let mut servers = Vec::new();
     let mut search_domains = Vec::new();
     let mut ndots = None;
@@ -55,7 +55,7 @@ fn parse_resolv_conf(content: &str) -> DnsConfig {
                         ip_str
                             .parse::<IpAddr>()
                             .ok()
-                            .map(|ip| SocketAddr::new(ip, DNS_PORT))
+                            .map(|ip| SocketAddr::new(ip, DnsProtocol::Udp.port()))
                     });
                     if let Some(addr) = addr {
                         servers.push(Nameserver::new(addr, DnsProtocol::Udp));
@@ -88,7 +88,7 @@ fn parse_resolv_conf(content: &str) -> DnsConfig {
         }
     }
 
-    DnsConfig {
+    Config {
         nameservers: servers,
         search_domains,
         ndots,
@@ -112,7 +112,7 @@ mod tests {
 
     use super::*;
 
-    fn ips(config: &DnsConfig) -> Vec<IpAddr> {
+    fn ips(config: &Config) -> Vec<IpAddr> {
         config.nameservers.iter().map(|ns| ns.addr.ip()).collect()
     }
 
@@ -229,7 +229,7 @@ mod tests {
             config.nameservers[0].addr,
             "8.8.8.8:5353".parse::<SocketAddr>().unwrap()
         );
-        assert_eq!(config.nameservers[1].addr.port(), DNS_PORT);
+        assert_eq!(config.nameservers[1].addr.port(), DnsProtocol::Udp.port());
     }
 
     #[test]

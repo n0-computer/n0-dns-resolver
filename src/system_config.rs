@@ -8,10 +8,7 @@
 
 use tracing::warn;
 
-use super::{
-    DnsProtocol, Nameserver,
-    config::{DNS_PORT, DnsConfig},
-};
+use super::{DnsProtocol, Nameserver, config::Config};
 
 #[cfg(any(target_os = "android", doc))]
 mod android;
@@ -42,12 +39,12 @@ use windows::read_system_dns;
 /// configuration, so the resolver falls back to public resolvers. The hosts file
 /// is still read in that case, since a missing resolv.conf does not imply a
 /// missing hosts file.
-pub(crate) fn read_system() -> DnsConfig {
+pub(crate) fn read_system() -> Config {
     match read_system_dns() {
         Ok(config) => config,
         Err(err) => {
             warn!(%err, "failed to read system DNS configuration, using fallback");
-            DnsConfig {
+            Config {
                 hosts: Hosts::from_system(),
                 ..Default::default()
             }

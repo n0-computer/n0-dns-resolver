@@ -4,13 +4,17 @@
 //! (or an explicit nameserver list) and resolves the common record kinds (see
 //! [`RecordKind`]) through [`DnsResolver::lookup_record`]. Lookups follow CNAME
 //! chains, cache their results, and race the configured nameservers
-//! happy-eyeballs style, falling back to public resolvers when the primary ones
-//! cannot answer. The resolver speaks plain DNS over UDP and TCP, and, with a
-//! crypto provider enabled, DNS-over-TLS (DoT) and DNS-over-HTTPS (DoH).
+//! happy-eyeballs style, falling back to a second tier of nameservers when the
+//! primary ones cannot answer. The resolver speaks plain DNS over UDP and TCP,
+//! and, with a crypto provider enabled, DNS-over-TLS (DoT) and DNS-over-HTTPS
+//! (DoH).
 //!
-//! Construct a resolver with [`DnsResolver::new`] for cross-platform defaults,
-//! or with [`DnsResolver::builder`] to configure the nameservers and fallback
-//! behavior. See [`Builder`] for the available settings.
+//! Construct a resolver with [`DnsResolver::system_with_fallback`] for
+//! cross-platform defaults: the system configuration, backed by the public
+//! resolvers in [`public_resolvers`]. Every other setup goes through
+//! [`DnsResolver::builder`], which starts empty — no system configuration and no
+//! nameservers — so each source is added explicitly. See [`Builder`] for the
+//! available settings.
 //!
 //! [`simple-dns`]: https://docs.rs/simple-dns
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
@@ -20,6 +24,7 @@
 mod builder;
 mod config;
 mod error;
+pub mod public_resolvers;
 mod records;
 mod resolver;
 mod system_config;

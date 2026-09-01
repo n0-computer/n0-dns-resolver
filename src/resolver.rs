@@ -23,7 +23,7 @@ use tracing::{debug, trace};
 use crate::system_config::Hosts;
 use crate::{
     Builder, DnsProtocol, Error, FallbackMode, HttpsRecord, MxRecordData, Nameserver, Record,
-    RecordKind, SrvRecordData, SvcbRecordData, TxtRecordData, config::DnsConfig, system_config,
+    RecordKind, SrvRecordData, SvcbRecordData, TxtRecordData, config::Config, system_config,
 };
 
 mod cache;
@@ -129,9 +129,9 @@ fn is_localhost(host: &str) -> bool {
 
 /// A stub DNS resolver over UDP/TCP (and, with a crypto provider, DoT/DoH).
 ///
-/// See the [crate] docs for an overview. Construct one with [`Self::new`] for
-/// cross-platform defaults, or with [`Self::builder`] to configure the
-/// nameservers and fallback behavior.
+/// See the [crate] docs for an overview. Construct one with
+/// [`Self::system_with_fallback`] for cross-platform defaults, or with
+/// [`Self::builder`] to configure the nameservers and fallback behavior.
 #[derive(Debug)]
 pub struct DnsResolver {
     #[cfg(with_rustls)]
@@ -162,7 +162,7 @@ struct ResolverState {
     /// `config.nameservers` holds the primary nameservers followed by the
     /// fallback ones, split at `primary_count`; see
     /// [`DnsResolver::send_query`] for how the two tiers are used.
-    config: DnsConfig,
+    config: Config,
     /// Number of leading entries in `config.nameservers` that form the primary
     /// tier.
     primary_count: usize,
@@ -181,10 +181,10 @@ impl ResolverState {
         // Start from the system configuration (when enabled). It also carries
         // the search list and hosts file, which we keep as-is; a failed read
         // yields an empty configuration so the fallback can take over.
-        let mut config = if builder.use_system_defaults {
+        let mut config = if builder.use_system_config {
             system_config::read_system()
         } else {
-            DnsConfig::default()
+            Config::default()
         };
         // Primary tier: the system nameservers plus any explicitly configured
         // ones.
@@ -193,23 +193,17 @@ impl ResolverState {
             .nameservers
             .extend(builder.nameservers.iter().cloned());
 
-        // Fallback tier: the configured (or default public) resolvers. Whether
-        // to include them, and whether they defer behind the primary tier or
-        // race alongside it, depends on the mode.
-        let fallback_servers = || {
-            builder
-                .fallback_nameservers
-                .clone()
-                .unwrap_or_else(|| DnsConfig::fallback().nameservers)
-        };
-        // `defer` marks the fallback as a lower-priority second tier; otherwise
-        // it merges into the primary tier and is raced from the start.
+        // Fallback tier: whether to include the configured fallback
+        // nameservers, and whether they defer behind the primary tier or race
+        // alongside it, depends on the mode. `defer` marks them as a
+        // lower-priority second tier; otherwise they merge into the primary tier
+        // and are raced from the start.
+        let fallback_servers = || builder.fallback_nameservers.clone();
         let (mut fallback, defer) = match builder.fallback {
-            FallbackMode::Never => (Vec::new(), false),
-            FallbackMode::Always => (fallback_servers(), false),
+            FallbackMode::Eager => (fallback_servers(), false),
             FallbackMode::Deferred => (fallback_servers(), true),
-            FallbackMode::IfSystemUnavailable if system_has_nameservers => (Vec::new(), false),
-            FallbackMode::IfSystemUnavailable => (fallback_servers(), false),
+            FallbackMode::IfSystemEmpty if system_has_nameservers => (Vec::new(), false),
+            FallbackMode::IfSystemEmpty => (fallback_servers(), false),
         };
         let primary_count = if defer {
             config.nameservers.len()
@@ -235,16 +229,27 @@ impl ResolverState {
 }
 
 impl DnsResolver {
-    /// Creates a resolver with cross-platform defaults.
+    /// Creates a resolver on the system's DNS configuration, with the default
+    /// public resolvers behind it.
     ///
-    /// Reads the system's DNS configuration and escalates to public resolvers
-    /// when it cannot be read or a query goes unanswered. Equivalent to
-    /// `DnsResolver::builder().build()`.
-    pub fn new() -> Self {
-        Self::builder().build()
+    /// This is the cross-platform default: the host's nameservers, search
+    /// domains, `ndots` and hosts file are used first, and the public resolvers
+    /// (Cloudflare, Google, Quad9) are queried only when the system
+    /// configuration cannot be read or its nameservers do not answer.
+    /// Equivalent to
+    /// `DnsResolver::builder().use_system_config().default_fallback_nameservers().build()`.
+    ///
+    /// Every other configuration goes through [`Self::builder`].
+    pub fn system_with_fallback() -> Self {
+        Self::builder()
+            .use_system_config()
+            .default_fallback_nameservers()
+            .build()
     }
 
-    /// Returns a [`Builder`] for configuring a resolver.
+    /// Returns an empty [`Builder`] for configuring a resolver.
+    ///
+    /// The builder queries nothing until nameservers are added; see [`Builder`].
     pub fn builder() -> Builder {
         Builder::default()
     }
@@ -557,9 +562,9 @@ impl DnsResolver {
     /// fallback tier only if every primary nameserver fails or times out.
     ///
     /// The two tiers are the leading `primary_count` entries of `nameservers`
-    /// and the rest. Only [`FallbackMode::Deferred`] produces a second tier; the
-    /// other modes leave `primary_count == nameservers.len()`, so no escalation
-    /// happens. When the primary tier is empty (for example the system
+    /// and the rest. Only [`FallbackMode::Deferred`] with a non-empty fallback
+    /// tier produces a second tier; otherwise
+    /// `primary_count == nameservers.len()`, so no escalation happens. When the primary tier is empty (for example the system
     /// configuration could not be read), escalation makes the fallback tier the
     /// effective primary.
     async fn send_query(&self, query_bytes: &[u8]) -> Result<Vec<u8>, Error> {
@@ -1049,14 +1054,15 @@ impl DnsResolver {
         self.cache.clear();
     }
 
-    /// Returns the configured nameservers and their transports.
-    pub fn nameservers(&self) -> Vec<(std::net::SocketAddr, DnsProtocol)> {
-        self.state()
-            .config
-            .nameservers
-            .iter()
-            .map(|ns| (ns.addr, ns.protocol))
-            .collect()
+    /// Returns the effective nameservers, primary tier first.
+    ///
+    /// This is the assembled list the resolver queries: the system
+    /// configuration (when [`Builder::use_system_config`] was set) and the
+    /// explicitly added nameservers, followed by the fallback tier unless
+    /// [`FallbackMode`] excluded it. Reading it builds the resolver's state,
+    /// which on the first call reads the host's DNS configuration.
+    pub fn nameservers(&self) -> Vec<Nameserver> {
+        self.state().config.nameservers.clone()
     }
 
     /// Overrides the search domains and `ndots` used for search-list expansion.
@@ -1095,12 +1101,6 @@ impl DnsResolver {
     }
 }
 
-impl Default for DnsResolver {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{
@@ -1116,16 +1116,13 @@ mod tests {
     use tracing::info;
 
     use super::{CachedResult, DnsResolver, Hosts};
-    use crate::{DnsProtocol, FallbackMode, Nameserver, Record, RecordKind};
+    use crate::{DnsProtocol, FallbackMode, Nameserver, Record, RecordKind, public_resolvers};
 
-    /// A resolver with no nameservers and no fallback, for unit tests that do
-    /// not query the network. Skips reading the host's DNS configuration so the
-    /// tests stay hermetic.
+    /// A resolver with no nameservers at all, for unit tests that do not query
+    /// the network. A default builder reads nothing from the host, so the tests
+    /// stay hermetic.
     fn empty_resolver() -> DnsResolver {
-        DnsResolver::builder()
-            .without_system_defaults()
-            .disable_fallback()
-            .build()
+        DnsResolver::builder().build()
     }
 
     const GOOGLE_DNS: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(8, 8, 8, 8)), 53);
@@ -1142,15 +1139,13 @@ mod tests {
     /// (`tls-ring` in the default features), so no config is set here.
     fn with_proto(addr: SocketAddr, proto: DnsProtocol) -> DnsResolver {
         DnsResolver::builder()
-            .without_system_defaults()
-            .disable_fallback()
-            .nameserver(addr, proto)
+            .nameserver(Nameserver::new(addr, proto))
             .build()
     }
 
     /// A resolver that reads the host system's DNS configuration.
     fn system_resolver() -> DnsResolver {
-        DnsResolver::new()
+        DnsResolver::system_with_fallback()
     }
 
     async fn assert_resolves_ipv4(resolver: &DnsResolver, host: &str) {
@@ -1276,10 +1271,11 @@ mod tests {
         // A nameserver on a closed port: the TCP connect is refused at once, so
         // live resolution fails fast and the stale fallback runs.
         let resolver = DnsResolver::builder()
-            .without_system_defaults()
-            .disable_fallback()
             .serve_stale(Duration::from_secs(3600))
-            .nameserver("127.0.0.1:1".parse().unwrap(), DnsProtocol::Tcp)
+            .nameserver(Nameserver::new(
+                "127.0.0.1:1".parse().unwrap(),
+                DnsProtocol::Tcp,
+            ))
             .build();
         // Seed a positive entry that expired 5s ago.
         resolver.cache.insert_expired(
@@ -1544,9 +1540,10 @@ mod tests {
         // `bad` is listed first, so it is the fastest by default ordering and
         // wins the race with a SERVFAIL; the lookup must fall through to `good`.
         let resolver = DnsResolver::builder()
-            .without_system_defaults()
-            .disable_fallback()
-            .nameservers([(bad, DnsProtocol::Udp), (good, DnsProtocol::Udp)])
+            .nameservers([
+                Nameserver::new(bad, DnsProtocol::Udp),
+                Nameserver::new(good, DnsProtocol::Udp),
+            ])
             .build();
 
         let addrs: Vec<_> = resolver
@@ -1569,47 +1566,65 @@ mod tests {
     #[test]
     fn deferred_keeps_fallback_in_second_tier() {
         let r = DnsResolver::builder()
-            .without_system_defaults()
-            .nameserver(DUMMY, DnsProtocol::Udp)
+            .nameserver(Nameserver::new(DUMMY, DnsProtocol::Udp))
             .fallback_nameservers([Nameserver::new(DUMMY, DnsProtocol::Udp)])
             .build();
         assert_eq!(r.state().primary_count, 1);
         assert_eq!(r.state().config.nameservers.len(), 2);
     }
 
-    /// `always_use_fallback` merges the fallback nameservers into the primary
+    /// `FallbackMode::Eager` merges the fallback nameservers into the primary
     /// tier so they race from the start.
     #[test]
-    fn always_use_fallback_merges_tiers() {
+    fn eager_merges_tiers() {
         let r = DnsResolver::builder()
-            .without_system_defaults()
-            .nameserver(DUMMY, DnsProtocol::Udp)
+            .nameserver(Nameserver::new(DUMMY, DnsProtocol::Udp))
             .fallback_nameservers([Nameserver::new(DUMMY, DnsProtocol::Udp)])
-            .always_use_fallback()
+            .fallback_mode(FallbackMode::Eager)
             .build();
         assert_eq!(r.state().primary_count, 2);
         assert_eq!(r.state().config.nameservers.len(), 2);
     }
 
-    /// `disable_fallback` drops the fallback tier entirely.
+    /// A builder that adds no fallback nameservers has no second tier, so the
+    /// mode never comes into play.
     #[test]
-    fn disable_fallback_drops_second_tier() {
-        let r = DnsResolver::builder()
-            .without_system_defaults()
-            .nameserver(DUMMY, DnsProtocol::Udp)
-            .disable_fallback()
-            .build();
-        assert_eq!(r.state().primary_count, 1);
-        assert_eq!(r.state().config.nameservers.len(), 1);
+    fn empty_fallback_leaves_a_single_tier() {
+        for mode in [
+            FallbackMode::Deferred,
+            FallbackMode::Eager,
+            FallbackMode::IfSystemEmpty,
+        ] {
+            let r = DnsResolver::builder()
+                .nameserver(Nameserver::new(DUMMY, DnsProtocol::Udp))
+                .fallback_mode(mode)
+                .build();
+            assert_eq!(r.state().primary_count, 1, "{mode:?}");
+            assert_eq!(r.state().config.nameservers.len(), 1, "{mode:?}");
+        }
     }
 
-    /// With no system configuration, `IfSystemUnavailable` includes the fallback
+    /// `default_fallback_nameservers` fills the fallback tier with the public
+    /// resolvers, leaving the primary tier untouched.
+    #[test]
+    fn default_fallback_nameservers_fills_second_tier() {
+        let r = DnsResolver::builder()
+            .nameserver(Nameserver::new(DUMMY, DnsProtocol::Udp))
+            .default_fallback_nameservers()
+            .build();
+        assert_eq!(r.state().primary_count, 1);
+        assert_eq!(
+            r.state().config.nameservers.len(),
+            1 + public_resolvers::default_order(public_resolvers::Provider::ALL.to_vec()).len()
+        );
+    }
+
+    /// With no system configuration, `IfSystemEmpty` includes the fallback
     /// nameservers, and merges them into the primary tier rather than deferring.
     #[test]
-    fn if_system_unavailable_includes_fallback_when_system_empty() {
+    fn if_system_empty_includes_fallback_when_system_empty() {
         let r = DnsResolver::builder()
-            .without_system_defaults()
-            .fallback_mode(FallbackMode::IfSystemUnavailable)
+            .fallback_mode(FallbackMode::IfSystemEmpty)
             .fallback_nameservers([Nameserver::new(DUMMY, DnsProtocol::Udp)])
             .build();
         assert_eq!(r.state().config.nameservers.len(), 1);
@@ -1627,8 +1642,7 @@ mod tests {
         // The primary tier is only `bad`, which SERVFAILs; the fallback tier is
         // `good`, reached only after the primary tier is exhausted.
         let resolver = DnsResolver::builder()
-            .without_system_defaults()
-            .nameserver(bad, DnsProtocol::Udp)
+            .nameserver(Nameserver::new(bad, DnsProtocol::Udp))
             .fallback_nameservers([Nameserver::new(good, DnsProtocol::Udp)])
             .build();
 

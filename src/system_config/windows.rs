@@ -2,7 +2,7 @@
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 
-use super::{DNS_PORT, DnsConfig, DnsProtocol, Hosts, Nameserver};
+use super::{DnsConfig, DnsProtocol, Hosts, Nameserver};
 
 /// Deprecated IPv6 site-local anycast addresses still configured by Windows.
 ///
@@ -33,7 +33,7 @@ pub(super) fn read_system_dns() -> Result<DnsConfig, std::io::Error> {
             let ip = IpAddr::from(*dns_server);
             if !WINDOWS_BAD_SITE_LOCAL_DNS_SERVERS.contains(&ip) {
                 servers.push(Nameserver::new(
-                    SocketAddr::new(ip, DNS_PORT),
+                    SocketAddr::new(ip, DnsProtocol::Udp.port()),
                     DnsProtocol::Udp,
                 ));
             }

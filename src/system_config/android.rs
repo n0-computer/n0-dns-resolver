@@ -35,7 +35,7 @@ use jni::{
 use tracing::{trace, warn};
 
 #[cfg(target_os = "android")]
-use super::{DNS_PORT, DnsConfig, DnsProtocol, Hosts, Nameserver};
+use super::{DnsConfig, DnsProtocol, Hosts, Nameserver};
 
 /// Reads the active network's DNS configuration via JNI, plus the hosts file.
 #[cfg(target_os = "android")]
@@ -128,7 +128,7 @@ fn read_system_dns_jni() -> Result<DnsConfig, std::io::Error> {
                     }
                 };
                 nameservers.push(Nameserver::new(
-                    SocketAddr::new(ip, DNS_PORT),
+                    SocketAddr::new(ip, DnsProtocol::Udp.port()),
                     DnsProtocol::Udp,
                 ));
             }
@@ -152,8 +152,13 @@ fn read_system_dns_jni() -> Result<DnsConfig, std::io::Error> {
 /// `JavaVM` and Application Context to Rust code so that we can use JNI.
 /// This is required to get the configured nameservers on Android.
 ///
-/// If this function is not called, fetching the configured nameservers will fail
-/// and the default [`DnsResolver`] will use fallback nameservers instead.
+/// If this function is not called, fetching the configured nameservers will
+/// fail, and a resolver built with [`Builder::use_system_config`] falls back to
+/// whatever its fallback tier holds — for [`DnsResolver::system_with_fallback`],
+/// the public resolvers.
+///
+/// [`Builder::use_system_config`]: crate::Builder::use_system_config
+/// [`DnsResolver::system_with_fallback`]: crate::DnsResolver::system_with_fallback
 ///
 /// If you call [`ndk_context::initialize_android_context`] already somewhere
 /// up the stack in your app, or use a crate like `ndk-glue` or `android-activity`

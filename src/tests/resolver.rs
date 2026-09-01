@@ -6,7 +6,7 @@ use std::{net::Ipv4Addr, time::Duration};
 use simple_dns::RCODE;
 
 use super::{a, caa, cname, mx, ns, qname, reply, resolver_for, spawn_mock, srv, txt};
-use crate::{DnsProtocol, DnsResolver, Record, RecordKind};
+use crate::{DnsProtocol, DnsResolver, Nameserver, Record, RecordKind};
 
 /// A CNAME that only the second query resolves: the first response carries the
 /// CNAME alone, so the resolver follows it and queries the target name, which
@@ -127,10 +127,8 @@ async fn negative_caching_collapses_second_lookup() {
 
     // Negative caching is off by default; enable it for this scenario.
     let resolver = DnsResolver::builder()
-        .without_system_defaults()
-        .disable_fallback()
         .negative_max_ttl(Duration::from_secs(30))
-        .nameserver(server.addr(), DnsProtocol::Udp)
+        .nameserver(Nameserver::new(server.addr(), DnsProtocol::Udp))
         .build();
     for _ in 0..2 {
         let records = resolver
