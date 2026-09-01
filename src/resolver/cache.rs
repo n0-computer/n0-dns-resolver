@@ -1,6 +1,7 @@
 //! TTL-based DNS cache with least-recently-used eviction.
 
 use std::{
+    borrow::Cow,
     hash::{Hash, Hasher},
     sync::{Arc, Mutex},
     time::Duration,
@@ -57,8 +58,15 @@ pub(super) enum CachedResult {
 /// denotes the same node as the bare name. Normalizing here keeps
 /// `Example.COM.` and `example.com` in one entry, matching the hosts-file
 /// normalization in `Hosts::normalize`.
-fn normalize(host: &str) -> String {
-    host.strip_suffix('.').unwrap_or(host).to_ascii_lowercase()
+/// A name already in that form is borrowed rather than copied. Every cache
+/// probe passes through here, ahead of the lock, and query names are
+/// overwhelmingly lowercase and undotted already.
+fn normalize(host: &str) -> Cow<'_, str> {
+    let host = host.strip_suffix('.').unwrap_or(host);
+    match host.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        true => Cow::Owned(host.to_ascii_lowercase()),
+        false => Cow::Borrowed(host),
+    }
 }
 
 /// Hashes `(host, kind)` into a u64 key for allocation-free cache lookups.
@@ -137,7 +145,7 @@ impl DnsCache {
         let mut inner = self.inner.lock().expect("poisoned");
         let entry = inner.get(&key)?;
         // Reject `u64` key collisions: only serve an exact host+kind match.
-        if entry.host != host || entry.kind != kind {
+        if entry.host != *host || entry.kind != kind {
             return None;
         }
         if entry.is_expired() {
@@ -188,7 +196,7 @@ impl DnsCache {
         }
         let host = normalize(host);
         let entry = CacheEntry {
-            host: host.clone(),
+            host: host.to_string(),
             kind,
             result,
             inserted_at: Instant::now(),
@@ -218,7 +226,7 @@ impl DnsCache {
     ) {
         let host = normalize(host);
         let entry = CacheEntry {
-            host: host.clone(),
+            host: host.to_string(),
             kind,
             result,
             inserted_at: Instant::now() - (ttl + expired_ago),
