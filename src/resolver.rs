@@ -1,14 +1,12 @@
 //! Built-in DNS resolver using `simple-dns` for packet construction/parsing
 //! and tokio for transport.
 
-#[cfg(with_rustls)]
-use std::sync::Arc;
 #[cfg(transport_https)]
 use std::sync::Mutex;
 use std::{
     future::Future,
     net::{Ipv4Addr, Ipv6Addr},
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use n0_error::e;
@@ -132,8 +130,18 @@ fn is_localhost(host: &str) -> bool {
 /// See the [crate] docs for an overview. Construct one with
 /// [`Self::system_with_fallback`] for cross-platform defaults, or with
 /// [`Self::builder`] to configure the nameservers and the fallback behavior.
-#[derive(Debug)]
+/// Cloning is cheap and shares everything: the cache, the connection pool and
+/// the resolved configuration. Clones are the same resolver, so clearing the
+/// cache through one is visible through all of them. [`Self::reset`] is the
+/// operation that produces a genuinely new resolver.
+#[derive(Debug, Clone)]
 pub struct DnsResolver {
+    inner: Arc<Inner>,
+}
+
+/// The state behind a [`DnsResolver`], shared by every clone.
+#[derive(Debug)]
+struct Inner {
     #[cfg(with_rustls)]
     tls_config: Option<Arc<rustls::ClientConfig>>,
     /// Lazily initialized, cached reqwest client for DNS-over-HTTPS queries.
@@ -280,14 +288,16 @@ impl DnsResolver {
             .map(|config| Arc::new(config.clone()))
             .or_else(Self::default_tls_config);
         Self {
-            #[cfg(with_rustls)]
-            tls_config,
-            #[cfg(transport_https)]
-            https_client: Mutex::new(None),
-            conn_pool: ConnPool::new(),
-            cache,
-            builder,
-            state: OnceLock::new(),
+            inner: Arc::new(Inner {
+                #[cfg(with_rustls)]
+                tls_config,
+                #[cfg(transport_https)]
+                https_client: Mutex::new(None),
+                conn_pool: ConnPool::new(),
+                cache,
+                builder,
+                state: OnceLock::new(),
+            }),
         }
     }
 
@@ -320,8 +330,9 @@ impl DnsResolver {
     /// Returns the runtime state, reading the system DNS configuration on first
     /// call and caching it for the life of this resolver.
     fn state(&self) -> &ResolverState {
-        self.state
-            .get_or_init(|| ResolverState::build(&self.builder))
+        self.inner
+            .state
+            .get_or_init(|| ResolverState::build(&self.inner.builder))
     }
 
     /// Returns the candidate names to try for `host`.
@@ -382,7 +393,7 @@ impl DnsResolver {
     /// `reqwest::Client` uses an inner `Arc`, so cloning is cheap.
     #[cfg(transport_https)]
     fn get_or_init_https_client(&self) -> Result<reqwest::Client, Error> {
-        let mut guard = self.https_client.lock().expect("poisoned");
+        let mut guard = self.inner.https_client.lock().expect("poisoned");
         match guard.as_ref() {
             Some(client) => Ok(client.clone()),
             None => {
@@ -390,6 +401,7 @@ impl DnsResolver {
                 // (built with `rustls-no-provider`) would fall back to a process-default
                 // crypto provider and panic when none is installed.
                 let tls_config = self
+                    .inner
                     .tls_config
                     .as_ref()
                     .ok_or_else(|| e!(Error::MissingTlsConfig))?;
@@ -412,7 +424,8 @@ impl DnsResolver {
 
     /// The configured cache min-TTL floor in seconds, or 0 when unset.
     fn cache_min_ttl_secs(&self) -> u32 {
-        self.builder
+        self.inner
+            .builder
             .cache_min_ttl
             .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
     }
@@ -420,7 +433,7 @@ impl DnsResolver {
     /// TTL in seconds to use when caching a NODATA or NXDOMAIN answer, or 0 to
     /// skip the cache.
     fn negative_cache_ttl_secs(&self, soa_ttl: Option<u32>) -> u32 {
-        let Some(max) = self.builder.negative_max_ttl else {
+        let Some(max) = self.inner.builder.negative_max_ttl else {
             return 0;
         };
         let max_secs = u32::try_from(max.as_secs())
@@ -494,7 +507,7 @@ impl DnsResolver {
                             debug!(%addr, "UDP response truncated, retrying over TCP");
                             return Self::with_timeout(
                                 STREAM_TIMEOUT,
-                                transport::tcp_query(&self.conn_pool, addr, query_bytes),
+                                transport::tcp_query(&self.inner.conn_pool, addr, query_bytes),
                             )
                             .await;
                         }
@@ -513,27 +526,28 @@ impl DnsResolver {
                 debug!(%addr, err = %last_err, "UDP attempts failed, falling back to TCP");
                 Self::with_timeout(
                     STREAM_TIMEOUT,
-                    transport::tcp_query(&self.conn_pool, addr, query_bytes),
+                    transport::tcp_query(&self.inner.conn_pool, addr, query_bytes),
                 )
                 .await
             }
             DnsProtocol::Tcp => {
                 Self::with_timeout(
                     STREAM_TIMEOUT,
-                    transport::tcp_query(&self.conn_pool, addr, query_bytes),
+                    transport::tcp_query(&self.inner.conn_pool, addr, query_bytes),
                 )
                 .await
             }
             #[cfg(transport_tls)]
             DnsProtocol::Tls => {
                 let tls_config = self
+                    .inner
                     .tls_config
                     .as_ref()
                     .ok_or_else(|| e!(Error::MissingTlsConfig))?;
                 Self::with_timeout(
                     STREAM_TIMEOUT,
                     transport::tls_query(
-                        &self.conn_pool,
+                        &self.inner.conn_pool,
                         addr,
                         query_bytes,
                         tls_config,
@@ -744,7 +758,7 @@ impl DnsResolver {
         kind: RecordKind,
     ) -> Result<Vec<Record>, Error> {
         let name = name.into();
-        match self.cache.get(&name, kind) {
+        match self.inner.cache.get(&name, kind) {
             Some(CachedResult::Positive(records)) => {
                 trace!(%name, records = records.len(), ?kind, "cache hit");
                 return Ok(records);
@@ -801,8 +815,12 @@ impl DnsResolver {
                 Ok((results, ttl)) if !results.is_empty() => {
                     let ttl = ttl.max(self.cache_min_ttl_secs());
                     debug!(%name, ?kind, ?results, ttl, "resolved");
-                    self.cache
-                        .insert(&name, kind, CachedResult::Positive(results.clone()), ttl);
+                    self.inner.cache.insert(
+                        &name,
+                        kind,
+                        CachedResult::Positive(results.clone()),
+                        ttl,
+                    );
                     return Ok(results);
                 }
                 // A successful but empty answer is NODATA: the name exists but
@@ -857,7 +875,8 @@ impl DnsResolver {
             Some(CachedResult::NoData) => {
                 debug!(%name, ?kind, "resolved to no records (NODATA)");
                 if !saw_transient {
-                    self.cache
+                    self.inner
+                        .cache
                         .insert(&name, kind, CachedResult::NoData, negative_ttl_secs);
                 }
                 Ok(Vec::new())
@@ -865,7 +884,8 @@ impl DnsResolver {
             Some(CachedResult::NxDomain) => {
                 debug!(%name, ?kind, "does not exist (NXDOMAIN)");
                 if !saw_transient {
-                    self.cache
+                    self.inner
+                        .cache
                         .insert(&name, kind, CachedResult::NxDomain, negative_ttl_secs);
                 }
                 Err(e!(Error::NxDomain))
@@ -875,8 +895,8 @@ impl DnsResolver {
                 // Serve-stale (RFC 8767): every candidate failed indeterminately
                 // and produced no authoritative answer, so fall back to an expired
                 // positive answer within the configured window rather than fail.
-                if let Some(max_age) = self.builder.serve_stale
-                    && let Some(records) = self.cache.get_stale(&name, kind, max_age)
+                if let Some(max_age) = self.inner.builder.serve_stale
+                    && let Some(records) = self.inner.cache.get_stale(&name, kind, max_age)
                 {
                     debug!(%name, ?kind, "serving stale answer after resolution failure");
                     return Ok(records);
@@ -1043,7 +1063,7 @@ impl DnsResolver {
 
     /// Clears the positive DNS cache, dropping every cached answer.
     pub fn clear_cache(&self) {
-        self.cache.clear();
+        self.inner.cache.clear();
     }
 
     /// Returns the effective nameservers, primary tier first.
@@ -1066,20 +1086,22 @@ impl DnsResolver {
     pub(crate) fn set_search(&mut self, search_domains: Vec<String>, ndots: usize) {
         // Force the runtime state to exist (keeping the configured nameservers),
         // then override just the search settings under test.
-        let mut state = ResolverState::build(&self.builder);
+        let mut state = ResolverState::build(&self.inner.builder);
         state.config.search_domains = search_domains;
         state.config.ndots = Some(ndots);
-        self.state = OnceLock::new();
-        let _ = self.state.set(state);
+        let inner = Arc::get_mut(&mut self.inner).expect("test hook holds the only reference");
+        inner.state = OnceLock::new();
+        let _ = inner.state.set(state);
     }
 
     /// Overrides the hosts-file mapping. Test-only hook, like [`Self::set_search`].
     #[cfg(test)]
     pub(crate) fn set_hosts(&mut self, hosts: Hosts) {
-        let mut state = ResolverState::build(&self.builder);
+        let mut state = ResolverState::build(&self.inner.builder);
         state.config.hosts = hosts;
-        self.state = OnceLock::new();
-        let _ = self.state.set(state);
+        let inner = Arc::get_mut(&mut self.inner).expect("test hook holds the only reference");
+        inner.state = OnceLock::new();
+        let _ = inner.state.set(state);
     }
 
     /// Rebuilds the resolver after a network change, carrying the cache across.
@@ -1089,7 +1111,7 @@ impl DnsResolver {
     /// start DNS cold, which would strand reconnects while the new nameservers
     /// settle (#4037).
     pub fn reset(&self) -> Self {
-        Self::new_deferred(self.builder.clone(), self.cache.clone())
+        Self::new_deferred(self.inner.builder.clone(), self.inner.cache.clone())
     }
 }
 
@@ -1097,6 +1119,7 @@ impl DnsResolver {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        sync::Arc,
         time::Duration,
     };
 
@@ -1258,7 +1281,7 @@ mod tests {
             ))
             .build();
         // Seed a positive entry that expired 5s ago.
-        resolver.cache.insert_expired(
+        resolver.inner.cache.insert_expired(
             "stale.test",
             RecordKind::A,
             CachedResult::Positive(vec![Record::A(expected)]),
@@ -1512,6 +1535,46 @@ mod tests {
         good_handle.await.unwrap();
     }
 
+    /// A clone shares the cache, so it is the same resolver, not a copy of one.
+    ///
+    /// This is what lets callers hold a `DnsResolver` by value instead of
+    /// wrapping it in an `Arc`, so it has to keep holding.
+    #[test]
+    fn clone_shares_the_cache() {
+        let resolver = empty_resolver();
+        let clone = resolver.clone();
+        resolver.inner.cache.insert(
+            "example.com",
+            RecordKind::A,
+            CachedResult::Positive(vec![Record::A(Ipv4Addr::new(10, 0, 0, 1))]),
+            60,
+        );
+        assert!(
+            clone
+                .inner
+                .cache
+                .get("example.com", RecordKind::A)
+                .is_some()
+        );
+        clone.clear_cache();
+        assert!(
+            resolver
+                .inner
+                .cache
+                .get("example.com", RecordKind::A)
+                .is_none()
+        );
+    }
+
+    /// `reset` is the operation that does not share: it builds a new resolver,
+    /// carrying only the cache across.
+    #[test]
+    fn reset_does_not_share_state_with_the_original() {
+        let resolver = empty_resolver();
+        let reset = resolver.reset();
+        assert!(!Arc::ptr_eq(&resolver.inner, &reset.inner));
+    }
+
     /// A dummy nameserver address that is never actually queried, used to check
     /// how the builder lays out the primary and fallback tiers.
     const DUMMY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 53);
@@ -1631,7 +1694,7 @@ mod tests {
     #[test]
     fn cache_survives_reset() {
         let r = empty_resolver();
-        r.cache.insert(
+        r.inner.cache.insert(
             "example.com",
             RecordKind::A,
             CachedResult::Positive(vec![Record::A(Ipv4Addr::LOCALHOST)]),
@@ -1640,7 +1703,7 @@ mod tests {
 
         let reset = r.reset();
 
-        let cached = reset.cache.get("example.com", RecordKind::A);
+        let cached = reset.inner.cache.get("example.com", RecordKind::A);
         let survived = matches!(
             cached,
             Some(CachedResult::Positive(ref records))
