@@ -11,17 +11,16 @@
 //! are the ones to read when comparing the two resolvers; the random one exists
 //! to confirm the deterministic result is not an artifact of the drop policy.
 //!
-//! Each test prints a table and asserts what should hold whatever the resolver
-//! does: that a lookup returning an answer returns the right one, and that a
-//! healthy network still costs exactly one datagram per lookup.
+//! Each test prints a table and asserts what we want to stay true: that a
+//! lookup returning an answer returns the right one, that our latency holds
+//! against hickory's on the two deterministic scenarios, and that a healthy
+//! network still costs exactly one datagram per lookup. The random-loss test
+//! only reports, since its numbers move between runs.
 //!
 //! The table carries latency and, beside it, the queries the nameserver
 //! received per lookup split by transport. Retransmitting early trades packets
 //! for latency, so both halves of that trade are measured. The counts are what
 //! one nameserver saw; the fan-out across several is not measured here.
-//!
-//! The latency we actually want lives in the `#[ignore]`d tests at the bottom.
-//! They fail until the retransmit work in `plans/improve-lossy-perf.md` lands.
 //!
 //! Run them with:
 //!
@@ -78,11 +77,20 @@ const ANSWER: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 1);
 /// TTL on the answers, long enough that no lookup in a test re-queries.
 const ANSWER_TTL: u32 = 300;
 
+/// Ceiling on our own median once the TCP query has had to rescue a lookup.
+///
+/// Both scenarios where that happens are floored at the resolver's 900ms delay
+/// before TCP starts, plus a round trip. The bound is deliberately well clear of
+/// that floor: it exists to catch a return to the six-second behaviour, not to
+/// pin the exact delay, and a tight bound would flake whenever a loaded runner
+/// adds scheduling latency.
+const LATENCY_CEILING: Duration = Duration::from_millis(1500);
+
 /// Cap on a single lookup, past which we record it as a failure.
 ///
-/// Above our own worst case for one nameserver (two 3 s UDP attempts plus a 5 s
-/// TCP leg) and above hickory's (two pool passes of 5 s), so a lookup only hits
-/// this when the resolver has genuinely given up on making progress.
+/// Above our own worst case for one nameserver (6 s covering the datagrams and
+/// the TCP query beside them) and above hickory's (two pool passes of 5 s), so
+/// a lookup only hits this when the resolver has stopped making progress.
 const LOOKUP_CAP: Duration = Duration::from_secs(15);
 
 // ── The test nameserver ─────────────────────────────────────────────────
@@ -355,6 +363,20 @@ impl Samples {
     }
 }
 
+/// Returns the median latency of the resolver labelled `label`.
+///
+/// # Panics
+///
+/// Panics if that resolver answered nothing, since a scenario that measures
+/// latency has nothing to say when every lookup failed.
+fn median(samples: &[Samples], label: &str) -> Duration {
+    samples
+        .iter()
+        .find(|s| s.label == label)
+        .and_then(|s| s.quantile(0.5))
+        .unwrap_or_else(|| panic!("{label} answered nothing"))
+}
+
 /// Prints a comparison table for one scenario.
 fn report(scenario: &str, samples: &[Samples]) {
     println!("\n{scenario}");
@@ -580,9 +602,9 @@ async fn no_loss_baseline() -> Result<()> {
 ///
 /// This is the measurement that matters. There is no random loss anywhere, so
 /// each lookup's latency is the resolver's retransmit interval plus one round
-/// trip, and nothing else. hickory retransmits on a 333 ms timer while the
-/// first datagram is still outstanding; we wait for a 3 s per-attempt timeout
-/// to expire first. Expect roughly 0.33 s against roughly 3 s.
+/// trip, and nothing else. Both resolvers retransmit on a timer while the first
+/// datagram is still outstanding, so both should land near their retransmit
+/// interval rather than near any timeout.
 #[tokio::test(flavor = "current_thread")]
 async fn first_datagram_dropped() -> Result<()> {
     let fixture = fixture(UdpPolicy::DropFirst(1)).await?;
@@ -596,15 +618,19 @@ async fn first_datagram_dropped() -> Result<()> {
             s.label
         );
     }
+    let (ours, theirs) = (median(&samples, "n0"), median(&samples, "hickory"));
+    assert!(
+        ours <= theirs * 2,
+        "n0 median {ours:?} should be within 2x hickory's {theirs:?}"
+    );
     fixture.ok();
     Ok(())
 }
 
 /// The nameserver drops the first two datagrams of every lookup.
 ///
-/// Past hickory's `max_retries = 3` budget for a single pool pass but within
-/// our two UDP attempts, so this is where the two designs diverge on outcome
-/// rather than only on latency.
+/// Past hickory's `max_retries = 3` limit for a single pool pass, and past our
+/// run of datagrams too, so this is where the TCP query decides the outcome.
 #[tokio::test(flavor = "current_thread")]
 async fn first_two_datagrams_dropped() -> Result<()> {
     let fixture = fixture(UdpPolicy::DropFirst(2)).await?;
@@ -618,6 +644,11 @@ async fn first_two_datagrams_dropped() -> Result<()> {
             s.label
         );
     }
+    let ours = median(&samples, "n0");
+    assert!(
+        ours < LATENCY_CEILING,
+        "n0 median {ours:?} should be near the TCP join delay, not seconds past it"
+    );
     fixture.ok();
     Ok(())
 }
@@ -626,8 +657,11 @@ async fn first_two_datagrams_dropped() -> Result<()> {
 ///
 /// This is the network from the real-world log: every datagram to the gateway
 /// disappears, but the same address answers over TCP in tens of milliseconds.
-/// We fall back to TCP after exhausting UDP; hickory does not, because
-/// `try_tcp_on_error` defaults to false, so it should fail outright here.
+/// We join UDP with TCP once the datagrams go unanswered; hickory does not,
+/// because `try_tcp_on_error` defaults to false, so it fails outright here.
+///
+/// The cost should be the delay before TCP starts plus a TCP round trip, and it
+/// should not grow across lookups as the server's smoothed RTT absorbs it.
 #[tokio::test(flavor = "current_thread")]
 async fn udp_blackhole_tcp_works() -> Result<()> {
     let fixture = fixture(UdpPolicy::Blackhole).await?;
@@ -641,6 +675,11 @@ async fn udp_blackhole_tcp_works() -> Result<()> {
         n0.ok(),
         n0.lookups.len(),
         "the TCP fallback should carry every lookup when UDP is black-holed"
+    );
+    let ours = median(&samples, "n0");
+    assert!(
+        ours < LATENCY_CEILING,
+        "n0 median {ours:?} should be near the TCP join delay, not seconds past it"
     );
     fixture.ok();
     Ok(())
@@ -662,63 +701,6 @@ async fn random_udp_loss() -> Result<()> {
         let samples = fixture.run(8).await?;
         report(&format!("random_udp_loss loss={loss}%"), &samples);
     }
-    fixture.ok();
-    Ok(())
-}
-
-// ── Targets ─────────────────────────────────────────────────────────────
-//
-// These encode what we want to be true after the work in
-// `plans/improve-lossy-perf.md`. They fail today. They are `#[ignore]`d so CI
-// stays green; remove the attribute as each proposal lands.
-
-/// We should recover from one lost datagram about as fast as hickory does.
-///
-/// Concretely: our median under [`UdpPolicy::DropFirst`] should be within twice
-/// hickory's. Today it is roughly nine times hickory's, because our retransmit
-/// waits out a 3 s per-attempt timeout instead of running on a short timer.
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "fails until UDP retransmits overlap, see plans/improve-lossy-perf.md"]
-async fn target_single_loss_recovery_matches_hickory() -> Result<()> {
-    let fixture = fixture(UdpPolicy::DropFirst(1)).await?;
-    let samples = fixture.run(5).await?;
-    report("target_single_loss_recovery_matches_hickory", &samples);
-    let median = |label: &str| {
-        samples
-            .iter()
-            .find(|s| s.label == label)
-            .and_then(|s| s.quantile(0.5))
-            .unwrap_or_else(|| panic!("{label} answered nothing"))
-    };
-    let (ours, theirs) = (median("n0"), median("hickory"));
-    assert!(
-        ours <= theirs * 2,
-        "n0 median {ours:?} should be within 2x hickory's {theirs:?}"
-    );
-    fixture.ok();
-    Ok(())
-}
-
-/// A UDP black hole should cost about one TCP round trip, not six seconds.
-///
-/// Today we send two UDP datagrams and wait out both 3 s timeouts before
-/// opening the TCP connection that answers in tens of milliseconds. Racing TCP
-/// against the tail of the UDP phase should bring this under a second.
-#[tokio::test(flavor = "current_thread")]
-#[ignore = "fails until TCP races the UDP tail, see plans/improve-lossy-perf.md"]
-async fn target_udp_blackhole_falls_back_quickly() -> Result<()> {
-    let fixture = fixture(UdpPolicy::Blackhole).await?;
-    let samples = fixture.run(3).await?;
-    report("target_udp_blackhole_falls_back_quickly", &samples);
-    let ours = samples
-        .iter()
-        .find(|s| s.label == "n0")
-        .and_then(|s| s.quantile(0.5))
-        .expect("n0 answered nothing");
-    assert!(
-        ours < Duration::from_secs(1),
-        "n0 median {ours:?} should be under 1 s when only TCP works"
-    );
     fixture.ok();
     Ok(())
 }
