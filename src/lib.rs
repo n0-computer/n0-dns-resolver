@@ -16,6 +16,22 @@
 //! and no nameservers, so that each source is added explicitly. See [`Builder`]
 //! for the available settings.
 //!
+//! # Examples
+//!
+//! ```no_run
+//! # async fn run() -> Result<(), n0_dns_resolver::Error> {
+//! use n0_dns_resolver::{DnsResolver, RecordKind};
+//!
+//! let resolver = DnsResolver::system_with_fallback();
+//!
+//! let addrs = resolver.lookup_ipv4("example.com").await?;
+//! let records = resolver
+//!     .lookup_record("example.com", RecordKind::Aaaa)
+//!     .await?;
+//! # Ok(())
+//! # }
+//! ```
+//!
 //! [`simple-dns`]: https://docs.rs/simple-dns
 #![deny(missing_docs, rustdoc::broken_intra_doc_links)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used))]

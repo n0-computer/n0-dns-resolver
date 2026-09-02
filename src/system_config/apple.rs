@@ -29,8 +29,9 @@ use tracing::warn;
 
 use super::{Config, DnsProtocol, Hosts, Nameserver};
 
-/// Reads the primary system DNS configuration from SystemConfiguration, plus
-/// the hosts file.
+/// Reads the primary system DNS configuration from SystemConfiguration.
+///
+/// Also reads the hosts file.
 pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
     let store = SCDynamicStoreBuilder::new("iroh-dns")
         .build()
@@ -66,8 +67,9 @@ pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
     })
 }
 
-/// Reads a `CFArray`-of-`CFString` value from `dict` by key, returning the
-/// strings. Returns an empty vector when the key is absent.
+/// Reads a `CFArray`-of-`CFString` value from `dict` by key.
+///
+/// Returns an empty vector when the key is absent or holds another type.
 fn read_string_array(dict: &CFDictionary, key: &'static str) -> Vec<String> {
     let Some(value) = dict.find(CFString::from_static_string(key).as_CFTypeRef()) else {
         return Vec::new();

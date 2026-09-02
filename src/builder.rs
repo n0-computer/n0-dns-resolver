@@ -37,9 +37,13 @@ use crate::{DnsResolver, public_resolvers};
 /// ```
 #[derive(Debug, Clone, Default)]
 pub struct Builder {
+    /// Whether to read the host's DNS configuration into the primary tier.
     pub(crate) use_system_config: bool,
+    /// Explicitly added primary-tier nameservers, ahead of any from the system.
     pub(crate) nameservers: Vec<Nameserver>,
+    /// The fallback tier, empty unless the caller added to it.
     pub(crate) fallback_nameservers: Vec<Nameserver>,
+    /// How the fallback tier relates to the primary one.
     pub(crate) fallback: FallbackMode,
     /// Serve-stale window, or `None` to disable serving expired answers.
     pub(crate) serve_stale: Option<Duration>,
@@ -47,6 +51,10 @@ pub struct Builder {
     pub(crate) cache_min_ttl: Option<Duration>,
     /// Cap on how long NXDOMAIN and NODATA are cached, or `None` to disable.
     pub(crate) negative_max_ttl: Option<Duration>,
+    /// Caller-supplied TLS settings for DoT and DoH.
+    ///
+    /// `None` falls back to a config built from the compiled-in crypto
+    /// provider, and failing that those transports error.
     #[cfg(with_rustls)]
     pub(crate) tls_client_config: Option<rustls::ClientConfig>,
 }
@@ -263,8 +271,12 @@ where
 /// IP.
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct Nameserver {
+    /// The address to connect to. Always an IP, never resolved as a name.
     pub(crate) addr: SocketAddr,
+    /// The transport to query over, which also fixes the default port.
     pub(crate) protocol: DnsProtocol,
+    /// The name to validate the TLS certificate against, if not the IP.
+    ///
     /// Only used for DoT/DoH (the `transport-tls` or `transport-https` feature).
     #[cfg(any(with_rustls, doc))]
     pub(crate) server_name: Option<String>,

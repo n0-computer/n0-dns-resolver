@@ -18,8 +18,9 @@ const WINDOWS_BAD_SITE_LOCAL_DNS_SERVERS: [IpAddr; 3] = [
     IpAddr::V6(Ipv6Addr::new(0xfec0, 0, 0, 0xffff, 0, 0, 0, 3)),
 ];
 
-/// Reads the DNS servers from the Windows network adapter configuration, plus
-/// the hosts file.
+/// Reads the DNS servers from the Windows network adapter configuration.
+///
+/// Also reads the hosts file.
 pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
     let adapters = ipconfig::get_adapters().map_err(std::io::Error::other)?;
 

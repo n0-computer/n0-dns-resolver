@@ -43,8 +43,10 @@ const PRUNE_INTERVAL: Duration = IDLE_TIMEOUT;
 #[cfg(transport_tls)]
 pub(super) type TlsStream = tokio_rustls::client::TlsStream<TcpStream>;
 
-/// Pool key for a DoT connection: the address plus the TLS server name, so a
-/// connection is never reused for a different server name.
+/// Pool key for a DoT connection: address plus TLS server name.
+///
+/// Keying on both means a connection is never reused for a server name it was
+/// not validated against.
 #[cfg(transport_tls)]
 pub(super) type TlsKey = (SocketAddr, Option<String>);
 
@@ -55,6 +57,7 @@ struct Idle<S> {
 }
 
 impl<S> Idle<S> {
+    /// Wraps a stream that has just been returned to the pool.
     fn new(stream: S) -> Self {
         Self {
             stream,
@@ -62,6 +65,7 @@ impl<S> Idle<S> {
         }
     }
 
+    /// Returns whether the connection has sat idle past [`IDLE_TIMEOUT`].
     fn is_stale(&self) -> bool {
         self.last_used.elapsed() >= IDLE_TIMEOUT
     }
@@ -70,7 +74,12 @@ impl<S> Idle<S> {
 /// The pooled connections, shared between the [`ConnPool`] and its pruning task.
 #[derive(Default)]
 struct Inner {
+    /// Idle plain-TCP connections, keyed by nameserver address.
     tcp: Mutex<HashMap<SocketAddr, Vec<Idle<TcpStream>>>>,
+    /// Idle DoT connections, keyed by address and TLS server name.
+    ///
+    /// Keyed separately from `tcp` so a connection is never reused for a
+    /// different server name than it was validated against.
     #[cfg(transport_tls)]
     tls: Mutex<HashMap<TlsKey, Vec<Idle<TlsStream>>>>,
 }
@@ -87,6 +96,7 @@ impl Inner {
 /// A pool of idle TCP and DoT connections, keyed by nameserver.
 #[derive(Clone)]
 pub(super) struct ConnPool {
+    /// Shared with every clone of the pool and with the pruning task.
     inner: Arc<Inner>,
     /// Set once the idle-connection pruning task has been spawned.
     pruner_spawned: OnceLock<()>,
@@ -99,6 +109,7 @@ impl std::fmt::Debug for ConnPool {
 }
 
 impl ConnPool {
+    /// Creates an empty pool. The pruning task starts on the first insert.
     pub(super) fn new() -> Self {
         Self {
             inner: Arc::new(Inner::default()),
@@ -168,8 +179,9 @@ async fn prune_loop(inner: Weak<Inner>) {
     }
 }
 
-/// Pops the most-recently-used connection still within [`IDLE_TIMEOUT`],
-/// discarding any staler ones encountered along the way.
+/// Pops the most-recently-used connection still within [`IDLE_TIMEOUT`].
+///
+/// Any staler ones encountered on the way are discarded.
 fn take_fresh<S>(idle: &mut Vec<Idle<S>>) -> Option<S> {
     while let Some(conn) = idle.pop() {
         if !conn.is_stale() {
@@ -199,8 +211,9 @@ fn prune_map<K, S>(map: &Mutex<HashMap<K, Vec<Idle<S>>>>) {
 mod tests {
     use super::*;
 
-    /// A TCP connection plus its accepted server end, kept alive so the client
-    /// side is not reset.
+    /// A TCP connection paired with its accepted server end.
+    ///
+    /// Holding the server end keeps the client side from being reset.
     async fn loopback_pair() -> (TcpStream, SocketAddr, TcpStream) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
@@ -208,6 +221,7 @@ mod tests {
         (client.unwrap(), addr, accepted.unwrap().0)
     }
 
+    /// Returns how many idle TCP connections `pool` is holding.
     fn tcp_idle_count(pool: &ConnPool) -> usize {
         pool.inner.tcp.lock().unwrap().values().map(Vec::len).sum()
     }

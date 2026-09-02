@@ -51,6 +51,7 @@ struct Srtt {
 }
 
 impl Srtt {
+    /// Creates an entry at the neutral baseline, as for an untried server.
     fn new() -> Self {
         Self {
             micros: SRTT_BASELINE_MICROS,
@@ -89,6 +90,7 @@ impl Srtt {
 /// threading a lock through the call sites.
 #[derive(Debug)]
 pub(super) struct RttMap {
+    /// One entry per nameserver, indexed as the resolver's nameserver list is.
     entries: Mutex<Vec<Srtt>>,
 }
 

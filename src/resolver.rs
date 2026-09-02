@@ -1,5 +1,8 @@
-//! Built-in DNS resolver using `simple-dns` for packet construction/parsing
-//! and tokio for transport.
+//! The resolver itself.
+//!
+//! Builds and parses packets with `simple-dns` and moves them with tokio. The
+//! submodules hold the pieces: the cache, the connection pool, the per-server
+//! RTT map, packet construction and parsing, and the transports.
 
 #[cfg(with_rustls)]
 use std::sync::Arc;
@@ -105,13 +108,16 @@ const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// not turn every lookup into an N-way fan-out.
 const MAX_CONCURRENT_QUERIES: usize = 3;
 
-/// Delay before starting the next nameserver attempt, unless the in-flight
-/// attempt fails first. Gives faster servers a head start without blasting
-/// the whole list at once (happy-eyeballs style).
+/// Delay before starting the next nameserver attempt.
+///
+/// An in-flight attempt failing starts the next one immediately instead. The
+/// delay gives faster servers a head start without blasting the whole list at
+/// once, happy-eyeballs style.
 const QUERY_ATTEMPT_DELAY: Duration = Duration::from_millis(100);
 
-/// Number of UDP retry attempts per nameserver before giving up.
-/// UDP is unreliable, so a single dropped packet shouldn't be fatal.
+/// Number of UDP attempts per nameserver before giving up on it.
+///
+/// UDP is unreliable, so a single dropped datagram should not be fatal.
 const UDP_ATTEMPTS: usize = 2;
 
 /// Default value for `ndots` per resolv.conf(5).
@@ -121,7 +127,9 @@ const UDP_ATTEMPTS: usize = 2;
 /// domains first. See <https://man7.org/linux/man-pages/man5/resolv.conf.5.html>.
 const DEFAULT_NDOTS: usize = 1;
 
-/// RFC 6761 Section 6.3: "localhost" and names under it resolve to loopback.
+/// Returns whether `host` is `localhost` or a name under it.
+///
+/// RFC 6761 Section 6.3 reserves these to resolve to loopback without a query.
 fn is_localhost(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
     host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost")
@@ -132,8 +140,26 @@ fn is_localhost(host: &str) -> bool {
 /// See the [crate] docs for an overview. Construct one with
 /// [`Self::system_with_fallback`] for cross-platform defaults, or with
 /// [`Self::builder`] to configure the nameservers and the fallback behavior.
+///
+/// # Examples
+///
+/// ```no_run
+/// # async fn run() -> Result<(), n0_dns_resolver::Error> {
+/// use n0_dns_resolver::DnsResolver;
+///
+/// let resolver = DnsResolver::system_with_fallback();
+/// for addr in resolver.lookup_ipv4("example.com").await? {
+///     println!("{addr}");
+/// }
+/// # Ok(())
+/// # }
+/// ```
 #[derive(Debug)]
 pub struct DnsResolver {
+    /// TLS settings for DoT and DoH, from the builder or the crypto provider.
+    ///
+    /// `None` when neither supplied one, in which case those transports fail
+    /// with [`Error::MissingTlsConfig`] rather than falling back to a default.
     #[cfg(with_rustls)]
     tls_config: Option<Arc<rustls::ClientConfig>>,
     /// Lazily initialized, cached reqwest client for DNS-over-HTTPS queries.
@@ -141,35 +167,43 @@ pub struct DnsResolver {
     https_client: Mutex<Option<reqwest::Client>>,
     /// Pooled TCP/DoT connections, reused across queries.
     conn_pool: ConnPool,
+    /// Cached positive and negative answers.
+    ///
+    /// Shared with the resolver [`Self::reset`] produces, so a network change
+    /// does not start DNS cold.
     cache: DnsCache,
-    /// The settings this resolver was built from, kept so [`Self::reset`] can
-    /// rebuild against a changed network, and used to compute `state`.
+    /// The settings this resolver was built from.
+    ///
+    /// Kept so [`Self::reset`] can rebuild against a changed network, and used
+    /// to compute `state`.
     builder: Builder,
-    /// Config-derived state built on first use, so that construction and
-    /// [`Self::reset`] perform no IO: the system DNS read (which on some
-    /// platforms is a blocking or otherwise costly call) is deferred until the
-    /// first lookup rather than run eagerly on every network change.
+    /// Config-derived state, built on first use.
+    ///
+    /// Deferring it keeps construction and [`Self::reset`] free of IO. The
+    /// system DNS read blocks on some platforms, and a network change calls
+    /// reset, so it waits for the first lookup rather than running eagerly.
     state: OnceLock<ResolverState>,
 }
 
-/// The runtime state a resolver derives from its builder and the system DNS
-/// configuration, built lazily by [`DnsResolver::state`].
+/// What a resolver derives from its builder and the system configuration.
+///
+/// Built lazily by [`DnsResolver::state`].
 #[derive(Debug)]
 struct ResolverState {
     /// The effective configuration this resolver runs on.
     ///
     /// Holds the assembled nameserver list, the search list, `ndots`, and the
-    /// hosts file.
-    ///
-    /// `config.nameservers` holds the primary nameservers followed by the
-    /// fallback ones, split at `primary_count`; see
-    /// [`DnsResolver::send_query`] for how the two tiers are used.
+    /// hosts file. `config.nameservers` is the primary tier followed by the
+    /// fallback one, split at `primary_count`; see [`DnsResolver::send_query`]
+    /// for how the two are used.
     config: Config,
-    /// Number of leading entries in `config.nameservers` that form the primary
-    /// tier.
+    /// Number of leading `config.nameservers` entries forming the primary tier.
     primary_count: usize,
-    /// Smoothed RTT per nameserver (parallel to `config.nameservers`), used to
-    /// order servers and re-probe demoted ones.
+    /// Smoothed round-trip time per nameserver.
+    ///
+    /// Indexed in parallel to `config.nameservers`.
+    ///
+    /// Orders servers fastest-first and re-probes ones that were demoted.
     rtt_map: RttMap,
 }
 
@@ -291,8 +325,10 @@ impl DnsResolver {
         }
     }
 
-    /// Builds a default TLS client config from the compiled-in crypto provider,
-    /// preferring ring over aws-lc-rs, with the webpki roots.
+    /// Builds a default TLS client config from the compiled-in crypto provider.
+    ///
+    /// Prefers ring over aws-lc-rs when both features are on, and trusts the
+    /// webpki roots.
     #[cfg(all(with_rustls, with_crypto_provider))]
     fn default_tls_config() -> Option<Arc<rustls::ClientConfig>> {
         #[cfg(feature = "tls-ring")]
@@ -309,16 +345,19 @@ impl DnsResolver {
         Some(Arc::new(config))
     }
 
-    /// Without a crypto provider there is no default config, so DoT/DoH need one
-    /// from [`Builder::tls_client_config`] and otherwise fail with
-    /// [`Error::MissingTlsConfig`].
+    /// Returns no default TLS client config, for builds without a crypto provider.
+    ///
+    /// DoT and DoH then need one from [`Builder::tls_client_config`], and fail
+    /// with [`Error::MissingTlsConfig`] without it.
     #[cfg(all(with_rustls, not(with_crypto_provider)))]
     fn default_tls_config() -> Option<Arc<rustls::ClientConfig>> {
         None
     }
 
-    /// Returns the runtime state, reading the system DNS configuration on first
-    /// call and caching it for the life of this resolver.
+    /// Returns the runtime state, building it on first call.
+    ///
+    /// The first call reads the system DNS configuration, which on some
+    /// platforms blocks; every later call reuses the result.
     fn state(&self) -> &ResolverState {
         self.state
             .get_or_init(|| ResolverState::build(&self.builder))
@@ -349,7 +388,7 @@ impl DnsResolver {
 
         let mut names: Vec<String> = Vec::with_capacity(config.search_domains.len() + 1);
 
-        // Append a candidate unless it is already present.
+        /// Appends a candidate name unless the list already holds it.
         fn push(names: &mut Vec<String>, name: String) {
             if !names.contains(&name) {
                 names.push(name);
@@ -417,8 +456,10 @@ impl DnsResolver {
             .map_or(0, |d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
     }
 
-    /// TTL in seconds to use when caching a NODATA or NXDOMAIN answer, or 0 to
-    /// skip the cache.
+    /// Returns how long to cache a NODATA or NXDOMAIN answer, in seconds.
+    ///
+    /// Zero means do not cache it, which is what an unset
+    /// [`Builder::negative_max_ttl`] and an indeterminate failure both yield.
     fn negative_cache_ttl_secs(&self, soa_ttl: Option<u32>) -> u32 {
         let Some(max) = self.builder.negative_max_ttl else {
             return 0;
@@ -678,8 +719,10 @@ impl DnsResolver {
         }
     }
 
-    /// Send a query and follow CNAME chains recursively if the response contains
-    /// a CNAME but no records of the requested type.
+    /// Sends a query, following CNAME chains across responses.
+    ///
+    /// A nameserver that answers with a CNAME but no records of the requested
+    /// type has left the chain unresolved, so the target is queried in turn.
     async fn send_query_following_cnames(
         &self,
         host: String,
@@ -1010,8 +1053,9 @@ impl DnsResolver {
         Ok(records)
     }
 
-    /// Looks up the NS (name server) records for `name`, returning the name of
-    /// each authoritative name server.
+    /// Looks up the NS (name server) records for `name`.
+    ///
+    /// Each entry is the name of one authoritative name server.
     pub async fn lookup_ns(&self, name: impl Into<String>) -> Result<Vec<String>, Error> {
         let name = name.into();
         let records: Vec<String> = self
@@ -1110,9 +1154,10 @@ mod tests {
     use super::{CachedResult, DnsResolver, Hosts};
     use crate::{DnsProtocol, FallbackMode, Nameserver, Record, RecordKind, public_resolvers};
 
-    /// A resolver with no nameservers at all, for unit tests that do not query
-    /// the network. A default builder reads nothing from the host, so the tests
-    /// stay hermetic.
+    /// Builds a resolver with no nameservers at all.
+    ///
+    /// For unit tests that do not query the network. A default builder reads
+    /// nothing from the host, so these stay hermetic.
     fn empty_resolver() -> DnsResolver {
         DnsResolver::builder().build()
     }
@@ -1145,8 +1190,9 @@ mod tests {
         assert!(!addrs.is_empty(), "{host} should have IPv4 addresses");
     }
 
-    /// A FORMERR response triggers an EDNS-less retry to the same server (RFC
-    /// 6891): the mock rejects the EDNS query with FORMERR, then answers the
+    /// A FORMERR response triggers an EDNS-less retry to the same server.
+    ///
+    /// RFC 6891. The mock rejects the EDNS query with FORMERR, then answers the
     /// retry that carries no OPT record.
     #[tokio::test]
     async fn formerr_retries_without_edns() {
@@ -1194,10 +1240,11 @@ mod tests {
         handle.await.unwrap();
     }
 
-    /// When every UDP attempt fails, the resolver falls back to TCP on the same
-    /// server, so lookups still succeed on a network that drops UDP/53 but allows
-    /// TCP/53. Serves DNS over TCP only and leaves the UDP port unbound, so the
-    /// UDP attempts time out.
+    /// A server that fails over UDP is retried over TCP.
+    ///
+    /// This keeps lookups working on a network that drops UDP/53 but allows
+    /// TCP/53. The mock serves DNS over TCP only and leaves the UDP port
+    /// unbound, so the UDP attempts time out.
     #[tokio::test]
     async fn udp_failure_falls_back_to_tcp() {
         let expected = Ipv4Addr::new(93, 184, 216, 34);
@@ -1243,8 +1290,10 @@ mod tests {
         server.await.unwrap();
     }
 
-    /// With serve-stale enabled, a lookup that cannot reach any nameserver falls
-    /// back to an expired positive cache entry instead of failing.
+    /// Serve-stale answers from an expired entry when no nameserver responds.
+    ///
+    /// RFC 8767: a brief upstream outage returns the stale answer rather than
+    /// an error.
     #[tokio::test]
     async fn serve_stale_returns_expired_answer_on_failure() {
         let expected = Ipv4Addr::new(203, 0, 113, 7);
@@ -1453,8 +1502,10 @@ mod tests {
         }
     }
 
-    /// Spawns a mock UDP nameserver that answers one query with `rcode`,
-    /// echoing the question and adding `answer` as an A record when given.
+    /// Spawns a mock UDP nameserver that answers a single query.
+    ///
+    /// It replies with `rcode`, echoes the question, and adds `answer` as an A
+    /// record when one is given.
     async fn spawn_mock_ns(
         rcode: simple_dns::RCODE,
         answer: Option<Ipv4Addr>,
@@ -1488,8 +1539,10 @@ mod tests {
         (addr, handle)
     }
 
-    /// A SERVFAIL or REFUSED response from the fastest nameserver must not be
-    /// the final answer: the resolver races on to a nameserver that can answer.
+    /// A SERVFAIL or REFUSED answer must not end the lookup.
+    ///
+    /// Those mean this server will not answer for the name, so the resolver
+    /// races on to one that can rather than returning the failure.
     #[tokio::test]
     async fn servfail_winner_falls_through_to_next_nameserver() {
         let (bad, bad_handle) = spawn_mock_ns(simple_dns::RCODE::ServerFailure, None).await;
@@ -1512,12 +1565,14 @@ mod tests {
         good_handle.await.unwrap();
     }
 
-    /// A dummy nameserver address that is never actually queried, used to check
-    /// how the builder lays out the primary and fallback tiers.
+    /// A nameserver address that is never actually queried.
+    ///
+    /// Used to check how the builder lays out the primary and fallback tiers.
     const DUMMY: SocketAddr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 1)), 53);
 
-    /// In the default `Deferred` mode the fallback nameservers sit behind the
-    /// primary tier rather than racing with it.
+    /// The default `Deferred` mode keeps the fallback behind the primary tier.
+    ///
+    /// They form a second tier rather than racing with the primary one.
     #[test]
     fn deferred_keeps_fallback_in_second_tier() {
         let r = DnsResolver::builder()
@@ -1528,8 +1583,9 @@ mod tests {
         assert_eq!(r.state().config.nameservers.len(), 2);
     }
 
-    /// `FallbackMode::Eager` merges the fallback nameservers into the primary
-    /// tier so they race from the start.
+    /// `FallbackMode::Eager` merges the fallback into the primary tier.
+    ///
+    /// The two then race from the start rather than forming two tiers.
     #[test]
     fn eager_merges_tiers() {
         let r = DnsResolver::builder()
@@ -1541,8 +1597,9 @@ mod tests {
         assert_eq!(r.state().config.nameservers.len(), 2);
     }
 
-    /// A builder that adds no fallback nameservers has no second tier, so the
-    /// mode never comes into play.
+    /// A builder with no fallback nameservers has no second tier.
+    ///
+    /// The mode then never comes into play, whichever one is set.
     #[test]
     fn empty_fallback_leaves_a_single_tier() {
         for mode in [
@@ -1559,8 +1616,9 @@ mod tests {
         }
     }
 
-    /// `default_fallback_nameservers` fills the fallback tier with the public
-    /// resolvers, leaving the primary tier untouched.
+    /// `default_fallback_nameservers` fills the fallback tier only.
+    ///
+    /// The public resolvers land there, leaving the primary tier untouched.
     #[test]
     fn default_fallback_nameservers_fills_second_tier() {
         let r = DnsResolver::builder()
@@ -1574,8 +1632,9 @@ mod tests {
         );
     }
 
-    /// With no system configuration, `IfSystemEmpty` includes the fallback
-    /// nameservers, and merges them into the primary tier rather than deferring.
+    /// `IfSystemEmpty` uses the fallback when there is no system configuration.
+    ///
+    /// It merges them into the primary tier rather than deferring them.
     #[test]
     fn if_system_empty_includes_fallback_when_system_empty() {
         let r = DnsResolver::builder()
@@ -1586,8 +1645,9 @@ mod tests {
         assert_eq!(r.state().primary_count, 1);
     }
 
-    /// When every primary nameserver fails, the lookup escalates to the fallback
-    /// tier, which resolves the name.
+    /// A lookup escalates to the fallback tier when every primary one fails.
+    ///
+    /// The fallback then resolves the name.
     #[tokio::test]
     async fn escalates_to_fallback_when_primary_fails() {
         let (bad, bad_handle) = spawn_mock_ns(simple_dns::RCODE::ServerFailure, None).await;
@@ -1608,8 +1668,9 @@ mod tests {
         good_handle.await.unwrap();
     }
 
-    /// A hosts-file entry must override DNS and resolve without any network
-    /// query, the way the old hickory-backed resolver honored `/etc/hosts`.
+    /// A hosts-file entry overrides DNS and resolves without a network query.
+    ///
+    /// This is how the old hickory-backed resolver honored `/etc/hosts`.
     #[tokio::test]
     async fn hosts_file_overrides_dns() {
         let mut resolver = empty_resolver();
@@ -1625,9 +1686,10 @@ mod tests {
         assert_eq!(v6, [Ipv6Addr::LOCALHOST]);
     }
 
-    /// A major network change rebuilds the resolver via [`DnsResolver::reset`];
-    /// the DNS cache must carry across so reconnects keep resolving while the new
-    /// nameservers settle (issue #4037).
+    /// [`DnsResolver::reset`] carries the cache across a network change.
+    ///
+    /// Reconnects then keep resolving while the new nameservers settle, rather
+    /// than starting DNS cold (issue #4037).
     #[test]
     fn cache_survives_reset() {
         let r = empty_resolver();

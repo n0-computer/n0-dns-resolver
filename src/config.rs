@@ -10,6 +10,7 @@ use crate::{Nameserver, system_config::Hosts};
 /// Parsed DNS configuration: the nameservers to query and resolv.conf options.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct Config {
+    /// The nameservers to query, in the order they should be tried.
     pub(crate) nameservers: Vec<Nameserver>,
     /// Search domains from resolv.conf `search` or `domain` directives.
     ///

@@ -248,9 +248,12 @@ impl SvcbRecordData {
 /// [`DnsResolver::lookup_https`]: crate::DnsResolver::lookup_https
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HttpsRecordData {
-    /// The record's owner name, needed to resolve a `"."` target (RFC 9460
+    /// The name the record was found at.
+    ///
+    /// Needed to resolve a `"."` target, which means the owner (RFC 9460
     /// Section 2.5.2).
     owner: String,
+    /// The SVCB-format payload the HTTPS rules are layered on top of.
     data: SvcbRecordData,
 }
 
