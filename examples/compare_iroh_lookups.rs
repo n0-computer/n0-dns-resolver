@@ -48,9 +48,18 @@ const RELAY_HOSTS: &[&str] = &[
     "aps1-1.relay.n0.iroh.link.",
 ];
 
-#[tokio::main(flavor = "current_thread")]
-async fn main() {
+fn main() {
     tracing_subscriber::fmt::init();
+    run()
+}
+
+/// Runs the comparison.
+///
+/// The `compare_iroh_lookups_android` example calls this from its Android entry
+/// point, which is why it is a separate function: everything below is shared
+/// with the on-device run, only the setup above it differs.
+#[tokio::main(flavor = "current_thread")]
+pub async fn run() {
     debug!("start");
 
     let mut args = std::env::args().skip(1);
