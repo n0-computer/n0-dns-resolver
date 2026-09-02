@@ -15,6 +15,7 @@
 
 use std::{
     future::Future,
+    panic::catch_unwind,
     sync::{
         Arc,
         atomic::{AtomicU32, Ordering},
@@ -219,17 +220,32 @@ async fn lookup_n0(resolver: &DnsResolver, query: &Query) -> Outcome {
 /// Builds a hickory resolver configured like `iroh-dns` `HickoryResolver`:
 /// system DNS config, Google only if that read fails, `negative_max_ttl = 0`.
 fn build_hickory_resolver() -> TokioResolver {
-    let (config, mut options) =
-        hickory_resolver::system_conf::read_system_conf().unwrap_or_else(|reason| {
+    let google = || {
+        (
+            ResolverConfig::udp_and_tcp(&hickory_resolver::config::GOOGLE),
+            ResolverOpts::default(),
+        )
+    };
+    // On Android the read goes through `ConnectivityManager` over JNI and
+    // panics, rather than returning an error, when `ndk_context` is
+    // uninitialized. We catch the panic, like we do in iroh's hickory-resolver wrapper.
+    let (config, mut options) = match catch_unwind(hickory_resolver::system_conf::read_system_conf)
+    {
+        Ok(Ok(system_conf)) => system_conf,
+        Ok(Err(reason)) => {
             warn!(
                 %reason,
-                "Failed to read the system's DNS config, using Google DNS servers as fallback."
+                "hickory-resolver: Failed to read the system's DNS config, using Google DNS servers as fallback."
             );
-            (
-                ResolverConfig::udp_and_tcp(&hickory_resolver::config::GOOGLE),
-                ResolverOpts::default(),
-            )
-        });
+            google()
+        }
+        Err(_) => {
+            warn!(
+                "hickory-resolver: Reading the system's DNS config panicked, using Google DNS servers as fallback."
+            );
+            google()
+        }
+    };
     options.negative_max_ttl = Some(Duration::ZERO);
 
     let mut builder = TokioResolver::builder_with_config(config, TokioRuntimeProvider::default());
