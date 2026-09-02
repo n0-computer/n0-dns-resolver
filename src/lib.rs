@@ -38,7 +38,7 @@ pub use self::{
     builder::{Builder, DnsProtocol, FallbackMode, Nameserver, interleave_nameservers},
     error::{Error, ResponseCode},
     records::{
-        CaaRecordData, HttpsRecord, MxRecordData, Record, RecordKind, SrvRecordData,
+        CaaRecordData, HttpsRecordData, MxRecordData, Record, RecordKind, SrvRecordData,
         SvcbRecordData, TxtRecordData,
     },
     resolver::{DnsResolver, TransportError},

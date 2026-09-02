@@ -29,11 +29,10 @@ async fn cname_chain_resolves_across_hops() {
     .await;
 
     let resolver = resolver_for(server.addr());
-    let addrs: Vec<_> = resolver
-        .lookup_ipv4("alias.example".to_string())
+    let addrs = resolver
+        .lookup_ipv4("alias.example")
         .await
-        .expect("alias resolves across the CNAME hop")
-        .collect();
+        .expect("alias resolves across the CNAME hop");
 
     assert_eq!(addrs, [Ipv4Addr::new(10, 0, 0, 1)]);
     assert_eq!(server.query_count(), 2, "one query per CNAME hop");
@@ -63,11 +62,10 @@ async fn records_attach_to_intermediate_cname_name() {
     .await;
 
     let resolver = resolver_for(server.addr());
-    let addrs: Vec<_> = resolver
-        .lookup_ipv4("alias.example".to_string())
+    let addrs = resolver
+        .lookup_ipv4("alias.example")
         .await
-        .expect("intermediate-name record resolves")
-        .collect();
+        .expect("intermediate-name record resolves");
 
     assert_eq!(addrs, [Ipv4Addr::new(9, 9, 9, 9)]);
     assert_eq!(
@@ -90,7 +88,7 @@ async fn nodata_answer_returns_empty_result() {
 
     let resolver = resolver_for(server.addr());
     let records = resolver
-        .lookup_record("empty.example".to_string(), RecordKind::A)
+        .lookup_record("empty.example", RecordKind::A)
         .await
         .expect("NODATA is an empty result, not an error");
 
@@ -106,7 +104,7 @@ async fn negative_results_are_not_cached_by_default() {
     let resolver = resolver_for(server.addr());
     for _ in 0..2 {
         let records = resolver
-            .lookup_record("nodata.example".to_string(), RecordKind::A)
+            .lookup_record("nodata.example", RecordKind::A)
             .await
             .expect("NODATA is an empty result");
         assert!(records.is_empty());
@@ -136,7 +134,7 @@ async fn negative_caching_collapses_second_lookup() {
         .build();
     for _ in 0..2 {
         let records = resolver
-            .lookup_record("nodata.example".to_string(), RecordKind::A)
+            .lookup_record("nodata.example", RecordKind::A)
             .await
             .expect("NODATA is an empty result");
         assert!(records.is_empty());
@@ -178,11 +176,10 @@ async fn search_list_expansion_reaches_bare_name() {
     // bare name; only the bare name resolves here.
     resolver.set_search(vec!["search.invalid".to_string()], 1);
 
-    let addrs: Vec<_> = resolver
-        .lookup_ipv4("myhost".to_string())
+    let addrs = resolver
+        .lookup_ipv4("myhost")
         .await
-        .expect("resolves via the bare name after the search suffix fails")
-        .collect();
+        .expect("resolves via the bare name after the search suffix fails");
 
     assert_eq!(addrs, [Ipv4Addr::new(10, 1, 1, 1)]);
 }
@@ -217,9 +214,7 @@ async fn bare_nxdomain_wins_over_appended_nodata() {
     // Two labels exceed ndots, so the bare name is tried first, then the suffix.
     resolver.set_search(vec!["corp.local".to_string()], 1);
 
-    let result = resolver
-        .lookup_record("host.example".to_string(), RecordKind::A)
-        .await;
+    let result = resolver.lookup_record("host.example", RecordKind::A).await;
 
     assert!(
         matches!(result, Err(crate::Error::NxDomain { .. })),
@@ -256,15 +251,11 @@ async fn transient_failure_blocks_negative_caching() {
     // A single label is under ndots, so the search suffix is tried first.
     resolver.set_search(vec!["flaky".to_string()], 1);
 
-    let first = resolver
-        .lookup_record("host".to_string(), RecordKind::A)
-        .await;
+    let first = resolver.lookup_record("host", RecordKind::A).await;
     assert!(matches!(first, Err(crate::Error::NxDomain { .. })));
     let after_first = server.query_count();
 
-    let second = resolver
-        .lookup_record("host".to_string(), RecordKind::A)
-        .await;
+    let second = resolver.lookup_record("host", RecordKind::A).await;
     assert!(matches!(second, Err(crate::Error::NxDomain { .. })));
 
     assert!(
@@ -289,7 +280,7 @@ async fn srv_lookup_end_to_end() {
 
     let resolver = resolver_for(server.addr());
     let records = resolver
-        .lookup_record("_sip._tcp.example".to_string(), RecordKind::Srv)
+        .lookup_record("_sip._tcp.example", RecordKind::Srv)
         .await
         .expect("SRV resolves");
 
@@ -321,7 +312,7 @@ async fn mx_lookup_end_to_end() {
 
     let resolver = resolver_for(server.addr());
     let records = resolver
-        .lookup_record("example".to_string(), RecordKind::Mx)
+        .lookup_record("example", RecordKind::Mx)
         .await
         .expect("MX resolves");
 
@@ -351,7 +342,7 @@ async fn caa_lookup_end_to_end() {
 
     let resolver = resolver_for(server.addr());
     let records = resolver
-        .lookup_record("example".to_string(), RecordKind::Caa)
+        .lookup_record("example", RecordKind::Caa)
         .await
         .expect("CAA resolves");
 
@@ -383,7 +374,7 @@ async fn ns_lookup_end_to_end() {
 
     let resolver = resolver_for(server.addr());
     let records = resolver
-        .lookup_record("example".to_string(), RecordKind::Ns)
+        .lookup_record("example", RecordKind::Ns)
         .await
         .expect("NS resolves");
 
@@ -408,11 +399,10 @@ async fn txt_lookup_preserves_character_strings() {
     .await;
 
     let resolver = resolver_for(server.addr());
-    let records: Vec<_> = resolver
-        .lookup_txt("txt.example".to_string())
+    let records = resolver
+        .lookup_txt("txt.example")
         .await
-        .expect("TXT resolves")
-        .collect();
+        .expect("TXT resolves");
 
     assert_eq!(records.len(), 1);
     let strings: Vec<Vec<u8>> = records[0].iter().map(<[u8]>::to_vec).collect();

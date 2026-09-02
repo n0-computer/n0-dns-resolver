@@ -9,7 +9,7 @@ use simple_dns::{
 };
 
 use crate::{
-    CaaRecordData, HttpsRecord, MxRecordData, Record, RecordKind, ResponseCode, SrvRecordData,
+    CaaRecordData, HttpsRecordData, MxRecordData, Record, RecordKind, ResponseCode, SrvRecordData,
     SvcbRecordData, TxtRecordData,
 };
 
@@ -342,7 +342,7 @@ pub(super) fn parse_records(
             _ => None,
         }),
         RecordKind::Https => parse_response(data, |name, rdata| match rdata {
-            RData::HTTPS(https) => Some(Record::Https(HttpsRecord::new(
+            RData::HTTPS(https) => Some(Record::Https(HttpsRecordData::new(
                 name.to_string(),
                 extract_svcb(&https.0),
             ))),
@@ -835,10 +835,13 @@ mod tests {
     fn assert_sample_svcb(svcb: &SvcbRecordData) {
         assert_eq!(svcb.priority(), 1);
         assert_eq!(svcb.target(), "svc.example.com");
-        assert_eq!(svcb.alpn(), ["h2", "h3"]);
+        assert_eq!(svcb.alpn().collect::<Vec<_>>(), ["h2", "h3"]);
         assert_eq!(svcb.port(), Some(8443));
-        assert_eq!(svcb.ipv4hint(), [Ipv4Addr::new(192, 0, 2, 1)]);
-        assert_eq!(svcb.ipv6hint(), [Ipv6Addr::LOCALHOST]);
+        assert_eq!(
+            svcb.ipv4hint().collect::<Vec<_>>(),
+            [Ipv4Addr::new(192, 0, 2, 1)]
+        );
+        assert_eq!(svcb.ipv6hint().collect::<Vec<_>>(), [Ipv6Addr::LOCALHOST]);
     }
 
     #[test]
@@ -865,13 +868,13 @@ mod tests {
         assert_sample_svcb(https.svcb());
     }
 
-    /// The [`HttpsRecord`] helpers apply the RFC 9460 rules a raw parameter read
+    /// The [`HttpsRecordData`] helpers apply the RFC 9460 rules a raw parameter read
     /// would miss: AliasMode vs ServiceMode, the root-target-uses-owner rule
     /// (Section 2.5.2), and the default `http/1.1` ALPN (Sections 7.1.1 and 9.5).
     #[test]
     fn https_record_helpers() {
         // Parse one HTTPS record from raw rdata; the owner is EXAMPLE_WIRE.
-        fn https(rdata: &[u8]) -> HttpsRecord {
+        fn https(rdata: &[u8]) -> HttpsRecordData {
             let resp = raw_response(TYPE_HTTPS, EXAMPLE_WIRE, EXAMPLE_WIRE, TYPE_HTTPS, rdata);
             let (records, _) = parse_records(&resp, RecordKind::Https).expect("vector parses");
             match records.as_slice() {
@@ -884,8 +887,8 @@ mod tests {
         // is appended, and the root target resolves to the owner name.
         let svc = https(b"\x00\x01\x00\x00\x01\x00\x03\x02h2");
         assert!(svc.is_service() && !svc.is_alias());
-        assert_eq!(svc.alpn(), ["h2"]);
-        assert_eq!(svc.alpn_protocols(), ["h2", "http/1.1"]);
+        assert_eq!(svc.alpn().collect::<Vec<_>>(), ["h2"]);
+        assert_eq!(svc.effective_alpn(), ["h2", "http/1.1"]);
         assert!(svc.supports_http2());
         assert!(!svc.supports_http3());
         assert_eq!(svc.effective_target(), "example.com");
@@ -893,12 +896,21 @@ mod tests {
         // no-default-alpn suppresses the http/1.1 default.
         let no_default = https(b"\x00\x01\x00\x00\x01\x00\x03\x02h2\x00\x02\x00\x00");
         assert!(no_default.no_default_alpn());
-        assert_eq!(no_default.alpn_protocols(), ["h2"]);
+        assert_eq!(no_default.effective_alpn(), ["h2"]);
 
         // AliasMode (priority 0): no endpoint, so no ALPN; the target is used as-is.
         let alias = https(b"\x00\x00\x03svc\x07example\x03com\x00");
         assert!(alias.is_alias());
-        assert!(alias.alpn_protocols().is_empty());
+        assert!(alias.effective_alpn().is_empty());
+        assert!(!alias.supports_http2());
+
+        // A ServiceMode record with no `alpn` gets only the scheme default, so
+        // supports_http2 must stay false. This pins the equivalence that lets
+        // supports_http2 search the raw list rather than the effective set.
+        let bare = https(b"\x00\x01\x00");
+        assert_eq!(bare.effective_alpn(), ["http/1.1"]);
+        assert!(!bare.supports_http2());
+        assert!(!bare.supports_http3());
         assert_eq!(alias.effective_target(), "svc.example.com");
     }
 
@@ -1017,10 +1029,10 @@ mod tests {
         );
         assert_eq!(svcb.priority(), 0);
         assert_eq!(svcb.target(), "foo.example.com");
-        assert!(svcb.alpn().is_empty());
+        assert!(svcb.alpn().next().is_none());
         assert_eq!(svcb.port(), None);
-        assert!(svcb.ipv4hint().is_empty());
-        assert!(svcb.ipv6hint().is_empty());
+        assert!(svcb.ipv4hint().next().is_none());
+        assert!(svcb.ipv6hint().next().is_none());
     }
 
     /// RFC 9460 Appendix D.2.3: a ServiceMode record whose target is the root,
@@ -1071,7 +1083,7 @@ mod tests {
         assert_eq!(svcb.priority(), 1);
         assert_eq!(svcb.target(), "foo.example.com");
         assert_eq!(
-            svcb.ipv6hint(),
+            svcb.ipv6hint().collect::<Vec<_>>(),
             [
                 Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0, 1),
                 Ipv6Addr::new(0x2001, 0x0db8, 0, 0, 0, 0, 0x0053, 1),
@@ -1093,8 +1105,11 @@ mod tests {
         );
         assert_eq!(svcb.priority(), 16);
         assert_eq!(svcb.target(), "foo.example.org");
-        assert_eq!(svcb.alpn(), ["h2", "h3-19"]);
-        assert_eq!(svcb.ipv4hint(), [Ipv4Addr::new(192, 0, 2, 1)]);
+        assert_eq!(svcb.alpn().collect::<Vec<_>>(), ["h2", "h3-19"]);
+        assert_eq!(
+            svcb.ipv4hint().collect::<Vec<_>>(),
+            [Ipv4Addr::new(192, 0, 2, 1)]
+        );
     }
 
     /// `simple_dns` rejects SvcParamKeys that are not strictly ascending on the
@@ -1229,9 +1244,9 @@ mod tests {
         let [Record::Svcb(data)] = records.as_slice() else {
             panic!("expected one SVCB record, got {records:?}");
         };
-        assert_eq!(data.mandatory(), vec![1]);
+        assert_eq!(data.mandatory().collect::<Vec<_>>(), vec![1]);
         assert!(data.no_default_alpn());
-        assert_eq!(data.ech().as_deref(), Some(b"echconfig".as_slice()));
+        assert_eq!(data.ech(), Some(b"echconfig".as_slice()));
     }
 
     /// `into_boxed_slices` hands over the character strings without copying.

@@ -45,7 +45,7 @@ use n0_dns_resolver::{
 // fallback. This is the only constructor; everything else goes through the
 // builder.
 let resolver = DnsResolver::system_with_fallback();
-let addrs: Vec<_> = resolver.lookup_ipv4("example.com".to_string()).await?.collect();
+let addrs: Vec<_> = resolver.lookup_ipv4("example.com").await?.collect();
 
 // The builder starts empty, with no system configuration and no nameservers,
 // so each source is added explicitly. Here it is a single nameserver.
