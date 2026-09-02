@@ -75,14 +75,13 @@ async fn main() {
     for z32 in &z32s {
         queries.push(Query::new(RecordType::TXT, format!("_iroh.{z32}.{origin}")));
     }
-    if z32s.is_empty() {
-        if let Ok(name) = publish_iroh_txt(&origin)
+    if z32s.is_empty()
+        && let Ok(name) = publish_iroh_txt(&origin)
             .await
             .inspect_err(|err| warn!("pkarr PUT failed, skipping TXT query: {err:#}"))
-        {
-            wait_for_txt(&n0, &hickory, &name).await;
-            queries.push(Query::new(RecordType::TXT, name));
-        }
+    {
+        wait_for_txt(&n0, &hickory, &name).await;
+        queries.push(Query::new(RecordType::TXT, name));
     }
 
     println!(
@@ -191,13 +190,7 @@ fn fmt_duration(duration: Duration) -> String {
     }
 }
 
-fn id() -> u32 {
-    static NEXT_ID: AtomicU32 = AtomicU32::new(0);
-    let id = NEXT_ID.fetch_add(1, Ordering::SeqCst);
-    id
-}
-
-#[tracing::instrument(name = "query", skip_all, fields(r = %"n0", q=id()))]
+#[tracing::instrument(name = "query", skip_all, fields(r = %"n0", q=query_id()))]
 async fn lookup_n0(resolver: &DnsResolver, query: &Query) -> Outcome {
     debug!("query {query}");
     let name = query.name.clone();
@@ -244,7 +237,7 @@ fn build_hickory_resolver() -> TokioResolver {
     builder.build().expect("config works")
 }
 
-#[tracing::instrument(name = "query", skip_all, fields(r = %"hi", q=id()))]
+#[tracing::instrument(name = "query", skip_all, fields(r = %"hi", q=query_id()))]
 async fn lookup_hickory(resolver: &TokioResolver, query: &Query) -> Outcome {
     debug!("query {query}");
     match resolver.lookup(query.name.clone(), query.kind).await {
@@ -350,4 +343,9 @@ async fn wait_for_txt(n0: &DnsResolver, hickory: &TokioResolver, name: &str) {
         );
         time::sleep(Duration::from_millis(250)).await;
     }
+}
+
+fn query_id() -> u32 {
+    static NEXT_ID: AtomicU32 = AtomicU32::new(0);
+    NEXT_ID.fetch_add(1, Ordering::SeqCst)
 }

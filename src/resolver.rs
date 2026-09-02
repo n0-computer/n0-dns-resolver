@@ -150,11 +150,11 @@ struct Inner {
     /// Pooled TCP/DoT connections, reused across queries.
     conn_pool: ConnPool,
     cache: DnsCache,
-    /// The settings this resolver was built from, kept so [`Self::reset`] can
-    /// rebuild against a changed network, and used to compute `state`.
+    /// The settings this resolver was built from, kept so [`DnsResolver::reset`]
+    /// can rebuild against a changed network, and used to compute `state`.
     builder: Builder,
     /// Config-derived state built on first use, so that construction and
-    /// [`Self::reset`] perform no IO: the system DNS read (which on some
+    /// [`DnsResolver::reset`] perform no IO: the system DNS read (which on some
     /// platforms is a blocking or otherwise costly call) is deferred until the
     /// first lookup rather than run eagerly on every network change.
     state: OnceLock<ResolverState>,
