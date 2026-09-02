@@ -791,10 +791,10 @@ impl DnsResolver {
         let mut saw_transient = false;
         let names = self.search_names(&name);
         let total = names.len();
-        for (i, search_name) in names.into_iter().enumerate() {
-            trace!(%search_name, ?kind, "resolving");
+        for (i, name) in names.into_iter().enumerate() {
+            trace!(%name, ?kind, "resolving");
             let (res, soa_negative_ttl) = match self
-                .send_query_following_cnames(search_name.clone(), kind.dns_type())
+                .send_query_following_cnames(name.clone(), kind.dns_type())
                 .await
             {
                 Ok(response) => {
@@ -833,7 +833,7 @@ impl DnsResolver {
                 }
                 Err(e @ Error::NxDomain { .. }) => {
                     let remaining = total - i - 1;
-                    trace!(%search_name, ?kind, remaining, reason = %e, "lookup failed");
+                    trace!(%name, ?kind, remaining, reason = %e, "lookup failed");
                     if first_negative.is_none() {
                         first_negative = Some(CachedResult::NxDomain);
                         negative_ttl_secs = self.negative_cache_ttl_secs(soa_negative_ttl);
@@ -852,7 +852,7 @@ impl DnsResolver {
                     | Error::InvalidResponse { .. }),
                 ) => {
                     let remaining = total - i - 1;
-                    trace!(%search_name, ?kind, remaining, reason = %e, "lookup failed");
+                    trace!(%name, ?kind, remaining, reason = %e, "lookup failed");
                     saw_transient = true;
                     last_err = Some(e);
                 }
@@ -861,7 +861,7 @@ impl DnsResolver {
                 // candidate identically, so there is nothing to gain by trying
                 // the rest.
                 Err(e) => {
-                    debug!(%search_name, ?kind, reason = %e, "lookup failed");
+                    debug!(%name, ?kind, reason = %e, "lookup failed");
                     return Err(e);
                 }
             }
