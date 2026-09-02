@@ -64,7 +64,11 @@ impl<T: Copy> Addrs<T> {
 /// Static host-to-address mappings parsed from the system hosts file.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Hosts {
+    /// Names with an IPv4 address, pre-sized on parse since most lines are A.
     a: NameMap<Ipv4Addr>,
+    /// Names with an IPv6 address.
+    ///
+    /// Kept apart from `a` so an A-only name costs nothing here.
     aaaa: NameMap<Ipv6Addr>,
 }
 

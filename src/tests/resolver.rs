@@ -1,5 +1,6 @@
-//! End-to-end resolver scenarios ported from hickory-resolver, driven through
-//! the public API against a mock UDP nameserver.
+//! End-to-end resolver scenarios ported from hickory-resolver.
+//!
+//! Each drives the public API against a mock UDP nameserver.
 
 use std::{net::Ipv4Addr, time::Duration};
 
@@ -95,8 +96,9 @@ async fn nodata_answer_returns_empty_result() {
     assert!(records.is_empty());
 }
 
-/// By default negatives are not cached. A second NODATA lookup hits the
-/// nameserver again.
+/// Negatives are not cached by default.
+///
+/// A second NODATA lookup therefore reaches the nameserver again.
 #[tokio::test]
 async fn negative_results_are_not_cached_by_default() {
     let server = spawn_mock(|query| Some(reply(query, RCODE::NoError, vec![]))).await;
@@ -384,9 +386,10 @@ async fn ns_lookup_end_to_end() {
     assert_eq!(name, "ns1.example");
 }
 
-/// A TXT lookup preserves each character-string of the record as its own bytes,
-/// rather than concatenating them, matching the RFC 1035 Section 3.3.14 model of
-/// a TXT record as a list of character-strings.
+/// A TXT lookup keeps each character-string separate.
+///
+/// Concatenating them would lose the RFC 1035 Section 3.3.14 model of a TXT
+/// record as a list of character-strings.
 #[tokio::test]
 async fn txt_lookup_preserves_character_strings() {
     let server = spawn_mock(|query| {

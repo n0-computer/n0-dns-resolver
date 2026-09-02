@@ -4,8 +4,9 @@ use std::net::{IpAddr, SocketAddr};
 
 use super::{Config, DnsProtocol, Hosts, Nameserver};
 
-/// Reads the nameservers and search domains from `/etc/resolv.conf`, plus the
-/// hosts file.
+/// Reads the nameservers and search domains from `/etc/resolv.conf`.
+///
+/// Also reads the hosts file.
 pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
     let content = std::fs::read_to_string("/etc/resolv.conf")?;
     let mut config = parse_resolv_conf(&content);
@@ -112,10 +113,12 @@ mod tests {
 
     use super::*;
 
+    /// Returns the parsed nameserver addresses, dropping ports and protocols.
     fn ips(config: &Config) -> Vec<IpAddr> {
         config.nameservers.iter().map(|ns| ns.addr.ip()).collect()
     }
 
+    /// Builds an IPv4 [`IpAddr`], to keep the expectations below readable.
     fn ipv4(a: u8, b: u8, c: u8, d: u8) -> IpAddr {
         IpAddr::V4(Ipv4Addr::new(a, b, c, d))
     }

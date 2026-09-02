@@ -22,8 +22,9 @@ pub enum TransportError {
         #[error(from)]
         source: io::Error,
     },
-    /// A UDP response arrived from an address other than the nameserver queried,
-    /// so it was rejected (a spoofing defence).
+    /// A UDP response arrived from an address other than the one queried.
+    ///
+    /// Rejected as a spoofing defence.
     #[error("response from unexpected source {actual}, expected {expected}")]
     UnexpectedSource {
         /// The nameserver address the query was sent to.
@@ -259,8 +260,9 @@ mod tests {
     use super::*;
     use crate::Record;
 
-    /// Parses the A records from a response and returns just the addresses and
-    /// TTL, so the transport tests can compare against `Vec<Ipv4Addr>`.
+    /// Parses a response down to its A record addresses and TTL.
+    ///
+    /// Lets the transport tests compare against a plain `Vec<Ipv4Addr>`.
     fn parse_a_addrs(data: &[u8]) -> (Vec<Ipv4Addr>, u32) {
         let (records, ttl) =
             super::super::query::parse_records(data, crate::RecordKind::A).unwrap();
@@ -386,8 +388,9 @@ mod tests {
         handle.await.unwrap();
     }
 
-    /// A datagram that exactly fills the receive buffer is flagged as possibly
-    /// truncated, so the caller can retry over TCP.
+    /// A datagram that exactly fills the receive buffer is flagged as truncated.
+    ///
+    /// It may have been cut off, so the caller can retry over TCP.
     #[tokio::test]
     async fn udp_query_flags_full_buffer_as_maybe_truncated() {
         let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();

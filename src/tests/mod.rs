@@ -40,8 +40,11 @@ const ANSWER_TTL: u32 = 300;
 /// the resolved records and how many network queries the lookup issued (for
 /// example that a cached result served the second lookup).
 pub(crate) struct MockServer {
+    /// The loopback address the server is bound to.
     addr: SocketAddr,
+    /// Queries received so far, shared with the receive loop.
     queries: Arc<AtomicUsize>,
+    /// The receive loop, aborted when the server is dropped.
     task: JoinHandle<()>,
 }
 
@@ -103,9 +106,10 @@ where
     }
 }
 
-/// Builds a resolver that queries only `addr` over UDP. A default builder adds
-/// no system config and no fallback tier, so the lookup is hermetic and hits
-/// only the mock.
+/// Builds a resolver that queries only `addr`, over UDP.
+///
+/// A default builder adds no system config and no fallback tier, so the lookup
+/// is hermetic and reaches only the mock.
 pub(crate) fn resolver_for(addr: SocketAddr) -> DnsResolver {
     DnsResolver::builder()
         .nameserver(Nameserver::new(addr, DnsProtocol::Udp))

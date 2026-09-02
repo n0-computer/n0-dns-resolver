@@ -94,16 +94,26 @@ fn cache_key(host: &str, kind: RecordKind) -> u64 {
 /// A cache entry with TTL expiry tracking.
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    /// The host and record kind this entry is for. Verified on lookup so a
+    /// The host this entry is for, in [`normalize`] form.
+    ///
+    /// Verified against the query on lookup, together with `kind`, so that a
     /// `u64` key collision returns a miss rather than another entry's records.
     host: String,
+    /// The record kind this entry is for, verified on lookup alongside `host`.
     kind: RecordKind,
+    /// The answer, which may be positive, NODATA or NXDOMAIN.
     result: CachedResult,
+    /// When the entry was stored, which `ttl` counts from.
     inserted_at: Instant,
+    /// How long the entry stays fresh, clamped to [`MAX_TTL_SECS`] on insert.
     ttl: Duration,
 }
 
 impl CacheEntry {
+    /// Returns whether the entry has outlived its TTL.
+    ///
+    /// An expired entry is not evicted, so [`DnsCache::get_stale`] can still
+    /// serve it under serve-stale.
     fn is_expired(&self) -> bool {
         self.inserted_at.elapsed() > self.ttl
     }
@@ -111,9 +121,9 @@ impl CacheEntry {
 
 /// Thread-safe DNS cache with LRU eviction and TTL-based expiry.
 ///
-/// Uses pre-hashed u64 keys to avoid allocating a `String` on every lookup.
-/// The only remaining per-hit allocation is the `records.clone()` on cache hit,
-/// necessary because the result must outlive the lock guard.
+/// Uses pre-hashed `u64` keys, so a lookup does not allocate a key. The one
+/// remaining per-hit allocation is cloning the result, which has to outlive the
+/// lock guard.
 ///
 /// Cloning shares the same underlying cache, so a resolver rebuilt on a network
 /// change (see [`DnsResolver::reset`]) can carry its cache across rather
@@ -122,10 +132,12 @@ impl CacheEntry {
 /// [`DnsResolver::reset`]: super::DnsResolver::reset
 #[derive(Debug, Clone)]
 pub(super) struct DnsCache {
+    /// Shared by every clone, which is what lets a reset carry the cache over.
     inner: Arc<Mutex<LruCache<u64, CacheEntry>>>,
 }
 
 impl DnsCache {
+    /// Creates an empty cache holding up to [`MAX_CACHE_ENTRIES`] entries.
     pub(super) fn new() -> Self {
         Self {
             inner: Arc::new(Mutex::new(LruCache::new(
@@ -213,8 +225,9 @@ impl DnsCache {
         self.inner.lock().expect("poisoned").clear();
     }
 
-    /// Inserts an entry that expired `expired_ago` ago (stored with `ttl`,
-    /// inserted `ttl + expired_ago` in the past), for serve-stale tests.
+    /// Inserts an entry that expired `expired_ago` ago, for serve-stale tests.
+    ///
+    /// Stored with `ttl`, as though inserted `ttl + expired_ago` in the past.
     #[cfg(test)]
     pub(super) fn insert_expired(
         &self,
@@ -259,8 +272,7 @@ mod tests {
         CachedResult::Positive(vec![Record::A(ADDR)])
     }
 
-    /// Asserts that `result` is a positive hit holding exactly one A record for
-    /// `expected`.
+    /// Asserts that `result` holds exactly one A record for `expected`.
     fn assert_single_a(result: Option<CachedResult>, expected: Ipv4Addr) {
         match result {
             Some(CachedResult::Positive(records)) => {

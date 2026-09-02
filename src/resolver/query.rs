@@ -423,8 +423,9 @@ mod tests {
         build_query(host, TYPE::A).unwrap()
     }
 
-    /// Parses the A records from `data` and returns just their addresses and TTL,
-    /// so the A-focused tests can compare against `Vec<Ipv4Addr>` directly.
+    /// Parses `data` down to its A record addresses and TTL.
+    ///
+    /// Lets the A-focused tests compare against a plain `Vec<Ipv4Addr>`.
     fn parse_a_addrs(data: &[u8]) -> (Vec<Ipv4Addr>, u32) {
         let (records, ttl) = parse_records(data, RecordKind::A).unwrap();
         let addrs = records
@@ -461,8 +462,10 @@ mod tests {
         packet.build_bytes_vec().unwrap()
     }
 
-    /// Build a response containing a CNAME from `alias` -> `canonical`, plus
-    /// A records under the canonical name (the common "both in one response" case).
+    /// Builds a response with a CNAME from `alias` to `canonical`.
+    ///
+    /// The A records sit under the canonical name, which is the common case of
+    /// a nameserver answering the alias and the target in one response.
     fn cname_with_a_response(id: u16, alias: &str, canonical: &str, addrs: &[Ipv4Addr]) -> Vec<u8> {
         let mut packet = Packet::new_reply(id);
         packet.set_flags(PacketFlag::RECURSION_DESIRED | PacketFlag::RECURSION_AVAILABLE);
@@ -662,8 +665,9 @@ mod tests {
         assert_eq!(target.as_deref(), Some("real.example.com"));
     }
 
-    /// Builds a reply packet echoing one question for `name`/`qtype`, plus an A
-    /// answer, so `check_response` has something to validate.
+    /// Builds a reply echoing one question for `name`/`qtype`, plus an A answer.
+    ///
+    /// Gives `check_response` something to validate.
     fn reply_with_question(id: u16, name: &str, qtype: TYPE) -> Packet<'static> {
         let mut packet = Packet::new_reply(id);
         packet.set_flags(PacketFlag::RECURSION_DESIRED | PacketFlag::RECURSION_AVAILABLE);
@@ -726,8 +730,9 @@ mod tests {
         assert_eq!(target, None);
     }
 
-    /// Builds a reply for `name` carrying a single `rdata` answer, so a parse
-    /// test can drive [`parse_records`] against one record of a given kind.
+    /// Builds a reply for `name` carrying a single `rdata` answer.
+    ///
+    /// Lets a parse test drive [`parse_records`] against one record of a kind.
     fn reply_with_answer(name: &str, qtype: TYPE, rdata: RData<'_>) -> Vec<u8> {
         let mut packet = Packet::new_reply(1);
         packet.set_flags(PacketFlag::RECURSION_DESIRED | PacketFlag::RECURSION_AVAILABLE);
@@ -821,8 +826,9 @@ mod tests {
         assert_eq!(&*caa.value, b"letsencrypt.org");
     }
 
-    /// Builds an SVCB rdata in ServiceMode with the parameters we decode set, so
-    /// both the SVCB and HTTPS parse tests can share one endpoint description.
+    /// Builds a ServiceMode SVCB rdata with every parameter we decode set.
+    ///
+    /// Lets the SVCB and HTTPS parse tests share one endpoint description.
     fn sample_svcb() -> SVCB<'static> {
         let mut svcb = SVCB::new(1, Name::new_unchecked("svc.example.com"));
         svcb.set_alpn(&["h2".try_into().unwrap(), "h3".try_into().unwrap()]);
@@ -868,9 +874,11 @@ mod tests {
         assert_sample_svcb(https.svcb());
     }
 
-    /// The [`HttpsRecordData`] helpers apply the RFC 9460 rules a raw parameter read
-    /// would miss: AliasMode vs ServiceMode, the root-target-uses-owner rule
-    /// (Section 2.5.2), and the default `http/1.1` ALPN (Sections 7.1.1 and 9.5).
+    /// The [`HttpsRecordData`] helpers apply the RFC 9460 rules.
+    ///
+    /// A raw parameter read would miss all three: AliasMode versus ServiceMode,
+    /// the root-target-uses-owner rule (Section 2.5.2), and the default
+    /// `http/1.1` ALPN (Sections 7.1.1 and 9.5).
     #[test]
     fn https_record_helpers() {
         // Parse one HTTPS record from raw rdata; the owner is EXAMPLE_WIRE.
@@ -914,8 +922,9 @@ mod tests {
         assert_eq!(alias.effective_target(), "svc.example.com");
     }
 
-    /// The header-peek helpers run on raw, unvalidated bytes before the response
-    /// is checked, so a short buffer must return a value rather than panic.
+    /// The header-peek helpers must not panic on a short buffer.
+    ///
+    /// They run on raw, unvalidated bytes before the response is checked.
     #[test]
     fn header_helpers_do_not_panic_on_short_input() {
         for data in [&[][..], &[0][..], &[0, 0][..], &[0, 0, 0][..]] {
@@ -925,9 +934,10 @@ mod tests {
         }
     }
 
-    /// A TXT record with several character-strings must preserve each one as its
-    /// own raw bytes, including binary and `key=value` content, rather than
-    /// concatenating them or dropping non-UTF-8 data.
+    /// A TXT record keeps each character-string as its own raw bytes.
+    ///
+    /// That covers binary and `key=value` content, which concatenating them or
+    /// dropping non-UTF-8 data would lose.
     #[test]
     fn parse_txt_preserves_character_strings() {
         let (id, _) = make_query("example.com");
@@ -959,8 +969,9 @@ mod tests {
         assert_eq!(strings, [b"first".as_slice(), b"k=\xff\x00".as_slice()]);
     }
 
-    /// The `example.com` owner name in wire form, used by the hand-assembled
-    /// packets below for both the question and the single answer.
+    /// The `example.com` owner name in wire form.
+    ///
+    /// Used by the hand-assembled packets below for the question and answer.
     const EXAMPLE_WIRE: &[u8] = b"\x07example\x03com\x00";
 
     /// SVCB and HTTPS record type codes (RFC 9460 Section 14.1 and 14.2).
@@ -1005,9 +1016,10 @@ mod tests {
         buf
     }
 
-    /// Wraps a raw SVCB or HTTPS rdata vector in a one-answer response and returns
-    /// the parsed record data, so the RFC 9460 Appendix D vectors drive straight
-    /// through [`parse_records`].
+    /// Parses a raw SVCB or HTTPS rdata vector into its record data.
+    ///
+    /// Wraps it in a one-answer response first, so the RFC 9460 Appendix D
+    /// vectors drive straight through [`parse_records`].
     fn parse_svcb_vector(rtype: u16, kind: RecordKind, rdata: &[u8]) -> SvcbRecordData {
         let resp = raw_response(rtype, EXAMPLE_WIRE, EXAMPLE_WIRE, rtype, rdata);
         let (records, _) = parse_records(&resp, kind).expect("vector should parse");
@@ -1018,8 +1030,9 @@ mod tests {
         }
     }
 
-    /// RFC 9460 Appendix D.1: an AliasMode record has priority 0, a target, and
-    /// no parameters.
+    /// RFC 9460 Appendix D.1: an AliasMode record.
+    ///
+    /// Priority 0, a target, and no parameters.
     #[test]
     fn parse_svcb_aliasmode_vector() {
         let svcb = parse_svcb_vector(
@@ -1035,8 +1048,9 @@ mod tests {
         assert!(svcb.ipv6hint().next().is_none());
     }
 
-    /// RFC 9460 Appendix D.2.3: a ServiceMode record whose target is the root,
-    /// which surfaces as an empty target string.
+    /// RFC 9460 Appendix D.2.3: a ServiceMode record targeting the root.
+    ///
+    /// The root target surfaces as an empty target string.
     #[test]
     fn parse_svcb_root_target_vector() {
         let svcb = parse_svcb_vector(TYPE_SVCB, RecordKind::Svcb, b"\x00\x01\x00");
@@ -1057,8 +1071,9 @@ mod tests {
         assert_eq!(svcb.port(), Some(53));
     }
 
-    /// The same D.2.4 vector must parse identically through the HTTPS path, which
-    /// reuses the SVCB rdata.
+    /// The D.2.4 vector parses identically through the HTTPS path.
+    ///
+    /// HTTPS records reuse the SVCB rdata format.
     #[test]
     fn parse_https_port_vector() {
         let https = parse_svcb_vector(
@@ -1091,8 +1106,9 @@ mod tests {
         );
     }
 
-    /// RFC 9460 Appendix D.2.10: `mandatory`, `alpn`, and `ipv4hint` together,
-    /// stored out of presentation order but sorted on the wire.
+    /// RFC 9460 Appendix D.2.10: `mandatory`, `alpn` and `ipv4hint` together.
+    ///
+    /// Stored out of presentation order, but sorted on the wire.
     #[test]
     fn parse_svcb_mandatory_alpn_ipv4hint_vector() {
         let svcb = parse_svcb_vector(
@@ -1112,9 +1128,10 @@ mod tests {
         );
     }
 
-    /// `simple_dns` rejects SvcParamKeys that are not strictly ascending on the
-    /// wire (RFC 9460 Section 2.2). Such a packet must surface as a clean parse
-    /// error rather than panicking.
+    /// SvcParamKeys out of ascending order are a clean parse error.
+    ///
+    /// RFC 9460 Section 2.2 requires them strictly ascending on the wire, and
+    /// `simple_dns` rejects the packet rather than panicking.
     #[test]
     fn parse_svcb_out_of_order_params_is_malformed() {
         // Priority 1, root target, then `port` (key 3) before `alpn` (key 1).
@@ -1128,8 +1145,9 @@ mod tests {
         ));
     }
 
-    /// An A answer whose rdlength is 3 rather than 4 is malformed. It must yield a
-    /// clean parse error, not a panic on a short read.
+    /// An A answer with an rdlength of 3 is a clean parse error.
+    ///
+    /// Four bytes are required, and a short read must not panic.
     #[test]
     fn parse_a_with_short_rdata_is_malformed() {
         let resp = raw_response(
@@ -1145,8 +1163,9 @@ mod tests {
         ));
     }
 
-    /// An answer whose owner name is a compression pointer to the question name
-    /// resolves to that name, so the record is matched and returned.
+    /// An owner name that is a compression pointer resolves to its target.
+    ///
+    /// Pointing at the question name matches, so the record is returned.
     #[test]
     fn parse_a_with_compression_pointer_resolves() {
         // The question name begins at offset 12, right after the fixed header.
@@ -1162,9 +1181,10 @@ mod tests {
         assert_eq!(addrs, [Ipv4Addr::new(10, 0, 0, 7)]);
     }
 
-    /// A self-referential compression pointer must be rejected as a clean parse
-    /// error. `simple_dns` only follows strictly-backward pointers, so a pointer
-    /// to its own offset fails without looping.
+    /// A self-referential compression pointer is a clean parse error.
+    ///
+    /// `simple_dns` follows only strictly-backward pointers, so one aimed at
+    /// its own offset fails without looping.
     #[test]
     fn parse_a_with_circular_pointer_is_malformed() {
         // The answer name sits right after the 12-byte header and the question
@@ -1184,9 +1204,10 @@ mod tests {
         ));
     }
 
-    /// A record attached to an intermediate name in the CNAME chain (not the
-    /// query name or the final canonical name) must still be collected, matching
-    /// how recursive resolvers extract from the whole chain.
+    /// A record on an intermediate name in the CNAME chain is still collected.
+    ///
+    /// The name is neither the query name nor the final canonical name, but
+    /// recursive resolvers extract from the whole chain.
     #[test]
     fn parse_collects_records_on_intermediate_cname_name() {
         let (id, _) = make_query("alias.example.com");
@@ -1225,8 +1246,10 @@ mod tests {
         assert_eq!(addrs, [Ipv4Addr::new(9, 9, 9, 9)]);
     }
 
-    /// The SVCB accessors surface the ECH config, the mandatory key list, and the
-    /// no-default-alpn flag.
+    /// The SVCB accessors surface the less common parameters.
+    ///
+    /// Namely the ECH config, the mandatory key list and the no-default-alpn
+    /// flag.
     #[test]
     fn svcb_exposes_ech_mandatory_and_no_default_alpn() {
         use simple_dns::rdata::{SVCB, SVCParam};
@@ -1262,9 +1285,10 @@ mod tests {
         assert_eq!(&*slices[1], b"bb");
     }
 
-    /// A short-TTL CNAME in the chain bounds the returned min TTL, so the alias
-    /// is not cached past the CNAME's intended lifetime even when the final
-    /// records carry a longer TTL.
+    /// A short-TTL CNAME in the chain bounds the returned minimum TTL.
+    ///
+    /// The alias must not be cached past the CNAME's intended lifetime, even
+    /// when the final records carry a longer TTL.
     #[test]
     fn cname_ttl_bounds_the_min_ttl() {
         let (id, _) = make_query("alias.example.com");
