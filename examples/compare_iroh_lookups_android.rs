@@ -38,6 +38,36 @@ mod compare_iroh_lookups;
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
 fn android_main(_app: android_activity::AndroidApp) {
-    paranoid_android::init("compare_iroh_lookups");
+    init_logging();
     compare_iroh_lookups::run()
+}
+
+/// Sends the example's output to logcat, and not much else.
+///
+/// The results are `println!`, which this target turns into `info` events, and
+/// the default filter passes those plus any warning. An Android process has no
+/// environment to read at run time, so `RUST_LOG` is read at build time
+/// instead; changing it rebuilds the example:
+///
+/// ```text
+/// RUST_LOG=n0_dns_resolver=debug cargo apk run --example compare_iroh_lookups_android
+/// ```
+#[cfg(target_os = "android")]
+fn init_logging() {
+    use tracing_subscriber::{
+        filter::Targets, layer::SubscriberExt as _, util::SubscriberInitExt as _,
+    };
+
+    /// Results and warnings. The glue's lifecycle logging is off because it
+    /// reports the activity being torn down as errors.
+    const DEFAULT_FILTER: &str = "warn,android_activity=off,compare_iroh_lookups_android=info";
+
+    let filter: Targets = option_env!("RUST_LOG")
+        .unwrap_or(DEFAULT_FILTER)
+        .parse()
+        .expect("RUST_LOG parses as a tracing filter");
+    tracing_subscriber::registry()
+        .with(paranoid_android::layer("compare_iroh_lookups").with_target(false))
+        .with(filter)
+        .init();
 }
