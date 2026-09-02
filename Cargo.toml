@@ -60,6 +60,12 @@ tls-aws-lc-rs = ["rustls?/aws-lc-rs"]
 android-activity = { version = "0.6", features = ["native-activity"] }
 paranoid-android = "0.2.2"
 
+# patchbay netsim test dependencies (linux only)
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+anyhow = "1"
+ctor = "1.0"
+patchbay = "0.7"
+
 [dev-dependencies]
 hickory-resolver = { version = "0.26.0", features = ["tokio", "system-config"] }
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }

@@ -1,0 +1,13 @@
+# The patchbay tests build Linux network namespaces and measure lookup latency.
+# Running them alongside each other, or alongside the rest of the suite, both
+# starves the namespace threads and skews the timings they exist to report, so
+# they get a group of their own.
+[test-groups.patchbay]
+max-threads = 1
+
+[[profile.default.overrides]]
+filter = 'binary(patchbay_lossy)'
+test-group = 'patchbay'
+# A lookup under loss can legitimately take tens of seconds, and each test runs
+# several of them with both resolvers.
+slow-timeout = { period = "60s", terminate-after = 5 }
