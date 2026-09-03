@@ -56,6 +56,10 @@ transport-https = ["dep:reqwest", "dep:rustls", "dep:webpki-roots"]
 tls-ring = ["rustls?/ring"]
 tls-aws-lc-rs = ["rustls?/aws-lc-rs"]
 
+[target.'cfg(target_os = "android")'.dev-dependencies]
+android-activity = { version = "0.6", features = ["native-activity"] }
+paranoid-android = "0.2.2"
+
 [dev-dependencies]
 hickory-resolver = { version = "0.26.0", features = ["tokio", "system-config"] }
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
@@ -76,6 +80,28 @@ allowed_external_types = [
     "reqwest::error::Error",
 ]
 
+[package.metadata.android]
+# arm64 phones and x86_64 emulators.
+build_targets = ["aarch64-linux-android", "x86_64-linux-android"]
+
+[package.metadata.android.sdk]
+min_sdk_version = 24
+target_sdk_version = 33
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.INTERNET"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_NETWORK_STATE"
+
 [[example]]
 name = "compare_iroh_lookups"
 required-features = ["transport-https", "tls-ring"]
+
+# The same example, packaged for Android. cargo-apk needs a `cdylib`, and an
+# example cannot be both that and a runnable binary, so this is a separate
+# target that compiles the one above as a module.
+[[example]]
+name = "compare_iroh_lookups_android"
+required-features = ["transport-https", "tls-ring"]
+crate-type = ["cdylib"]
