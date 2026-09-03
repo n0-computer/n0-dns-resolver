@@ -635,6 +635,12 @@ impl DnsResolver {
     /// succeeds on a network that drops outbound UDP/53 but permits TCP/53.
     /// Whichever transport answers first wins.
     ///
+    /// A server that refuses UDP outright rather than dropping it leaves nothing
+    /// in flight, and there the TCP query starts as soon as the datagrams have
+    /// run out rather than waiting out the delay: an interface with no route to
+    /// the server fails every send immediately, and the whole point of the delay
+    /// is to give datagrams that might still arrive their chance.
+    ///
     /// Duplicate datagrams are safe: each carries the same transaction id from a
     /// fresh random source port, and the caller validates the id, the QR bit, and
     /// the echoed question either way.
@@ -666,16 +672,33 @@ impl DnsResolver {
         let tcp_due = MaybeFuture::Some(time::sleep(TCP_JOIN_DELAY));
         tokio::pin!(tcp_due);
         let mut sends_left = UDP_DATAGRAMS;
+        // Whether a datagram is due right now. The first one is; the rest come
+        // due when `next_send` fires, or as soon as a datagram fails outright,
+        // so one that errors on the socket is replaced at once rather than an
+        // interval later. Nothing else pulls a send forward: a wakeup from the
+        // TCP side must not spend a datagram the pacing has not released yet.
+        let mut send_due = true;
         let mut last_err = None;
 
         loop {
-            if sends_left > 0 {
+            if send_due && sends_left > 0 {
                 trace!(%addr, datagram = UDP_DATAGRAMS - sends_left, "sending UDP query");
                 datagrams.push(transport::udp_query(addr, query_bytes));
                 sends_left -= 1;
                 if sends_left > 0 {
                     next_send.as_mut().set_future(time::sleep(retransmit));
+                } else {
+                    // Nothing more to pace, and a timer left running here would
+                    // hold the loop open past the last failure.
+                    next_send.as_mut().set_none();
                 }
+            }
+            send_due = false;
+
+            // Nothing outstanding and no datagram left to send, so the rest of
+            // the delay cannot produce an answer: bring TCP forward to now.
+            if datagrams.is_empty() && sends_left == 0 && tcp_due.is_some() {
+                tcp_due.as_mut().set_future(time::sleep(Duration::ZERO));
             }
 
             tokio::select! {
@@ -696,6 +719,9 @@ impl DnsResolver {
                     Err(err) => {
                         trace!(%addr, %err, "UDP query failed");
                         last_err = Some(Error::from(err));
+                        // A send that failed on the socket left nothing in
+                        // flight to wait for, so replace it now.
+                        send_due = true;
                     }
                 },
                 // The TCP query came back.
@@ -706,11 +732,8 @@ impl DnsResolver {
                         last_err = Some(Error::from(err));
                     }
                 },
-                // Time to send the next datagram. The loop head does it, and
-                // will also do it on any other wakeup while sends are left, so
-                // a datagram that fails outright is replaced at once rather
-                // than an interval later.
-                () = &mut next_send, if next_send.is_some() => {}
+                // Time to send the next datagram.
+                () = &mut next_send, if next_send.is_some() => send_due = true,
                 // Time to bring TCP in.
                 () = &mut tcp_due, if tcp_due.is_some() => {
                     // The datagrams may still be in flight rather than lost, so
@@ -1300,7 +1323,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tracing::info;
 
-    use super::{CachedResult, DnsResolver, Hosts, UDP_RETRANSMIT_MIN};
+    use super::{CachedResult, DnsResolver, Hosts, TCP_JOIN_DELAY, UDP_RETRANSMIT_MIN};
     use crate::{DnsProtocol, FallbackMode, Nameserver, Record, RecordKind, public_resolvers};
 
     /// Builds a resolver with no nameservers at all.
@@ -1446,6 +1469,25 @@ mod tests {
             "recovery took {elapsed:?}, expected about {UDP_RETRANSMIT_MIN:?}"
         );
         handle.await.unwrap();
+    }
+
+    /// A nameserver that rejects UDP outright does not wait out the TCP delay.
+    ///
+    /// Port 0 is not a valid destination, so every datagram fails on the socket
+    /// immediately and nothing is ever in flight. Sitting out
+    /// [`TCP_JOIN_DELAY`] there would delay only the TCP query that is about to
+    /// fail too, and behind it the next nameserver in the race. This is the
+    /// shape of an interface with no route to the server.
+    #[tokio::test]
+    async fn udp_rejected_outright_skips_the_tcp_delay() {
+        let resolver = with_proto("127.0.0.1:0".parse().unwrap(), DnsProtocol::Udp);
+        let start = Instant::now();
+        assert!(resolver.lookup_ipv4("example.com").await.is_err());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < TCP_JOIN_DELAY,
+            "gave up after {elapsed:?}, expected well inside the {TCP_JOIN_DELAY:?} TCP join delay"
+        );
     }
 
     /// A server that fails over UDP is retried over TCP.
