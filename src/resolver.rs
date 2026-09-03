@@ -115,13 +115,38 @@ const MAX_CONCURRENT_QUERIES: usize = 3;
 /// once, happy-eyeballs style.
 const QUERY_ATTEMPT_DELAY: Duration = Duration::from_millis(100);
 
-/// Number of UDP datagrams sent to one nameserver for a single query.
+/// Number of UDP datagrams sent at the paced retransmit interval.
 ///
 /// UDP is unreliable, so a single dropped datagram should not be fatal. The
 /// datagrams overlap rather than run in sequence: each goes out while the
 /// earlier ones are still outstanding, and any may carry the answer. Matches
 /// hickory-resolver's `max_retries`.
-const UDP_DATAGRAMS: usize = 3;
+const UDP_PACED_DATAGRAMS: usize = 3;
+
+/// Number of UDP datagrams sent to one nameserver for a single query.
+///
+/// The first [`UDP_PACED_DATAGRAMS`] go out at the interval
+/// [`DnsResolver::retransmit_interval`] gives; after those the interval doubles
+/// for each one that follows, so the last of the six lands around five seconds
+/// in rather than at three times the interval.
+///
+/// Stopping at the paced run left UDP silent for the rest of
+/// [`UDP_NAMESERVER_TIMEOUT`], five of its six seconds, with a single TCP query
+/// carrying the lookup alone. On a link that drops packets at random that is the
+/// wrong thing to lean on. A datagram is one packet and one round trip, where a
+/// TCP query needs a handshake, a query, and an answer to all get through, and
+/// recovers from a loss on the kernel's retransmission timer rather than on
+/// ours. The later datagrams cost nothing in any case where they are not needed:
+/// a lookup that TCP answers returns and drops the whole set, so against a UDP
+/// black hole we still send three.
+const UDP_DATAGRAMS: usize = 6;
+
+/// Growth of the retransmit interval past the paced run.
+///
+/// Doubling is what keeps the ceiling low. Holding the interval flat instead
+/// would put a datagram on a black-holed link every 300ms for six seconds;
+/// doubling reaches the end of the run on three more.
+const UDP_RETRANSMIT_BACKOFF: u32 = 2;
 
 /// Multiplier on a nameserver's smoothed RTT to get its retransmit interval.
 ///
@@ -151,9 +176,10 @@ const UDP_RETRANSMIT_MAX: Duration = Duration::from_secs(1);
 /// How long a nameserver may leave UDP unanswered before the query also goes
 /// out over TCP.
 ///
-/// [`UDP_RETRANSMIT_MIN`] times [`UDP_DATAGRAMS`], so at the interval floor the
-/// whole run of datagrams has gone out with one interval to spare. A link that
-/// merely loses datagrams therefore recovers over UDP and never pays for a
+/// [`UDP_RETRANSMIT_MIN`] times [`UDP_PACED_DATAGRAMS`], so at the interval
+/// floor the paced run of datagrams has gone out with one interval to spare. A
+/// link that merely loses datagrams therefore recovers over UDP and never pays
+/// for a
 /// connection. The datagrams stay outstanding either way: TCP joins them rather
 /// than replacing them.
 ///
@@ -165,7 +191,7 @@ const UDP_RETRANSMIT_MAX: Duration = Duration::from_secs(1);
 /// switch to another transport off it is not, because there the RTT measures the
 /// fallback we are trying to reach.
 const TCP_JOIN_DELAY: Duration =
-    Duration::from_millis(UDP_RETRANSMIT_MIN.as_millis() as u64 * UDP_DATAGRAMS as u64);
+    Duration::from_millis(UDP_RETRANSMIT_MIN.as_millis() as u64 * UDP_PACED_DATAGRAMS as u64);
 
 /// Default value for `ndots` per resolv.conf(5).
 ///
@@ -642,11 +668,13 @@ impl DnsResolver {
 
     /// Queries a nameserver over UDP, overlapping retransmits and then TCP.
     ///
-    /// Sends up to [`UDP_DATAGRAMS`] datagrams `retransmit` apart, each from its
-    /// own socket and all left outstanding, so a datagram that never arrives
-    /// costs one interval rather than a full timeout. After [`TCP_JOIN_DELAY`]
-    /// with nothing answered a TCP query joins them, which is how a lookup still
-    /// succeeds on a network that drops outbound UDP/53 but permits TCP/53.
+    /// Sends up to [`UDP_DATAGRAMS`] datagrams, each from its own socket and all
+    /// left outstanding, so a datagram that never arrives costs one interval
+    /// rather than a full timeout. The first [`UDP_PACED_DATAGRAMS`] go
+    /// `retransmit` apart and the interval doubles from there. After
+    /// [`TCP_JOIN_DELAY`] with nothing answered a TCP query joins them, which is
+    /// how a lookup still succeeds on a network that drops outbound UDP/53 but
+    /// permits TCP/53.
     /// Whichever transport answers first wins.
     ///
     /// A server that refuses UDP outright rather than dropping it leaves nothing
@@ -699,6 +727,10 @@ impl DnsResolver {
         let tcp_due = MaybeFuture::Some(time::sleep(TCP_JOIN_DELAY));
         tokio::pin!(tcp_due);
         let mut sends_left = UDP_DATAGRAMS;
+        // Datagrams left at the paced interval, and the wait until the next one.
+        // Past the paced run the interval doubles rather than holding flat.
+        let mut paced_left = UDP_PACED_DATAGRAMS;
+        let mut interval = retransmit;
         // Whether a datagram is due right now. The first one is; the rest come
         // due when `next_send` fires, or as soon as a datagram fails outright,
         // so one that errors on the socket is replaced at once rather than an
@@ -709,13 +741,20 @@ impl DnsResolver {
 
         loop {
             if send_due && sends_left > 0 {
-                trace!(%addr, datagram = UDP_DATAGRAMS - sends_left, "sending UDP query");
+                let n = UDP_DATAGRAMS - sends_left;
+                trace!(%addr, datagram = n, ?interval, "sending UDP query");
                 let sent = Instant::now();
                 datagrams
                     .push(async move { (sent, transport::udp_query(addr, query_bytes).await) });
                 sends_left -= 1;
+                paced_left = paced_left.saturating_sub(1);
                 if sends_left > 0 {
-                    next_send.as_mut().set_future(time::sleep(retransmit));
+                    if paced_left == 0 {
+                        interval = interval
+                            .checked_mul(UDP_RETRANSMIT_BACKOFF)
+                            .unwrap_or(UDP_NAMESERVER_TIMEOUT);
+                    }
+                    next_send.as_mut().set_future(time::sleep(interval));
                 } else {
                     // Nothing more to pace, and a timer left running here would
                     // hold the loop open past the last failure.
@@ -1354,7 +1393,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tracing::info;
 
-    use super::{CachedResult, DnsResolver, Hosts, TCP_JOIN_DELAY, UDP_RETRANSMIT_MIN};
+    use super::{
+        CachedResult, DnsResolver, Hosts, TCP_JOIN_DELAY, UDP_PACED_DATAGRAMS, UDP_RETRANSMIT_MIN,
+    };
     use crate::{DnsProtocol, FallbackMode, Nameserver, Record, RecordKind, public_resolvers};
 
     /// Builds a resolver with no nameservers at all.
@@ -1498,6 +1539,65 @@ mod tests {
         assert!(
             elapsed < UDP_RETRANSMIT_MIN * 2,
             "recovery took {elapsed:?}, expected about {UDP_RETRANSMIT_MIN:?}"
+        );
+        handle.await.unwrap();
+    }
+
+    /// Datagrams keep going after the paced run has been used up.
+    ///
+    /// The mock swallows every datagram of the paced run and answers the first
+    /// one after it, and nothing listens on TCP at that address, so the TCP
+    /// query that joins at [`TCP_JOIN_DELAY`] is refused. Only a datagram can
+    /// carry this lookup, and only if we are still sending them.
+    ///
+    /// This is the case the harness meets under heavy random loss: three
+    /// datagrams inside the first 600ms, then five silent seconds resting on a
+    /// single TCP query, on a link where a datagram is the likelier of the two
+    /// to get through.
+    #[tokio::test]
+    async fn datagrams_continue_past_the_paced_run() {
+        let expected = Ipv4Addr::new(198, 51, 100, 41);
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            for _ in 0..UDP_PACED_DATAGRAMS {
+                server.recv_from(&mut buf).await.unwrap();
+            }
+            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+            let query = Packet::parse(&buf[..n]).unwrap();
+            let mut reply = Packet::new_reply(query.id());
+            reply.set_flags(PacketFlag::RECURSION_DESIRED | PacketFlag::RECURSION_AVAILABLE);
+            reply.questions.push(Question::new(
+                Name::new_unchecked("example.com"),
+                QTYPE::TYPE(TYPE::A),
+                QCLASS::CLASS(CLASS::IN),
+                false,
+            ));
+            reply.answers.push(ResourceRecord::new(
+                Name::new_unchecked("example.com"),
+                CLASS::IN,
+                300,
+                RData::A(A {
+                    address: u32::from(expected),
+                }),
+            ));
+            let bytes = reply.build_bytes_vec().unwrap();
+            server.send_to(&bytes, peer).await.unwrap();
+        });
+
+        let resolver = with_proto(addr, DnsProtocol::Udp);
+        let start = Instant::now();
+        let addrs = resolver.lookup_ipv4("example.com").await.unwrap();
+        let elapsed = start.elapsed();
+        assert_eq!(addrs, [expected]);
+        // The first datagram past the paced run is due one doubled interval
+        // after the last of it, so about four floors in. Well short of the
+        // six-second limit that a resolver which had stopped would wait out.
+        assert!(
+            elapsed < UDP_RETRANSMIT_MIN * 8,
+            "recovered after {elapsed:?}, expected about {:?}",
+            UDP_RETRANSMIT_MIN * 4
         );
         handle.await.unwrap();
     }
