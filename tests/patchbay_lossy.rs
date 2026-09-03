@@ -77,13 +77,13 @@ const ANSWER: Ipv4Addr = Ipv4Addr::new(10, 77, 0, 1);
 /// TTL on the answers, long enough that no lookup in a test re-queries.
 const ANSWER_TTL: u32 = 300;
 
-/// Ceiling on our own median once the TCP query has had to rescue a lookup.
+/// Ceiling on our own median in the scenarios that lose datagrams.
 ///
-/// Both scenarios where that happens are floored at the resolver's 900ms delay
-/// before TCP starts, plus a round trip. The bound is deliberately well clear of
-/// that floor: it exists to catch a return to the six-second behaviour, not to
-/// pin the exact delay, and a tight bound would flake whenever a loaded runner
-/// adds scheduling latency.
+/// Those are floored either at two retransmit intervals or, where UDP never
+/// answers at all, at the resolver's 900ms delay before TCP starts. The bound is
+/// deliberately well clear of both: it exists to catch a return to the
+/// six-second behaviour, not to pin the exact delay, and a tight bound would
+/// flake whenever a loaded runner adds scheduling latency.
 const LATENCY_CEILING: Duration = Duration::from_millis(1500);
 
 /// Cap on a single lookup, past which we record it as a failure.
@@ -363,6 +363,14 @@ impl Samples {
     }
 }
 
+/// Returns this crate's samples out of a run.
+fn ours(samples: &[Samples]) -> &Samples {
+    samples
+        .iter()
+        .find(|s| s.label == "n0")
+        .expect("n0 samples")
+}
+
 /// Returns the median latency of the resolver labelled `label`.
 ///
 /// # Panics
@@ -629,8 +637,17 @@ async fn first_datagram_dropped() -> Result<()> {
 
 /// The nameserver drops the first two datagrams of every lookup.
 ///
-/// Past hickory's `max_retries = 3` limit for a single pool pass, and past our
-/// run of datagrams too, so this is where the TCP query decides the outcome.
+/// Past hickory's `max_retries = 3` limit for a single pool pass, so hickory
+/// falls back on its 5 s timeout. Our third datagram is still inside the run, so
+/// UDP should carry it on its own, two retransmit intervals in and well before
+/// the TCP query is due.
+///
+/// That last part is the assertion that catches a regression of the pacing.
+/// The retransmit interval is scaled off the nameserver's smoothed RTT, so if
+/// the intervals a lookup spends waiting were ever folded back into that RTT,
+/// the interval would grow with every lossy lookup here: the third datagram
+/// would slip past the TCP join delay, and TCP would start answering lookups
+/// that UDP should have.
 #[tokio::test(flavor = "current_thread")]
 async fn first_two_datagrams_dropped() -> Result<()> {
     let fixture = fixture(UdpPolicy::DropFirst(2)).await?;
@@ -644,10 +661,16 @@ async fn first_two_datagrams_dropped() -> Result<()> {
             s.label
         );
     }
-    let ours = median(&samples, "n0");
+    let n0 = ours(&samples);
+    assert_eq!(
+        n0.tcp, 0,
+        "n0 should recover over UDP here; a TCP query means the retransmit \
+         interval has drifted past the join delay"
+    );
+    let median = median(&samples, "n0");
     assert!(
-        ours < LATENCY_CEILING,
-        "n0 median {ours:?} should be near the TCP join delay, not seconds past it"
+        median < LATENCY_CEILING,
+        "n0 median {median:?} should be two retransmit intervals, not seconds"
     );
     fixture.ok();
     Ok(())
@@ -667,10 +690,7 @@ async fn udp_blackhole_tcp_works() -> Result<()> {
     let fixture = fixture(UdpPolicy::Blackhole).await?;
     let samples = fixture.run(3).await?;
     report("udp_blackhole_tcp_works", &samples);
-    let n0 = samples
-        .iter()
-        .find(|s| s.label == "n0")
-        .expect("n0 samples");
+    let n0 = ours(&samples);
     assert_eq!(
         n0.ok(),
         n0.lookups.len(),

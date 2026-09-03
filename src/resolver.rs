@@ -551,6 +551,10 @@ impl DnsResolver {
     /// `retransmit` is how long to wait between UDP datagrams, from
     /// [`Self::retransmit_interval`]; it is ignored for the other transports.
     ///
+    /// Returns the response together with the round trip of the exchange that
+    /// carried it, which is the sample the caller folds into the server's
+    /// smoothed RTT.
+    ///
     /// A FORMERR response often means the server or a middlebox rejected our
     /// EDNS(0) OPT record, so retry the same server once without it (RFC 6891
     /// Section 6.2.2) before letting the caller move on. If the query carries no
@@ -561,8 +565,8 @@ impl DnsResolver {
         ns: &Nameserver,
         query_bytes: &[u8],
         retransmit: Duration,
-    ) -> Result<Vec<u8>, Error> {
-        let resp = self
+    ) -> Result<(Vec<u8>, Duration), Error> {
+        let (resp, rtt) = self
             .query_nameserver_once(ns, query_bytes, retransmit)
             .await?;
         if query::is_format_error(&resp)
@@ -571,16 +575,20 @@ impl DnsResolver {
             debug!(addr = %ns.addr, "FORMERR with EDNS, retrying without OPT");
             return self.query_nameserver_once(ns, &stripped, retransmit).await;
         }
-        Ok(resp)
+        Ok((resp, rtt))
     }
 
     /// Query a single nameserver once over its configured transport.
+    ///
+    /// Returns the response and the round trip of the exchange that carried it:
+    /// for UDP the winning datagram's own round trip rather than the whole run
+    /// (see [`Self::udp_query`]), for the others the single query it sends.
     async fn query_nameserver_once(
         &self,
         ns: &Nameserver,
         query_bytes: &[u8],
         retransmit: Duration,
-    ) -> Result<Vec<u8>, Error> {
+    ) -> Result<(Vec<u8>, Duration), Error> {
         let addr = ns.addr;
         match ns.protocol {
             DnsProtocol::Udp => time::timeout(
@@ -590,11 +598,13 @@ impl DnsResolver {
             .await
             .map_err(|_| e!(Error::Timeout))?,
             DnsProtocol::Tcp => {
-                Self::with_timeout(
+                let sent = Instant::now();
+                let resp = Self::with_timeout(
                     STREAM_TIMEOUT,
                     transport::tcp_query(&self.conn_pool, addr, query_bytes),
                 )
-                .await
+                .await?;
+                Ok((resp, sent.elapsed()))
             }
             #[cfg(transport_tls)]
             DnsProtocol::Tls => {
@@ -602,7 +612,8 @@ impl DnsResolver {
                     .tls_config
                     .as_ref()
                     .ok_or_else(|| e!(Error::MissingTlsConfig))?;
-                Self::with_timeout(
+                let sent = Instant::now();
+                let resp = Self::with_timeout(
                     STREAM_TIMEOUT,
                     transport::tls_query(
                         &self.conn_pool,
@@ -612,16 +623,19 @@ impl DnsResolver {
                         ns.server_name.as_deref(),
                     ),
                 )
-                .await
+                .await?;
+                Ok((resp, sent.elapsed()))
             }
             #[cfg(transport_https)]
             DnsProtocol::Https => {
                 let client = self.get_or_init_https_client()?;
-                Self::with_timeout(
+                let sent = Instant::now();
+                let resp = Self::with_timeout(
                     STREAM_TIMEOUT,
                     transport::https_query(addr, ns.server_name.as_deref(), query_bytes, &client),
                 )
-                .await
+                .await?;
+                Ok((resp, sent.elapsed()))
             }
         }
     }
@@ -648,6 +662,15 @@ impl DnsResolver {
     /// A truncated response also brings in the TCP query, since the full answer
     /// only fits there.
     ///
+    /// Returns the response and the round trip of the exchange that carried it,
+    /// timed from when that datagram (or the TCP query) went out rather than from
+    /// the start of the run. The caller folds that sample into the smoothed RTT
+    /// that [`Self::retransmit_interval`] paces the next lookup off, so it must
+    /// not contain the intervals we ourselves waited: a sample that did would
+    /// stretch the next interval, which would stretch the next sample, and a link
+    /// that keeps losing datagrams would ratchet its own recovery time up to the
+    /// cap.
+    ///
     /// The caller bounds this with [`UDP_NAMESERVER_TIMEOUT`]; it has no internal
     /// deadline.
     async fn udp_query(
@@ -655,9 +678,10 @@ impl DnsResolver {
         addr: SocketAddr,
         query_bytes: &[u8],
         retransmit: Duration,
-    ) -> Result<Vec<u8>, Error> {
-        // Datagrams still outstanding. None is cancelled when another answers:
-        // dropping the whole set on return closes their sockets.
+    ) -> Result<(Vec<u8>, Duration), Error> {
+        // Datagrams still outstanding, each carrying the instant it went out.
+        // None is cancelled when another answers: dropping the whole set on
+        // return closes their sockets.
         let mut datagrams = FuturesUnordered::new();
         // The TCP query, once the datagrams have run out. Cancelling it is safe:
         // the pool hands out a connection by removing it and only takes it back
@@ -665,6 +689,9 @@ impl DnsResolver {
         // returning a half-read one.
         let tcp = MaybeFuture::None;
         tokio::pin!(tcp);
+        // When the TCP query went out, for its round trip. Only read once `tcp`
+        // holds a future, which is where it is set.
+        let mut tcp_sent = Instant::now();
         // Fires when the next datagram is due.
         let next_send = MaybeFuture::None;
         tokio::pin!(next_send);
@@ -683,7 +710,9 @@ impl DnsResolver {
         loop {
             if send_due && sends_left > 0 {
                 trace!(%addr, datagram = UDP_DATAGRAMS - sends_left, "sending UDP query");
-                datagrams.push(transport::udp_query(addr, query_bytes));
+                let sent = Instant::now();
+                datagrams
+                    .push(async move { (sent, transport::udp_query(addr, query_bytes).await) });
                 sends_left -= 1;
                 if sends_left > 0 {
                     next_send.as_mut().set_future(time::sleep(retransmit));
@@ -704,7 +733,7 @@ impl DnsResolver {
             tokio::select! {
                 biased;
                 // A datagram came back.
-                Some(res) = datagrams.next(), if !datagrams.is_empty() => match res {
+                Some((sent, res)) = datagrams.next(), if !datagrams.is_empty() => match res {
                     Ok((resp, maybe_truncated)) if maybe_truncated || query::is_truncated(&resp) => {
                         debug!(%addr, "UDP response truncated, fetching the answer over TCP");
                         // The answer does not fit in a datagram, so stop sending
@@ -715,7 +744,7 @@ impl DnsResolver {
                             tcp_due.as_mut().set_future(time::sleep(Duration::ZERO));
                         }
                     }
-                    Ok((resp, _)) => return Ok(resp),
+                    Ok((resp, _)) => return Ok((resp, sent.elapsed())),
                     Err(err) => {
                         trace!(%addr, %err, "UDP query failed");
                         last_err = Some(Error::from(err));
@@ -726,7 +755,7 @@ impl DnsResolver {
                 },
                 // The TCP query came back.
                 res = &mut tcp, if tcp.is_some() => match res {
-                    Ok(resp) => return Ok(resp),
+                    Ok(resp) => return Ok((resp, tcp_sent.elapsed())),
                     Err(err) => {
                         debug!(%addr, %err, "TCP query failed");
                         last_err = Some(Error::from(err));
@@ -740,6 +769,7 @@ impl DnsResolver {
                     // they keep their sockets open and TCP races them rather
                     // than replacing them.
                     debug!(%addr, "UDP unanswered, joining with TCP");
+                    tcp_sent = Instant::now();
                     tcp.as_mut().set_future(transport::tcp_query(
                         &self.conn_pool,
                         addr,
@@ -815,7 +845,9 @@ impl DnsResolver {
     /// overlaps its own retransmits, paced by the server's smoothed RTT (see
     /// [`Self::udp_query`]). Per-server success and failure update that same
     /// smoothed RTT, so the server list is self-healing and the pacing adapts
-    /// with it.
+    /// with it. A success records the round trip of the exchange that answered,
+    /// not of the whole attempt, so an attempt's own retransmit intervals stay
+    /// out of the estimate that sets the next one.
     async fn race(&self, indices: &[usize], query_bytes: &[u8]) -> Result<Vec<u8>, Error> {
         let state = self.state();
         let order = self.order_indices(indices);
@@ -835,12 +867,11 @@ impl DnsResolver {
             {
                 let idx = order[next];
                 next += 1;
-                let start = Instant::now();
                 let retransmit = Self::retransmit_interval(state.rtt_map.get_decayed(idx));
                 dials.push(async move {
                     let ns = &state.config.nameservers[idx];
                     let res = self.query_nameserver(ns, query_bytes, retransmit).await;
-                    (idx, start, res)
+                    (idx, res)
                 });
                 // Pace the following attempt, unless this was the last server.
                 if next < order.len() {
@@ -857,8 +888,8 @@ impl DnsResolver {
             tokio::select! {
                 biased;
                 // A dial attempt completed.
-                Some((idx, start, res)) = dials.next(), if !dials.is_empty() => match res {
-                    Ok(resp) => {
+                Some((idx, res)) = dials.next(), if !dials.is_empty() => match res {
+                    Ok((resp, rtt)) => {
                         // A SERVFAIL, REFUSED, or FORMERR response means this server
                         // will not answer for the name (overloaded, not authoritative,
                         // policy block, or it rejected the query even without EDNS).
@@ -873,7 +904,7 @@ impl DnsResolver {
                             // Fail fast: start the next attempt now rather than waiting.
                             next_attempt.as_mut().set_none();
                         } else {
-                            state.rtt_map.record_success(idx, start.elapsed());
+                            state.rtt_map.record_success(idx, rtt);
                             return Ok(resp);
                         }
                     }
