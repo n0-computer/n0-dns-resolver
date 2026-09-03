@@ -65,10 +65,15 @@ use tokio::{
 /// Initializes the user namespace before any thread is spawned.
 ///
 /// patchbay needs this to run rootless, and it has to happen while the process
-/// is still single-threaded.
+/// is still single-threaded. This runs from ELF `.init_array`, before the Rust
+/// runtime is up, so it uses patchbay's libc-only entry point rather than
+/// `init_userns`: the latter allocates and returns a `Result` that could only be
+/// reported by panicking, which is not something this context can do. A failure
+/// here is silent by design and surfaces in [`fixture`], where it can be
+/// explained.
 #[ctor::ctor(unsafe)]
 fn userns_ctor() {
-    patchbay::init_userns().expect("failed to init userns");
+    unsafe { patchbay::init_userns_for_ctor() };
 }
 
 /// The address every A query is answered with.
@@ -505,7 +510,10 @@ struct Fixture {
 
 /// Builds the lab and starts the test nameserver with the given UDP policy.
 async fn fixture(policy: UdpPolicy) -> Result<Fixture> {
-    let lab = Lab::new().await?;
+    let lab = Lab::new().await.context(
+        "failed to build the patchbay lab; it needs unprivileged user namespaces \
+         (CONFIG_USER_NS, and kernel.unprivileged_userns_clone=1 where that knob exists)",
+    )?;
     let net = lab.add_router("net").build().await?;
     let server = lab.add_device("ns").uplink(net.id()).build().await?;
     let client = lab.add_device("client").uplink(net.id()).build().await?;
@@ -515,14 +523,21 @@ async fn fixture(policy: UdpPolicy) -> Result<Fixture> {
 
     let counts = Arc::new(Counts::default());
     let server_counts = counts.clone();
+    // The first lookup must not race the nameserver's binds. A datagram sent
+    // before UDP/53 exists is dropped by the kernel without the drop policy ever
+    // seeing it, which silently makes that lookup one datagram unluckier than
+    // the scenario says it is.
+    let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let task = server.spawn(move |_dev| async move {
         let udp = UdpSocket::bind(server_addr).await.expect("bind udp/53");
         let tcp = TcpListener::bind(server_addr).await.expect("bind tcp/53");
+        let _ = ready_tx.send(());
         tokio::join!(
             serve_udp(udp, policy, server_counts.clone()),
             serve_tcp(tcp, server_counts),
         );
     })?;
+    ready_rx.await.context("nameserver failed to bind")?;
 
     Ok(Fixture {
         client,
@@ -582,6 +597,8 @@ async fn no_loss_baseline() -> Result<()> {
     let fixture = fixture(UdpPolicy::Answer).await?;
     let samples = fixture.run(6).await?;
     report("no_loss_baseline", &samples);
+    // Both resolvers answering is a check on the lab rather than on either of
+    // them: if a clean link fails here, nothing below this line means anything.
     for s in &samples {
         assert_eq!(
             s.ok(),
@@ -589,19 +606,18 @@ async fn no_loss_baseline() -> Result<()> {
             "{} failed on a clean link",
             s.label
         );
-        // Retransmitting early should cost nothing when nothing is lost.
-        assert_eq!(
-            s.udp,
-            s.lookups.len() as u64,
-            "{} should send exactly one datagram per lookup on a clean link",
-            s.label
-        );
-        assert_eq!(
-            s.tcp, 0,
-            "{} should not fall back to TCP on a clean link",
-            s.label
-        );
     }
+    // The packet counts are asserted for this crate only. hickory's are in the
+    // table for scale, but they are a fact about hickory's defaults, and pinning
+    // them here would turn a version bump there into a failure here.
+    let n0 = ours(&samples);
+    // Retransmitting early should cost nothing when nothing is lost.
+    assert_eq!(
+        n0.udp,
+        n0.lookups.len() as u64,
+        "n0 should send exactly one datagram per lookup on a clean link"
+    );
+    assert_eq!(n0.tcp, 0, "n0 should not fall back to TCP on a clean link");
     fixture.ok();
     Ok(())
 }
