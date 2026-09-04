@@ -259,7 +259,8 @@ pub(super) fn names_equal(a: &Name<'_>, b: &Name<'_>) -> bool {
 ///
 /// Records of the queried type can be attached to any name along the chain, not
 /// just the final one, so extraction matches against the whole chain the way a
-/// recursive resolver does. Bounded by [`MAX_CNAME_DEPTH`].
+/// recursive resolver does. Bounded by [`MAX_CNAME_DEPTH`]. Only records of
+/// class IN take part; see [`parse_response`].
 fn cname_chain<'a>(packet: &'a Packet<'a>, start_name: &Name<'a>) -> Vec<Name<'a>> {
     let mut chain = vec![start_name.clone()];
     let mut current = start_name.clone();
@@ -267,7 +268,7 @@ fn cname_chain<'a>(packet: &'a Packet<'a>, start_name: &Name<'a>) -> Vec<Name<'a
         let Some(RData::CNAME(cname)) = packet
             .answers
             .iter()
-            .find(|rr| names_equal(&rr.name, &current))
+            .find(|rr| rr.class == CLASS::IN && names_equal(&rr.name, &current))
             .map(|rr| &rr.rdata)
         else {
             break;
@@ -343,6 +344,10 @@ pub(super) fn check_response(
 /// this walks the CNAME chain anchored on the question and extracts records of
 /// the requested type using `extract` at every name along the chain. Returns the
 /// records and the minimum TTL across them.
+///
+/// Every query is for class IN, and a record of another class is a different
+/// record even under the same name and type, so records of any other class are
+/// left out rather than returned as answers to an IN question.
 fn parse_response<T>(
     data: &[u8],
     extract: impl Fn(&Name<'_>, &RData<'_>) -> Option<T>,
@@ -360,7 +365,7 @@ fn parse_response<T>(
     let mut results = Vec::new();
     let mut min_ttl = u32::MAX;
     for rr in &packet.answers {
-        if !chain.iter().any(|name| names_equal(name, &rr.name)) {
+        if rr.class != CLASS::IN || !chain.iter().any(|name| names_equal(name, &rr.name)) {
             continue;
         }
         // A CNAME along the chain bounds the cached lifetime too: a short-TTL
@@ -1394,6 +1399,44 @@ mod tests {
             parse_records(&resp, RecordKind::A),
             Err(QueryError::Malformed { .. })
         ));
+    }
+
+    /// A record of a class other than IN is not an answer to an IN question.
+    ///
+    /// Neither as a record of the queried type nor as a link in the CNAME
+    /// chain.
+    #[test]
+    fn parse_ignores_records_of_another_class() {
+        let (id, _) = make_query("example.com");
+        let mut packet = reply_with_question(id, "example.com", TYPE::A);
+        packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked("example.com"),
+            CLASS::CH,
+            300,
+            RData::A(A {
+                address: u32::from(Ipv4Addr::new(6, 6, 6, 6)),
+            }),
+        ));
+        packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked("example.com"),
+            CLASS::CH,
+            300,
+            RData::CNAME(CNAME(Name::new_unchecked("other.example.com"))),
+        ));
+        packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked("other.example.com"),
+            CLASS::IN,
+            300,
+            RData::A(A {
+                address: u32::from(Ipv4Addr::new(7, 7, 7, 7)),
+            }),
+        ));
+        let resp = packet.build_bytes_vec().unwrap();
+
+        let (addrs, _) = parse_a_addrs(&resp);
+        assert!(addrs.is_empty(), "got {addrs:?}");
+        let packet = Packet::parse(&resp).unwrap();
+        assert_eq!(cname_target(&packet, "example.com"), None);
     }
 
     /// A record on an intermediate name in the CNAME chain is still collected.
