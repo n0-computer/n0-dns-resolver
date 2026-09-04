@@ -11,6 +11,7 @@ use std::sync::Mutex;
 use std::{
     future::Future,
     net::{Ipv4Addr, Ipv6Addr},
+    pin::Pin,
     sync::OnceLock,
 };
 
@@ -266,6 +267,18 @@ impl ResolverState {
 }
 
 impl DnsResolver {
+    /// Looks up records of `kind` for `name`.
+    pub fn lookup_record(
+        &self,
+        name: impl Into<String>,
+        kind: RecordKind,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Record>, Error>> + Send + '_>> {
+        // Type-erase the large lookup future here. Downstream adapters may box
+        // a typed lookup again, and retaining the complete concrete future can
+        // exhaust rustc's trait solver while it proves the outer future is Send.
+        Box::pin(self.lookup_record_impl(name.into(), kind))
+    }
+
     /// Creates a resolver on the system configuration, backed by public resolvers.
     ///
     /// This is the cross-platform default. The host's nameservers, search
@@ -781,12 +794,11 @@ impl DnsResolver {
     ///
     /// Returns [`Error::NxDomain`] when the name does not exist, and the other
     /// [`Error`] variants when every nameserver fails to answer.
-    pub async fn lookup_record(
+    async fn lookup_record_impl(
         &self,
-        name: impl Into<String>,
+        name: String,
         kind: RecordKind,
     ) -> Result<Vec<Record>, Error> {
-        let name = name.into();
         match self.cache.get(&name, kind) {
             Some(CachedResult::Positive(records)) => {
                 trace!(%name, records = records.len(), ?kind, "cache hit");
