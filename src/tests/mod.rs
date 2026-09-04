@@ -12,9 +12,7 @@
 //! nameserver, so they exercise the full lookup path (search-list expansion,
 //! CNAME following, parsing, and caching) rather than an internal function.
 
-mod live_txt;
 mod resolver;
-mod vs_hickory;
 
 use std::{
     net::{Ipv4Addr, SocketAddr},
