@@ -1,17 +1,12 @@
 //! Smoothed round-trip time (RTT) tracking, per nameserver.
 //!
-//! Each nameserver carries two estimates, because the two things that read them
-//! want opposite treatments of a lookup's own overhead.
-//!
-//! Ordering wants what a lookup to this server costs, so it measures the whole
-//! attempt. A server whose UDP is black-holed and whose answers come from the
-//! TCP query that joins at `TCP_JOIN_DELAY` costs most of a second every time,
-//! and should rank below one that answers a datagram in 40ms.
-//!
-//! Pacing retransmits wants how long a datagram takes to come back, so it
-//! measures one datagram exchange. Folding our own retransmit intervals into
-//! that estimate would let it set its own input, and the interval would climb on
-//! every lossy lookup.
+//! Each nameserver carries two estimates, because the two readers want opposite
+//! treatments of a lookup's own overhead. Ordering asks what a server costs us,
+//! so it measures the whole attempt: one whose UDP is black-holed pays
+//! `TCP_JOIN_DELAY` every lookup and should rank below one that answers a
+//! datagram in 40ms. Pacing asks how long a datagram takes to come back, so it
+//! measures one exchange. Folding our own intervals into that estimate would let
+//! it set its own input.
 
 use std::sync::Mutex;
 
@@ -52,26 +47,20 @@ const SRTT_DECAY_SECS: f64 = 180.0;
 /// Smoothed round-trip time estimates for one nameserver.
 #[derive(Debug)]
 struct Srtt {
-    /// What a whole attempt to this nameserver costs, in microseconds, as of
-    /// `updated`.
+    /// What a whole attempt costs, in microseconds, as of `updated`.
     ///
-    /// Orders nameservers fastest-first and demotes ones that fail. As the
-    /// estimate ages it decays back toward the baseline, so that a demoted
-    /// server eventually gets re-probed and a once-fast server that has gone
-    /// away does not stay preferred forever.
+    /// Orders nameservers fastest-first and demotes ones that fail. Decays back
+    /// toward the baseline as it ages, so a demoted server gets re-probed and a
+    /// once-fast one that has gone away does not stay preferred.
     attempt_micros: f64,
     /// When `attempt_micros` was last written.
     updated: Instant,
-    /// Round trip of one datagram exchange with this nameserver, in
-    /// microseconds.
+    /// Round trip of one datagram exchange, in microseconds.
     ///
     /// Paces retransmits. Written only when a datagram carried the answer, so
-    /// neither the intervals we waited nor the latency of a TCP query that
-    /// rescued the lookup reach it.
-    ///
-    /// Unlike `attempt_micros` this does not decay. Its only reader clamps it to
-    /// a few hundred milliseconds either way, so a stale estimate is coarse
-    /// rather than wrong, and the next datagram that answers corrects it.
+    /// neither our own intervals nor a rescuing TCP query reach it. Does not
+    /// decay: its only reader clamps it to a few hundred milliseconds either
+    /// way, and the next datagram corrects it.
     datagram_micros: f64,
 }
 
@@ -97,10 +86,9 @@ impl Srtt {
     /// Folds a successful attempt into the estimates.
     ///
     /// `attempt` is how long the whole attempt took, `datagram` the round trip
-    /// of the exchange that answered when that was a datagram. The two differ by
-    /// the retransmit intervals the attempt waited out and by a TCP query that
-    /// joined the datagrams, which is exactly what the pacing estimate must not
-    /// see.
+    /// of the exchange that answered when a datagram did. They differ by the
+    /// intervals the attempt waited out and by any TCP query that joined the
+    /// datagrams, which is what the pacing estimate must not see.
     fn record_success(&mut self, attempt: Duration, datagram: Option<Duration>, now: Instant) {
         let base = self.decayed(now);
         let sample = attempt.as_micros() as f64;
@@ -115,10 +103,10 @@ impl Srtt {
         }
     }
 
-    /// Penalizes the estimate after a failed attempt.
+    /// Penalizes the attempt estimate after a failed attempt.
     ///
-    /// Leaves `datagram_micros` alone: a failed attempt says the server did not
-    /// answer, not that its datagrams come back more slowly than they used to.
+    /// Leaves `datagram_micros` alone: a failure says the server did not answer,
+    /// not that its datagrams got slower.
     fn record_failure(&mut self, now: Instant) {
         let base = self.decayed(now);
         self.attempt_micros = (base + SRTT_FAILURE_PENALTY_MICROS).min(SRTT_MAX_MICROS);
@@ -157,7 +145,7 @@ impl RttMap {
 
     /// Folds a successful attempt for nameserver `idx` into its estimates.
     ///
-    /// See [`Srtt::record_success`] for what the two samples are.
+    /// See [`Srtt::record_success`] for the two samples.
     pub(super) fn record_success(&self, idx: usize, attempt: Duration, datagram: Option<Duration>) {
         self.entries.lock().expect("poisoned")[idx].record_success(
             attempt,

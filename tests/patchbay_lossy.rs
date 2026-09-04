@@ -1,26 +1,19 @@
 //! Compares this crate against hickory-resolver on links that lose UDP.
 //!
 //! Each test builds a two-device patchbay lab: one device runs a small
-//! authoritative nameserver that answers over both UDP and TCP, the other runs
-//! both resolvers against it. Only the loss mechanism differs between tests.
+//! authoritative nameserver answering over UDP and TCP, the other runs both
+//! resolvers against it. Only the loss mechanism differs between tests.
 //!
-//! Loss is introduced in one of two places. [`UdpPolicy`] makes the nameserver
-//! itself discard datagrams, which is deterministic and isolates retransmit
-//! pacing from everything else. `netem` on the client's uplink drops datagrams
-//! at random, which is closer to a real link but noisy. The deterministic tests
-//! are the ones to read when comparing the two resolvers; the random one exists
-//! to confirm the deterministic result is not an artifact of the drop policy.
+//! [`UdpPolicy`] makes the nameserver discard datagrams by rule, which is
+//! deterministic and isolates retransmit pacing from everything else. Those are
+//! the tests to read when comparing the two resolvers. `netem` random loss on
+//! the client's uplink is closer to a real link but noisy, and exists only to
+//! confirm the deterministic results are not an artifact of the drop policy.
 //!
-//! Each test prints a table and asserts what we want to stay true: that a
-//! lookup returning an answer returns the right one, that our latency holds
-//! against hickory's on the two deterministic scenarios, and that a healthy
-//! network still costs exactly one datagram per lookup. The random-loss test
-//! only reports, since its numbers move between runs.
-//!
-//! The table carries latency and, beside it, the queries the nameserver
-//! received per lookup split by transport. Retransmitting early trades packets
-//! for latency, so both halves of that trade are measured. The counts are what
-//! one nameserver saw; the fan-out across several is not measured here.
+//! Each test prints a table of latency and, beside it, the queries the
+//! nameserver received per lookup split by transport. Retransmitting early
+//! trades packets for latency, so both halves of that trade are measured. The
+//! counts are what one nameserver saw, not the fan-out across several.
 //!
 //! Run them with:
 //!
@@ -28,8 +21,7 @@
 //! cargo nextest run --test patchbay_lossy --no-capture
 //! ```
 //!
-//! patchbay needs Linux user namespaces. It runs rootless; no `sudo` is
-//! involved.
+//! patchbay runs rootless and needs unprivileged Linux user namespaces.
 
 #![cfg(target_os = "linux")]
 
@@ -59,18 +51,15 @@ use simple_dns::{
 };
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, UdpSocket},
+    net::{TcpListener, TcpStream, UdpSocket},
 };
 
 /// Initializes the user namespace before any thread is spawned.
 ///
-/// patchbay needs this to run rootless, and it has to happen while the process
-/// is still single-threaded. This runs from ELF `.init_array`, before the Rust
-/// runtime is up, so it uses patchbay's libc-only entry point rather than
-/// `init_userns`: the latter allocates and returns a `Result` that could only be
-/// reported by panicking, which is not something this context can do. A failure
-/// here is silent by design and surfaces in [`fixture`], where it can be
-/// explained.
+/// Runs from ELF `.init_array`, before the Rust runtime is up, so it uses
+/// patchbay's libc-only entry point rather than `init_userns`: the latter
+/// allocates and reports failure as a `Result` that only a panic could surface
+/// here. A failure is silent by design and surfaces in [`fixture`] instead.
 #[ctor::ctor(unsafe)]
 fn userns_ctor() {
     unsafe { patchbay::init_userns_for_ctor() };
@@ -84,37 +73,34 @@ const ANSWER_TTL: u32 = 300;
 
 /// Ceiling on our own median in the scenarios that lose datagrams.
 ///
-/// Those are floored either at two retransmit intervals or, where UDP never
-/// answers at all, at the resolver's 900ms delay before TCP starts. The bound is
-/// deliberately well clear of both: it exists to catch a return to the
-/// six-second behaviour, not to pin the exact delay, and a tight bound would
-/// flake whenever a loaded runner adds scheduling latency.
+/// Those are floored at two retransmit intervals, or at the 900ms before TCP
+/// starts where UDP never answers. Well clear of both on purpose: it catches a
+/// return to the six-second behaviour rather than pinning the exact delay, and
+/// a tight bound would flake on a loaded runner.
 const LATENCY_CEILING: Duration = Duration::from_millis(1500);
 
 /// Cap on a single lookup, past which we record it as a failure.
 ///
-/// Above our own worst case for one nameserver (6 s covering the datagrams and
-/// the TCP query beside them) and above hickory's (two pool passes of 5 s), so
-/// a lookup only hits this when the resolver has stopped making progress.
+/// Above our own worst case for one nameserver (6s) and hickory's (two pool
+/// passes of 5s), so only a resolver that has stopped making progress hits it.
 const LOOKUP_CAP: Duration = Duration::from_secs(15);
 
-// ── The test nameserver ─────────────────────────────────────────────────
+// --- The test nameserver ---
 
 /// How the test nameserver treats incoming UDP datagrams.
 ///
-/// TCP is always answered, matching the middlebox behavior we care about:
-/// UDP/53 is the transport that gets dropped, TCP/53 keeps working.
+/// TCP is always answered, matching the middlebox behavior we care about: UDP/53
+/// gets dropped, TCP/53 keeps working.
 #[derive(Debug, Clone, Copy)]
 enum UdpPolicy {
     /// Answers every datagram.
     Answer,
     /// Drops the first `n` datagrams of each transaction, then answers.
     ///
-    /// Both resolvers reuse one transaction id across the retransmits of a
-    /// single query, so `n` counts datagrams within a lookup rather than across
-    /// lookups. `DropFirst(1)` therefore discards a lookup's opening datagram
-    /// and answers its first retransmit, and the gap between the two is the
-    /// retransmit interval we are measuring.
+    /// Both resolvers reuse one transaction id across a query's retransmits, so
+    /// `n` counts within a lookup rather than across lookups. `DropFirst(1)`
+    /// discards the opening datagram and answers the first retransmit, and the
+    /// gap between them is the interval we are measuring.
     DropFirst(u32),
     /// Never answers over UDP.
     Blackhole,
@@ -140,11 +126,9 @@ impl UdpPolicy {
 
 /// Builds a reply to `query`: the echoed question plus one A record.
 ///
-/// Any name is answered with [`ANSWER`], so a test can use a fresh name for
-/// every lookup to step around both resolvers' caches without registering each
-/// one first. A query for anything other than A gets an empty NOERROR.
-///
-/// Returns `None` for a query we cannot answer, such as one with no question.
+/// Any name is answered with [`ANSWER`], so tests can use a fresh name per
+/// lookup to step around both resolvers' caches. Anything other than A gets an
+/// empty NOERROR. Returns `None` for a query with no question.
 fn build_reply(query: &Packet<'_>) -> Option<Vec<u8>> {
     let question = query.questions.first()?;
     let mut reply = Packet::new_reply(query.id());
@@ -166,8 +150,7 @@ fn build_reply(query: &Packet<'_>) -> Option<Vec<u8>> {
 /// Queries the test nameserver received, per resolver.
 ///
 /// Indexed the way [`run_rounds`] orders its samples: 0 is this crate, 1 is
-/// hickory. The nameserver attributes each query by the name asked for, since
-/// [`run_rounds`] gives the two resolvers disjoint name prefixes.
+/// hickory.
 #[derive(Debug, Default)]
 struct Counts {
     /// Datagrams that arrived, including ones the drop policy then discards.
@@ -177,37 +160,6 @@ struct Counts {
 }
 
 impl Counts {
-    /// Returns the index for the resolver that asked for `name`.
-    ///
-    /// Returns `None` for a name from neither, which no test sends.
-    fn index_of(name: &str) -> Option<usize> {
-        match () {
-            _ if name.starts_with("n0-") => Some(0),
-            _ if name.starts_with("hi-") => Some(1),
-            _ => None,
-        }
-    }
-
-    /// Counts one query that arrived over UDP.
-    fn record_udp(&self, query: &Packet<'_>) {
-        self.record(&self.udp, query);
-    }
-
-    /// Counts one query that arrived over TCP.
-    fn record_tcp(&self, query: &Packet<'_>) {
-        self.record(&self.tcp, query);
-    }
-
-    /// Counts one query against `counters`, attributed by its question.
-    fn record(&self, counters: &[AtomicU64; 2], query: &Packet<'_>) {
-        let Some(question) = query.questions.first() else {
-            return;
-        };
-        if let Some(idx) = Self::index_of(&question.qname.to_string()) {
-            counters[idx].fetch_add(1, Ordering::Relaxed);
-        }
-    }
-
     /// Returns the current `(udp, tcp)` totals for resolver `idx`.
     fn get(&self, idx: usize) -> (u64, u64) {
         (
@@ -215,6 +167,23 @@ impl Counts {
             self.tcp[idx].load(Ordering::Relaxed),
         )
     }
+}
+
+/// Counts one query against `counters`, attributed by the name it asks for.
+///
+/// [`run_rounds`] gives the two resolvers disjoint name prefixes. A name from
+/// neither is ignored, which no test sends.
+fn count_query(counters: &[AtomicU64; 2], query: &Packet<'_>) {
+    let Some(question) = query.questions.first() else {
+        return;
+    };
+    let name = question.qname.to_string();
+    let idx = match () {
+        _ if name.starts_with("n0-") => 0,
+        _ if name.starts_with("hi-") => 1,
+        _ => return,
+    };
+    counters[idx].fetch_add(1, Ordering::Relaxed);
 }
 
 /// Serves DNS on `socket`, applying `policy` to each datagram.
@@ -230,7 +199,7 @@ async fn serve_udp(socket: UdpSocket, policy: UdpPolicy, counts: Arc<Counts>) {
         };
         // Count before the policy runs. A datagram the policy discards still
         // crossed the network, and the network cost is what we are measuring.
-        counts.record_udp(&query);
+        count_query(&counts.udp, &query);
         if policy.drops(query.id(), &seen) {
             tracing::debug!(id = query.id(), "test nameserver: dropping datagram");
             continue;
@@ -243,45 +212,39 @@ async fn serve_udp(socket: UdpSocket, policy: UdpPolicy, counts: Arc<Counts>) {
 }
 
 /// Serves DNS on `listener`, answering every query.
-///
-/// Each connection is read in a loop rather than served once, because our
-/// resolver pools TCP connections and sends follow-up queries on the same one.
 async fn serve_tcp(listener: TcpListener, counts: Arc<Counts>) {
-    loop {
-        let Ok((mut stream, _)) = listener.accept().await else {
-            return;
-        };
+    while let Ok((stream, _)) = listener.accept().await {
         let counts = counts.clone();
         tokio::spawn(async move {
-            loop {
-                let Ok(len) = stream.read_u16().await else {
-                    return;
-                };
-                let mut buf = vec![0u8; len as usize];
-                if stream.read_exact(&mut buf).await.is_err() {
-                    return;
-                }
-                let Ok(query) = Packet::parse(&buf) else {
-                    return;
-                };
-                counts.record_tcp(&query);
-                let Some(reply) = build_reply(&query) else {
-                    return;
-                };
-                if stream
-                    .write_all(&(reply.len() as u16).to_be_bytes())
-                    .await
-                    .is_err()
-                    || stream.write_all(&reply).await.is_err()
-                {
-                    return;
-                }
-            }
+            let _ = serve_conn(stream, counts).await;
         });
     }
 }
 
-// ── The resolvers under test ────────────────────────────────────────────
+/// Answers queries on one connection until it closes.
+///
+/// Loops rather than serving once, because our resolver pools TCP connections
+/// and sends follow-up queries on the same one.
+async fn serve_conn(mut stream: TcpStream, counts: Arc<Counts>) -> std::io::Result<()> {
+    loop {
+        let len = stream.read_u16().await? as usize;
+        let mut buf = vec![0u8; len];
+        stream.read_exact(&mut buf).await?;
+        let Ok(query) = Packet::parse(&buf) else {
+            return Ok(());
+        };
+        count_query(&counts.tcp, &query);
+        let Some(reply) = build_reply(&query) else {
+            return Ok(());
+        };
+        stream
+            .write_all(&(reply.len() as u16).to_be_bytes())
+            .await?;
+        stream.write_all(&reply).await?;
+    }
+}
+
+// --- The resolvers under test ---
 
 /// Builds this crate's resolver, pointed at exactly one UDP nameserver.
 ///
@@ -327,7 +290,7 @@ async fn lookup_hickory(resolver: &TokioResolver, name: &str) -> Option<Ipv4Addr
     })
 }
 
-// ── Measurement ─────────────────────────────────────────────────────────
+// --- Measurement ---
 
 /// Latency samples for one resolver over one run.
 ///
@@ -346,17 +309,26 @@ struct Samples {
 }
 
 impl Samples {
+    /// Creates a set of samples with the packet counts left for [`Fixture::run`].
+    fn new(label: &'static str, lookups: Vec<Option<Duration>>) -> Self {
+        Self {
+            label,
+            lookups,
+            udp: 0,
+            tcp: 0,
+        }
+    }
+
     /// Returns how many lookups completed within [`LOOKUP_CAP`].
     fn ok(&self) -> usize {
         self.lookups.iter().filter(|s| s.is_some()).count()
     }
 
-    /// Returns the successful latencies at the given quantile, or `None` if
-    /// every lookup failed.
+    /// Returns the successful latencies at quantile `q`, or `None` if every
+    /// lookup failed.
     ///
-    /// `q` is a fraction from 0 to 1; 0.5 is the median. Uses nearest-rank on
-    /// the successes only, so a run with failures reports the latency of the
-    /// lookups that did complete and the failure count separately.
+    /// Nearest-rank over the successes only, so a run with failures reports the
+    /// latency of the lookups that completed and the failure count separately.
     fn quantile(&self, q: f64) -> Option<Duration> {
         let mut ok: Vec<Duration> = self.lookups.iter().flatten().copied().collect();
         if ok.is_empty() {
@@ -366,28 +338,17 @@ impl Samples {
         let rank = ((q * ok.len() as f64).ceil() as usize).clamp(1, ok.len());
         Some(ok[rank - 1])
     }
-}
 
-/// Returns this crate's samples out of a run.
-fn ours(samples: &[Samples]) -> &Samples {
-    samples
-        .iter()
-        .find(|s| s.label == "n0")
-        .expect("n0 samples")
-}
-
-/// Returns the median latency of the resolver labelled `label`.
-///
-/// # Panics
-///
-/// Panics if that resolver answered nothing, since a scenario that measures
-/// latency has nothing to say when every lookup failed.
-fn median(samples: &[Samples], label: &str) -> Duration {
-    samples
-        .iter()
-        .find(|s| s.label == label)
-        .and_then(|s| s.quantile(0.5))
-        .unwrap_or_else(|| panic!("{label} answered nothing"))
+    /// Returns the median successful latency.
+    ///
+    /// # Panics
+    ///
+    /// Panics if every lookup failed, since a scenario that measures latency has
+    /// nothing to say then.
+    fn median(&self) -> Duration {
+        self.quantile(0.5)
+            .unwrap_or_else(|| panic!("{} answered nothing", self.label))
+    }
 }
 
 /// Prints a comparison table for one scenario.
@@ -419,10 +380,9 @@ fn report(scenario: &str, samples: &[Samples]) {
 
 /// Runs `rounds` lookups with each resolver, alternating which one goes first.
 ///
-/// Every lookup uses a fresh name so neither resolver's cache is consulted, and
-/// each is capped at [`LOOKUP_CAP`]. Running them one at a time rather than
-/// concurrently keeps the two resolvers from competing for the same lossy link,
-/// which would make the comparison a measure of scheduling rather than of
+/// Every lookup uses a fresh name so neither cache is consulted, and each is
+/// capped at [`LOOKUP_CAP`]. They run one at a time so the two resolvers do not
+/// compete for the same lossy link, which would measure scheduling rather than
 /// retransmit behavior.
 async fn run_rounds(server: SocketAddr, rounds: usize) -> Result<[Samples; 2]> {
     /// Times one lookup, asserting that a successful one returns [`ANSWER`].
@@ -451,44 +411,22 @@ async fn run_rounds(server: SocketAddr, rounds: usize) -> Result<[Samples; 2]> {
     for round in 0..rounds {
         let n0_name = format!("n0-{round}.lossy.test.");
         let hickory_name = format!("hi-{round}.lossy.test.");
-        // Alternate the order so neither resolver systematically warms the link
-        // for the other.
-        if round % 2 == 0 {
-            n0_lookups.push(measure("n0", &n0_name, lookup_n0(&n0, &n0_name)).await);
-            hickory_lookups.push(
-                measure(
-                    "hickory",
-                    &hickory_name,
-                    lookup_hickory(&hickory, &hickory_name),
-                )
-                .await,
-            );
-        } else {
-            hickory_lookups.push(
-                measure(
-                    "hickory",
-                    &hickory_name,
-                    lookup_hickory(&hickory, &hickory_name),
-                )
-                .await,
-            );
-            n0_lookups.push(measure("n0", &n0_name, lookup_n0(&n0, &n0_name)).await);
+        // Alternate so neither resolver systematically warms the link for the
+        // other.
+        let n0_first = round % 2 == 0;
+        for n0_turn in [n0_first, !n0_first] {
+            if n0_turn {
+                n0_lookups.push(measure("n0", &n0_name, lookup_n0(&n0, &n0_name)).await);
+            } else {
+                let lookup = lookup_hickory(&hickory, &hickory_name);
+                hickory_lookups.push(measure("hickory", &hickory_name, lookup).await);
+            }
         }
     }
 
     Ok([
-        Samples {
-            label: "n0",
-            lookups: n0_lookups,
-            udp: 0,
-            tcp: 0,
-        },
-        Samples {
-            label: "hickory",
-            lookups: hickory_lookups,
-            udp: 0,
-            tcp: 0,
-        },
+        Samples::new("n0", n0_lookups),
+        Samples::new("hickory", hickory_lookups),
     ])
 }
 
@@ -523,10 +461,9 @@ async fn fixture(policy: UdpPolicy) -> Result<Fixture> {
 
     let counts = Arc::new(Counts::default());
     let server_counts = counts.clone();
-    // The first lookup must not race the nameserver's binds. A datagram sent
-    // before UDP/53 exists is dropped by the kernel without the drop policy ever
-    // seeing it, which silently makes that lookup one datagram unluckier than
-    // the scenario says it is.
+    // The first lookup must not race the binds. A datagram sent before UDP/53
+    // exists is dropped by the kernel without the policy seeing it, which makes
+    // that lookup one datagram unluckier than the scenario says.
     let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
     let task = server.spawn(move |_dev| async move {
         let udp = UdpSocket::bind(server_addr).await.expect("bind udp/53");
@@ -559,11 +496,11 @@ impl Fixture {
             .await
     }
 
-    /// Runs the comparison on the client device and returns both resolvers' samples.
+    /// Runs the comparison on the client device and returns both resolvers'
+    /// samples.
     ///
-    /// The packet counts on the samples are this run's alone: they are taken as
-    /// the difference across the run, so a fixture reused for several scenarios
-    /// reports each one separately.
+    /// Packet counts are this run's alone, taken as the difference across it, so
+    /// a fixture reused for several scenarios reports each separately.
     async fn run(&self, rounds: usize) -> Result<[Samples; 2]> {
         let server_addr = self.server_addr;
         let before = [self.counts.get(0), self.counts.get(1)];
@@ -586,7 +523,7 @@ impl Fixture {
     }
 }
 
-// ── Tests ───────────────────────────────────────────────────────────────
+// --- Tests ---
 
 /// A clean link, as the baseline the lossy runs are read against.
 ///
@@ -597,8 +534,8 @@ async fn no_loss_baseline() -> Result<()> {
     let fixture = fixture(UdpPolicy::Answer).await?;
     let samples = fixture.run(6).await?;
     report("no_loss_baseline", &samples);
-    // Both resolvers answering is a check on the lab rather than on either of
-    // them: if a clean link fails here, nothing below this line means anything.
+    // Both answering is a check on the lab, not on either resolver: if a clean
+    // link fails here, nothing below means anything.
     for s in &samples {
         assert_eq!(
             s.ok(),
@@ -607,10 +544,10 @@ async fn no_loss_baseline() -> Result<()> {
             s.label
         );
     }
-    // The packet counts are asserted for this crate only. hickory's are in the
-    // table for scale, but they are a fact about hickory's defaults, and pinning
-    // them here would turn a version bump there into a failure here.
-    let n0 = ours(&samples);
+    // Packet counts are asserted for this crate only. hickory's are in the table
+    // for scale, but pinning them would turn a version bump there into a failure
+    // here.
+    let [n0, _] = &samples;
     // Retransmitting early should cost nothing when nothing is lost.
     assert_eq!(
         n0.udp,
@@ -624,11 +561,10 @@ async fn no_loss_baseline() -> Result<()> {
 
 /// The nameserver drops the opening datagram of every lookup.
 ///
-/// This is the measurement that matters. There is no random loss anywhere, so
-/// each lookup's latency is the resolver's retransmit interval plus one round
-/// trip, and nothing else. Both resolvers retransmit on a timer while the first
-/// datagram is still outstanding, so both should land near their retransmit
-/// interval rather than near any timeout.
+/// The measurement that matters. Nothing else is lossy, so each lookup costs the
+/// retransmit interval plus one round trip and nothing more. Both resolvers
+/// retransmit while the first datagram is still outstanding, so both should land
+/// near their interval rather than near any timeout.
 #[tokio::test(flavor = "current_thread")]
 async fn first_datagram_dropped() -> Result<()> {
     let fixture = fixture(UdpPolicy::DropFirst(1)).await?;
@@ -642,7 +578,8 @@ async fn first_datagram_dropped() -> Result<()> {
             s.label
         );
     }
-    let (ours, theirs) = (median(&samples, "n0"), median(&samples, "hickory"));
+    let [n0, hickory] = &samples;
+    let (ours, theirs) = (n0.median(), hickory.median());
     assert!(
         ours <= theirs * 2,
         "n0 median {ours:?} should be within 2x hickory's {theirs:?}"
@@ -653,17 +590,15 @@ async fn first_datagram_dropped() -> Result<()> {
 
 /// The nameserver drops the first two datagrams of every lookup.
 ///
-/// Past hickory's `max_retries = 3` limit for a single pool pass, so hickory
-/// falls back on its 5 s timeout. Our third datagram is still inside the run, so
-/// UDP should carry it on its own, two retransmit intervals in and well before
-/// the TCP query is due.
+/// Past hickory's `max_retries = 3` for a single pool pass, so hickory falls
+/// back on its 5s timeout. Our third datagram is still inside the paced run, so
+/// UDP should carry it two intervals in, well before the TCP query is due.
 ///
-/// That last part is the assertion that catches a regression of the pacing.
-/// The retransmit interval is scaled off the nameserver's smoothed RTT, so if
-/// the intervals a lookup spends waiting were ever folded back into that RTT,
-/// the interval would grow with every lossy lookup here: the third datagram
-/// would slip past the TCP join delay, and TCP would start answering lookups
-/// that UDP should have.
+/// The TCP count is what catches a regression of the pacing. The interval is
+/// scaled off the server's datagram round trip, so if the intervals a lookup
+/// spends waiting were ever folded back into that measurement, the interval
+/// would grow with every lossy lookup here until the third datagram slipped past
+/// the TCP join delay.
 #[tokio::test(flavor = "current_thread")]
 async fn first_two_datagrams_dropped() -> Result<()> {
     let fixture = fixture(UdpPolicy::DropFirst(2)).await?;
@@ -677,16 +612,16 @@ async fn first_two_datagrams_dropped() -> Result<()> {
             s.label
         );
     }
-    let n0 = ours(&samples);
+    let [n0, _] = &samples;
     assert_eq!(
         n0.tcp, 0,
         "n0 should recover over UDP here; a TCP query means the retransmit \
          interval has drifted past the join delay"
     );
-    let median = median(&samples, "n0");
     assert!(
-        median < LATENCY_CEILING,
-        "n0 median {median:?} should be two retransmit intervals, not seconds"
+        n0.median() < LATENCY_CEILING,
+        "n0 median {:?} should be two retransmit intervals, not seconds",
+        n0.median()
     );
     fixture.ok();
     Ok(())
@@ -694,28 +629,28 @@ async fn first_two_datagrams_dropped() -> Result<()> {
 
 /// UDP is black-holed while TCP/53 answers normally.
 ///
-/// This is the network from the real-world log: every datagram to the gateway
-/// disappears, but the same address answers over TCP in tens of milliseconds.
-/// We join UDP with TCP once the datagrams go unanswered; hickory does not,
-/// because `try_tcp_on_error` defaults to false, so it fails outright here.
+/// The network from the real-world log: every datagram to the gateway
+/// disappears, but the same address answers over TCP in tens of milliseconds. We
+/// join UDP with TCP once the datagrams go unanswered. hickory does not, because
+/// `try_tcp_on_error` defaults to false, so it fails outright here.
 ///
-/// The cost should be the delay before TCP starts plus a TCP round trip, and it
-/// should not grow across lookups as the server's smoothed RTT absorbs it.
+/// The cost should be the delay before TCP starts plus a round trip, and it
+/// should not grow across lookups.
 #[tokio::test(flavor = "current_thread")]
 async fn udp_blackhole_tcp_works() -> Result<()> {
     let fixture = fixture(UdpPolicy::Blackhole).await?;
     let samples = fixture.run(3).await?;
     report("udp_blackhole_tcp_works", &samples);
-    let n0 = ours(&samples);
+    let [n0, _] = &samples;
     assert_eq!(
         n0.ok(),
         n0.lookups.len(),
         "the TCP fallback should carry every lookup when UDP is black-holed"
     );
-    let ours = median(&samples, "n0");
     assert!(
-        ours < LATENCY_CEILING,
-        "n0 median {ours:?} should be near the TCP join delay, not seconds past it"
+        n0.median() < LATENCY_CEILING,
+        "n0 median {:?} should be near the TCP join delay, not seconds past it",
+        n0.median()
     );
     fixture.ok();
     Ok(())
@@ -723,10 +658,10 @@ async fn udp_blackhole_tcp_works() -> Result<()> {
 
 /// Random datagram loss on the client's uplink.
 ///
-/// Closer to a real link than the drop policies, and correspondingly noisy:
-/// `netem` drops in both directions independently, so an exchange completes
-/// with probability `(1 - loss)^2`. Read this as corroboration of
-/// [`first_datagram_dropped`], not as a measurement in its own right.
+/// Closer to a real link than the drop policies and correspondingly noisy:
+/// `netem` drops in both directions independently, so an exchange completes with
+/// probability `(1 - loss)^2`. Corroboration for [`first_datagram_dropped`],
+/// not a measurement in its own right.
 #[tokio::test(flavor = "current_thread")]
 async fn random_udp_loss() -> Result<()> {
     let fixture = fixture(UdpPolicy::Answer).await?;
