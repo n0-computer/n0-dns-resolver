@@ -1424,13 +1424,25 @@ mod tests {
 
     /// Spawns a nameserver that answers one query over TCP and never over UDP.
     ///
-    /// UDP/53 at the returned address is left unbound, so this is the shape of a
-    /// network that permits TCP/53 and drops datagrams: a lookup only completes
-    /// once the TCP query joins them at [`TCP_JOIN_DELAY`].
+    /// The shape of a network that permits TCP/53 and drops datagrams, so a
+    /// lookup only completes once the TCP query joins them at
+    /// [`TCP_JOIN_DELAY`].
+    ///
+    /// The UDP port is bound and then ignored rather than left closed. A closed
+    /// port makes a datagram refused rather than dropped, and Windows reports
+    /// that back on the socket as `WSAECONNRESET` where Unix delivers nothing to
+    /// an unconnected socket. The refusal leaves nothing in flight, the resolver
+    /// correctly brings TCP forward, and there is no join delay left to measure.
     async fn tcp_only_nameserver(answer: Ipv4Addr) -> (SocketAddr, tokio::task::JoinHandle<()>) {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let addr = listener.local_addr().unwrap();
+        let udp = tokio::net::UdpSocket::bind(addr)
+            .await
+            .expect("UDP port taken");
         let handle = tokio::spawn(async move {
+            // Held open for the lifetime of the task so the datagrams are
+            // dropped rather than refused.
+            let _udp = udp;
             let (mut stream, _) = listener.accept().await.unwrap();
             let len = stream.read_u16().await.unwrap() as usize;
             let mut buf = vec![0u8; len];
@@ -1549,8 +1561,7 @@ mod tests {
     /// A server that fails over UDP is retried over TCP.
     ///
     /// This keeps lookups working on a network that drops UDP/53 but allows
-    /// TCP/53. The mock serves DNS over TCP only and leaves the UDP port
-    /// unbound, so the UDP attempts time out.
+    /// TCP/53.
     #[tokio::test]
     async fn udp_failure_falls_back_to_tcp() {
         let expected = Ipv4Addr::new(93, 184, 216, 34);
@@ -1563,11 +1574,11 @@ mod tests {
 
     /// A lookup the TCP query rescued is priced at what it cost.
     ///
-    /// This nameserver spends [`TCP_JOIN_DELAY`] on every lookup. Ordering has
-    /// to see that, or a server reachable only over TCP outranks one answering
-    /// datagrams in 40ms and gets dialled first forever. Pacing must not see it.
-    /// Both estimates come from this one attempt, and this is the case that
-    /// separates them.
+    /// This nameserver leaves UDP unanswered, so it spends [`TCP_JOIN_DELAY`] on
+    /// every lookup. Ordering has to see that, or a server reachable only over
+    /// TCP outranks one answering datagrams in 40ms and gets dialled first
+    /// forever. Pacing must not see it. Both estimates come from this one
+    /// attempt, and this is the case that separates them.
     #[tokio::test]
     async fn tcp_rescued_lookup_is_priced_at_what_it_cost() {
         let (addr, server) = tcp_only_nameserver(Ipv4Addr::new(93, 184, 216, 34)).await;
@@ -1575,9 +1586,18 @@ mod tests {
         let rtt_map = &resolver.state().rtt_map;
         let (untried_cost, untried_pacing) = (rtt_map.get_decayed(0), rtt_map.get_datagram(0));
 
+        let start = Instant::now();
         resolver.lookup_ipv4("example.com").await.unwrap();
+        let elapsed = start.elapsed();
         server.await.unwrap();
 
+        // A lower bound, so a loaded runner only makes it truer. It states the
+        // premise: without the join delay there is no cost to price.
+        assert!(
+            elapsed >= TCP_JOIN_DELAY,
+            "lookup took {elapsed:?}, so it never spent the {TCP_JOIN_DELAY:?} \
+             join delay this test is about"
+        );
         assert!(
             rtt_map.get_decayed(0) > untried_cost * 4.0,
             "a TCP-rescued lookup should rank the server well below an untried one, \

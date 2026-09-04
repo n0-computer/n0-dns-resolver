@@ -20,4 +20,9 @@ allow = [
 
 [advisories]
 yanked = "deny"
-ignore = []
+ignore = [
+    # paste, unmaintained. A proc-macro reached only through the patchbay test
+    # lab (patchbay -> rtnetlink -> netlink-packet-core), so it is a Linux
+    # dev-dependency and never reaches a user of this crate.
+    "RUSTSEC-2024-0436",
+]
