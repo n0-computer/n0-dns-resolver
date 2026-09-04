@@ -915,8 +915,7 @@ impl DnsResolver {
             })?;
             let (id, query_bytes) = query::build_query(&current_host, qtype)?;
             let response = self.send_query(&query_bytes).await?;
-            let packet =
-                simple_dns::Packet::parse(&response).map_err(|_| e!(Error::InvalidResponse))?;
+            let packet = query::parse_packet(&response)?;
 
             // Validate the id, QR bit, question, and RCODE before trusting the
             // packet to decide the answer or the next CNAME target. This is the

@@ -49,6 +49,37 @@ pub(super) fn response_code(rcode: RCODE) -> ResponseCode {
 /// network input guard against shorter buffers first.
 const DNS_HEADER_LEN: usize = 12;
 
+/// Smallest wire size of a question: a root name, a type, and a class.
+const MIN_QUESTION_LEN: usize = 1 + 2 + 2;
+
+/// Smallest wire size of a resource record.
+///
+/// A root name, a type, a class, a TTL, and a zero rdata length.
+const MIN_RECORD_LEN: usize = 1 + 2 + 2 + 4 + 2;
+
+/// Parses a message from the network.
+///
+/// `simple_dns` reserves each section's vector from the header counts before
+/// it reads a record, so a datagram of a dozen bytes claiming 65535 records
+/// in every section has it allocate tens of megabytes and then fail on the
+/// first record. The counts are checked against the smallest wire form of a
+/// question and a record first, so a message can only make the parser reserve
+/// what its own length could hold.
+pub(super) fn parse_packet(data: &[u8]) -> Result<Packet<'_>, QueryError> {
+    if data.len() < DNS_HEADER_LEN {
+        return Err(e!(QueryError::Malformed));
+    }
+    let questions = usize::from(header_buffer::questions_unchecked(data));
+    let records = usize::from(header_buffer::answers_unchecked(data))
+        + usize::from(header_buffer::name_servers_unchecked(data))
+        + usize::from(header_buffer::additional_records_unchecked(data));
+    let min_len = DNS_HEADER_LEN + questions * MIN_QUESTION_LEN + records * MIN_RECORD_LEN;
+    if data.len() < min_len {
+        return Err(e!(QueryError::Malformed));
+    }
+    Packet::parse(data).map_err(|_| e!(QueryError::Malformed))
+}
+
 /// EDNS(0) advertised UDP payload size.
 ///
 /// 1232 bytes is the current recommended safe value per RFC 6891 and the
@@ -147,7 +178,7 @@ pub(super) fn strip_edns(query: &[u8]) -> Option<Vec<u8>> {
 /// than `min(SOA MINIMUM, SOA record TTL)`. Returns `None` when no SOA is
 /// present, so the caller can fall back to a fixed default.
 pub(super) fn negative_ttl(data: &[u8]) -> Option<u32> {
-    let packet = Packet::parse(data).ok()?;
+    let packet = parse_packet(data).ok()?;
     packet.name_servers.iter().find_map(|rr| match &rr.rdata {
         RData::SOA(soa) => Some(rr.ttl.min(soa.minimum)),
         _ => None,
@@ -252,7 +283,7 @@ fn parse_response<T>(
     data: &[u8],
     extract: impl Fn(&Name<'_>, &RData<'_>) -> Option<T>,
 ) -> Result<(Vec<T>, u32), QueryError> {
-    let packet = Packet::parse(data).map_err(|_| e!(QueryError::Malformed))?;
+    let packet = parse_packet(data)?;
 
     // The chain is empty only for a response with no question section, which
     // `check_response` already rejects; extraction then matches nothing.
@@ -920,6 +951,39 @@ mod tests {
         assert!(!bare.supports_http2());
         assert!(!bare.supports_http3());
         assert_eq!(alias.effective_target(), "svc.example.com");
+    }
+
+    /// A header that claims more records than the message could hold is rejected.
+    ///
+    /// Before the parser reserves a vector per section from those counts.
+    #[test]
+    fn parse_packet_rejects_overstated_section_counts() {
+        let (id, _) = make_query("example.com");
+        let mut resp = a_response(id, "example.com", &[Ipv4Addr::new(1, 2, 3, 4)]);
+        assert!(parse_packet(&resp).is_ok());
+
+        // ANCOUNT is header bytes 6 and 7; NSCOUNT 8 and 9; ARCOUNT 10 and 11.
+        resp[6..8].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(matches!(
+            parse_packet(&resp),
+            Err(QueryError::Malformed { .. })
+        ));
+
+        // A bare header claiming one record of every kind is too short as well.
+        let mut header = [0u8; DNS_HEADER_LEN];
+        header[7] = 1;
+        header[9] = 1;
+        header[11] = 1;
+        assert!(matches!(
+            parse_packet(&header),
+            Err(QueryError::Malformed { .. })
+        ));
+
+        // Shorter than a header is malformed rather than a panic.
+        assert!(matches!(
+            parse_packet(&header[..4]),
+            Err(QueryError::Malformed { .. })
+        ));
     }
 
     /// The header-peek helpers must not panic on a short buffer.
