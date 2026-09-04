@@ -758,8 +758,9 @@ impl DnsResolver {
     /// `datagram_micros` is one datagram exchange with that server, as
     /// [`RttMap::get_datagram`] reports it, so a slow link gets proportionally
     /// longer before we send again.
-    fn retransmit_interval(datagram_micros: f64) -> Duration {
-        Duration::from_micros((datagram_micros * UDP_RETRANSMIT_SRTT_FACTOR) as u64)
+    fn retransmit_interval(datagram_rtt: Duration) -> Duration {
+        datagram_rtt
+            .mul_f64(UDP_RETRANSMIT_SRTT_FACTOR)
             .clamp(UDP_RETRANSMIT_MIN, UDP_RETRANSMIT_MAX)
     }
 
@@ -1517,6 +1518,44 @@ mod tests {
             "recovery took {elapsed:?}, expected about {UDP_RETRANSMIT_MIN:?}"
         );
         handle.await.unwrap();
+    }
+
+    /// A prompt UDP answer cancels the scheduled TCP fallback before it dials.
+    #[tokio::test]
+    async fn udp_answer_does_not_start_tcp() {
+        let answer = Ipv4Addr::new(198, 51, 100, 24);
+        let (listener, udp) = 'bind: {
+            for _ in 0..16 {
+                let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                if let Ok(udp) = tokio::net::UdpSocket::bind(tcp.local_addr().unwrap()).await {
+                    break 'bind (tcp, udp);
+                }
+            }
+            panic!("no port free for both UDP and TCP");
+        };
+        let addr = listener.local_addr().unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (len, peer) = udp.recv_from(&mut buf).await.unwrap();
+            let id = Packet::parse(&buf[..len]).unwrap().id();
+            udp.send_to(&a_reply(id, answer), peer).await.unwrap();
+        });
+        let (tcp_started, mut tcp_started_rx) = tokio::sync::oneshot::channel();
+        let tcp_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+            let _ = tcp_started.send(());
+        });
+
+        let resolver = with_proto(addr, DnsProtocol::Udp);
+        assert_eq!(resolver.lookup_ipv4("example.com").await.unwrap(), [answer]);
+        udp_task.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut tcp_started_rx)
+                .await
+                .is_err(),
+            "a UDP answer before the join delay must not open TCP"
+        );
+        tcp_task.abort();
     }
 
     /// Datagrams keep going once the paced run is used up.

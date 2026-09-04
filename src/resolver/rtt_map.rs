@@ -139,8 +139,8 @@ impl RttMap {
     }
 
     /// Returns the datagram round trip for nameserver `idx`, used for pacing.
-    pub(super) fn get_datagram(&self, idx: usize) -> f64 {
-        self.entries.lock().expect("poisoned")[idx].datagram_micros
+    pub(super) fn get_datagram(&self, idx: usize) -> Duration {
+        Duration::from_micros(self.entries.lock().expect("poisoned")[idx].datagram_micros as u64)
     }
 
     /// Folds a successful attempt for nameserver `idx` into its estimates.
