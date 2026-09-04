@@ -16,27 +16,34 @@ use crate::resolver::TransportError;
 pub enum Error {
     /// No nameservers were configured or discovered to query.
     #[error("no nameservers configured to query")]
+    #[non_exhaustive]
     NoNameservers {},
     /// A nameserver did not answer within the per-attempt timeout.
     #[error("request timed out")]
+    #[non_exhaustive]
     Timeout {},
     /// Every nameserver was tried and none returned a usable response.
     #[error("no nameserver returned a usable response")]
+    #[non_exhaustive]
     NoResponse {},
     /// The domain name does not exist (NXDOMAIN).
     #[error("domain name does not exist (NXDOMAIN)")]
+    #[non_exhaustive]
     NxDomain {},
     /// A nameserver answered with an error response code.
     #[error("nameserver returned error response code: {code}")]
+    #[non_exhaustive]
     ServerError {
         /// The response code the nameserver returned.
         code: ResponseCode,
     },
     /// The response was malformed or did not match the query.
     #[error("invalid or malformed DNS response")]
+    #[non_exhaustive]
     InvalidResponse {},
     /// The hostname could not be built into a valid DNS query.
     #[error("invalid domain name: {name}")]
+    #[non_exhaustive]
     InvalidName {
         /// The hostname that could not be used as a DNS name.
         name: String,
@@ -46,9 +53,11 @@ pub enum Error {
     /// None could be built from a crypto provider either, so the query has no
     /// TLS settings to run with.
     #[error("no TLS config for DNS-over-TLS or DNS-over-HTTPS")]
+    #[non_exhaustive]
     MissingTlsConfig {},
     /// A network or transport-level failure while talking to a nameserver.
     #[error("transport failure")]
+    #[non_exhaustive]
     Transport {
         /// The specific transport failure.
         source: TransportError,
