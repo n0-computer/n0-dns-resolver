@@ -188,6 +188,19 @@ pub(super) fn negative_ttl(data: &[u8]) -> Option<u32> {
 /// Maximum CNAME chain depth to prevent infinite loops.
 pub(super) const MAX_CNAME_DEPTH: usize = 8;
 
+/// Returns whether `a` and `b` are the same DNS name.
+///
+/// Labels are compared without regard to ASCII case, as RFC 4343 requires.
+/// `simple_dns` derives `PartialEq` for [`Name`] over the raw label bytes, so
+/// `Example.COM` and `example.com` compare unequal there, while a server may
+/// well return an owner name in a case other than the one we asked in.
+pub(super) fn names_equal(a: &Name<'_>, b: &Name<'_>) -> bool {
+    a.get_labels().len() == b.get_labels().len()
+        && a.as_bytes()
+            .zip(b.as_bytes())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
 /// Returns every name in the CNAME chain starting at `start_name`.
 ///
 /// The start name comes first, then each CNAME target, ending at the final
@@ -203,7 +216,7 @@ fn cname_chain<'a>(packet: &'a Packet<'a>, start_name: &Name<'a>) -> Vec<Name<'a
         let Some(RData::CNAME(cname)) = packet
             .answers
             .iter()
-            .find(|rr| rr.name == current)
+            .find(|rr| names_equal(&rr.name, &current))
             .map(|rr| &rr.rdata)
         else {
             break;
@@ -234,7 +247,7 @@ fn resolve_cname_chain<'a>(packet: &'a Packet<'a>, start_name: &Name<'a>) -> Nam
 pub(super) fn cname_target(packet: &Packet<'_>, qname: &str) -> Option<String> {
     let name = Name::new(qname).ok()?;
     let canonical = resolve_cname_chain(packet, &name);
-    (canonical != name).then(|| canonical.to_string())
+    (!names_equal(&canonical, &name)).then(|| canonical.to_string())
 }
 
 /// Validates a response against the query that produced it, then surfaces its RCODE.
@@ -261,7 +274,7 @@ pub(super) fn check_response(
     // The response must echo exactly the question we sent (RFC 1035 4.1.2).
     match packet.questions.as_slice() {
         [question]
-            if &question.qname == expected_name
+            if names_equal(&question.qname, expected_name)
                 && question.qtype == QTYPE::TYPE(expected_type)
                 && question.qclass == QCLASS::CLASS(CLASS::IN) => {}
         _ => return Err(e!(QueryError::Unexpected)),
@@ -296,7 +309,7 @@ fn parse_response<T>(
     let mut results = Vec::new();
     let mut min_ttl = u32::MAX;
     for rr in &packet.answers {
-        if !chain.contains(&rr.name) {
+        if !chain.iter().any(|name| names_equal(name, &rr.name)) {
             continue;
         }
         // A CNAME along the chain bounds the cached lifetime too: a short-TTL
@@ -750,6 +763,34 @@ mod tests {
             check_response(&packet, 42, &name, TYPE::A),
             Err(QueryError::Unexpected { .. })
         ));
+    }
+
+    /// Names are matched without regard to case throughout.
+    ///
+    /// The echoed question, the owner names along the CNAME chain, and the
+    /// CNAME target may all come back in a case other than the one queried.
+    #[test]
+    fn names_match_case_insensitively() {
+        let name = Name::new_unchecked("example.com");
+        let packet = reply_with_question(42, "EXAMPLE.com", TYPE::A);
+        assert!(check_response(&packet, 42, &name, TYPE::A).is_ok());
+
+        // The owner names in the answer differ in case from the question.
+        let (id, _) = make_query("alias.example.com");
+        let resp = cname_with_a_response(
+            id,
+            "Alias.Example.COM",
+            "REAL.example.com",
+            &[Ipv4Addr::new(10, 0, 0, 3)],
+        );
+        let (addrs, _) = parse_a_addrs(&resp);
+        assert_eq!(addrs, [Ipv4Addr::new(10, 0, 0, 3)]);
+
+        // A CNAME whose target is the query name in another case leaves the
+        // chain where it started rather than looping back on itself.
+        let resp = cname_only_response(id, "alias.example.com", "ALIAS.example.com");
+        let packet = Packet::parse(&resp).unwrap();
+        assert_eq!(cname_target(&packet, "alias.example.com"), None);
     }
 
     #[test]
