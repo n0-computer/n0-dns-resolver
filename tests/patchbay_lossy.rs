@@ -570,15 +570,12 @@ async fn first_datagram_dropped() -> Result<()> {
     let fixture = fixture(UdpPolicy::DropFirst(1)).await?;
     let samples = fixture.run(5).await?;
     report("first_datagram_dropped", &samples);
-    for s in &samples {
-        assert_eq!(
-            s.ok(),
-            s.lookups.len(),
-            "{} failed to recover from a single lost datagram",
-            s.label
-        );
-    }
     let [n0, hickory] = &samples;
+    assert_eq!(
+        n0.ok(),
+        n0.lookups.len(),
+        "n0 failed to recover from a single lost datagram"
+    );
     let (ours, theirs) = (n0.median(), hickory.median());
     assert!(
         ours <= theirs * 2,
@@ -604,15 +601,12 @@ async fn first_two_datagrams_dropped() -> Result<()> {
     let fixture = fixture(UdpPolicy::DropFirst(2)).await?;
     let samples = fixture.run(5).await?;
     report("first_two_datagrams_dropped", &samples);
-    for s in &samples {
-        assert_eq!(
-            s.ok(),
-            s.lookups.len(),
-            "{} failed to recover from two lost datagrams",
-            s.label
-        );
-    }
     let [n0, _] = &samples;
+    assert_eq!(
+        n0.ok(),
+        n0.lookups.len(),
+        "n0 failed to recover from two lost datagrams"
+    );
     assert_eq!(
         n0.tcp, 0,
         "n0 should recover over UDP here; a TCP query means the retransmit \

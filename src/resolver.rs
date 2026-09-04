@@ -161,8 +161,7 @@ const UDP_RETRANSMIT_MAX: Duration = Duration::from_secs(1);
 /// long this server takes would grow with the fallback it exists to reach: the
 /// server answers over TCP, that answer is what the measurement sees, and the
 /// switch slips further on every lookup.
-const TCP_JOIN_DELAY: Duration =
-    Duration::from_millis(UDP_RETRANSMIT_MIN.as_millis() as u64 * UDP_PACED_DATAGRAMS as u64);
+const TCP_JOIN_DELAY: Duration = UDP_RETRANSMIT_MIN.saturating_mul(UDP_PACED_DATAGRAMS as u32);
 
 /// Default value for `ndots` per resolv.conf(5).
 ///
@@ -1434,11 +1433,18 @@ mod tests {
     /// an unconnected socket. The refusal leaves nothing in flight, the resolver
     /// correctly brings TCP forward, and there is no join delay left to measure.
     async fn tcp_only_nameserver(answer: Ipv4Addr) -> (SocketAddr, tokio::task::JoinHandle<()>) {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        // Both transports share one port, and a test running in parallel may
+        // hold the UDP side of whichever port the OS picks for TCP.
+        let (listener, udp) = 'bind: {
+            for _ in 0..16 {
+                let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                if let Ok(udp) = tokio::net::UdpSocket::bind(tcp.local_addr().unwrap()).await {
+                    break 'bind (tcp, udp);
+                }
+            }
+            panic!("no port free for both UDP and TCP");
+        };
         let addr = listener.local_addr().unwrap();
-        let udp = tokio::net::UdpSocket::bind(addr)
-            .await
-            .expect("UDP port taken");
         let handle = tokio::spawn(async move {
             // Held open for the lifetime of the task so the datagrams are
             // dropped rather than refused.
