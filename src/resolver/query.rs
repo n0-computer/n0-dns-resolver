@@ -9,8 +9,8 @@ use simple_dns::{
 };
 
 use crate::{
-    CaaRecordData, HttpsRecord, MxRecordData, Record, RecordKind, ResponseCode, SrvRecordData,
-    SvcbRecordData, TxtRecordData,
+    CaaRecordData, HttpsRecord, InvalidResponseReason, MxRecordData, Record, RecordKind,
+    ResponseCode, SrvRecordData, SvcbRecordData, TxtRecordData,
 };
 
 /// Errors that can occur while building a query packet or parsing a response.
@@ -23,8 +23,8 @@ pub(super) enum QueryError {
     BuildQuery { name: String },
     #[error("malformed DNS response")]
     Malformed {},
-    #[error("response did not match query")]
-    Unexpected {},
+    #[error("response did not match query: {reason}")]
+    Unexpected { reason: InvalidResponseReason },
     #[error("domain name does not exist (NXDOMAIN)")]
     NxDomain {},
     #[error("server returned error: {rcode:?}")]
@@ -38,7 +38,27 @@ pub(super) fn response_code(rcode: RCODE) -> ResponseCode {
         RCODE::Refused => ResponseCode::Refused,
         RCODE::FormatError => ResponseCode::FormatError,
         RCODE::NotImplemented => ResponseCode::NotImplemented,
-        _ => ResponseCode::Other,
+        other => ResponseCode::Other {
+            code: rcode_to_u16(other),
+        },
+    }
+}
+
+fn rcode_to_u16(rcode: RCODE) -> u16 {
+    match rcode {
+        RCODE::NoError => 0,
+        RCODE::FormatError => 1,
+        RCODE::ServerFailure => 2,
+        RCODE::NameError => 3,
+        RCODE::NotImplemented => 4,
+        RCODE::Refused => 5,
+        RCODE::YXDOMAIN => 6,
+        RCODE::YXRRSET => 7,
+        RCODE::NXRRSET => 8,
+        RCODE::NOTAUTH => 9,
+        RCODE::NOTZONE => 10,
+        RCODE::BADVERS => 16,
+        RCODE::Reserved => 11,
     }
 }
 
@@ -217,10 +237,14 @@ pub(super) fn check_response(
     expected_type: TYPE,
 ) -> Result<(), QueryError> {
     if !packet.has_flags(PacketFlag::RESPONSE) {
-        return Err(e!(QueryError::Unexpected));
+        return Err(e!(QueryError::Unexpected {
+            reason: InvalidResponseReason::NotAResponse,
+        }));
     }
     if packet.id() != expected_id {
-        return Err(e!(QueryError::Unexpected));
+        return Err(e!(QueryError::Unexpected {
+            reason: InvalidResponseReason::IdMismatch,
+        }));
     }
     // The response must echo exactly the question we sent (RFC 1035 4.1.2).
     match packet.questions.as_slice() {
@@ -228,7 +252,11 @@ pub(super) fn check_response(
             if &question.qname == expected_name
                 && question.qtype == QTYPE::TYPE(expected_type)
                 && question.qclass == QCLASS::CLASS(CLASS::IN) => {}
-        _ => return Err(e!(QueryError::Unexpected)),
+        _ => {
+            return Err(e!(QueryError::Unexpected {
+                reason: InvalidResponseReason::QuestionMismatch,
+            }));
+        }
     }
     match packet.rcode() {
         RCODE::NoError => Ok(()),
@@ -686,21 +714,30 @@ mod tests {
         let packet = reply_with_question(42, "example.com", TYPE::A);
         assert!(matches!(
             check_response(&packet, 7, &name, TYPE::A),
-            Err(QueryError::Unexpected { .. })
+            Err(QueryError::Unexpected {
+                reason: InvalidResponseReason::IdMismatch,
+                ..
+            })
         ));
 
         // Question name does not echo the query.
         let packet = reply_with_question(42, "attacker.example", TYPE::A);
         assert!(matches!(
             check_response(&packet, 42, &name, TYPE::A),
-            Err(QueryError::Unexpected { .. })
+            Err(QueryError::Unexpected {
+                reason: InvalidResponseReason::QuestionMismatch,
+                ..
+            })
         ));
 
         // Question type does not match.
         let packet = reply_with_question(42, "example.com", TYPE::AAAA);
         assert!(matches!(
             check_response(&packet, 42, &name, TYPE::A),
-            Err(QueryError::Unexpected { .. })
+            Err(QueryError::Unexpected {
+                reason: InvalidResponseReason::QuestionMismatch,
+                ..
+            })
         ));
 
         // No question section at all.
@@ -708,8 +745,27 @@ mod tests {
         packet.questions.clear();
         assert!(matches!(
             check_response(&packet, 42, &name, TYPE::A),
-            Err(QueryError::Unexpected { .. })
+            Err(QueryError::Unexpected {
+                reason: InvalidResponseReason::QuestionMismatch,
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn response_code_preserves_numeric_other() {
+        assert_eq!(
+            response_code(RCODE::YXDOMAIN),
+            ResponseCode::Other { code: 6 }
+        );
+        assert_eq!(
+            response_code(RCODE::BADVERS),
+            ResponseCode::Other { code: 16 }
+        );
+        assert_eq!(
+            response_code(RCODE::ServerFailure),
+            ResponseCode::ServerFailure
+        );
     }
 
     #[test]

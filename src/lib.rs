@@ -31,7 +31,7 @@ mod tests;
 pub use self::system_config::install_android_jni_context;
 pub use self::{
     builder::{Builder, DnsProtocol, FallbackMode, Nameserver},
-    error::{Error, ResponseCode},
+    error::{Error, InvalidResponseReason, ResponseCode},
     records::{
         CaaRecordData, HttpsRecord, MxRecordData, Record, RecordKind, SrvRecordData,
         SvcbRecordData, TxtRecordData,

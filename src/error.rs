@@ -32,9 +32,12 @@ pub enum Error {
         /// The response code the nameserver returned.
         code: ResponseCode,
     },
-    /// The response was malformed or did not match the query.
-    #[error("invalid or malformed DNS response")]
-    InvalidResponse {},
+    /// The response was malformed, did not match the query, or could not be followed.
+    #[error("invalid DNS response: {reason}")]
+    InvalidResponse {
+        /// Why the response was rejected.
+        reason: InvalidResponseReason,
+    },
     /// The hostname could not be built into a valid DNS query.
     #[error("invalid domain name: {name}")]
     InvalidName {
@@ -69,19 +72,49 @@ pub enum ResponseCode {
     FormatError,
     /// The nameserver does not support the requested operation (NOTIMP).
     NotImplemented,
-    /// Another, less common response code.
-    Other,
+    /// Another response code, with the numeric RCODE from the packet.
+    Other {
+        /// The RCODE value from the DNS header.
+        code: u16,
+    },
 }
 
 impl fmt::Display for ResponseCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let s = match self {
-            ResponseCode::ServerFailure => "SERVFAIL",
-            ResponseCode::Refused => "REFUSED",
-            ResponseCode::FormatError => "FORMERR",
-            ResponseCode::NotImplemented => "NOTIMP",
-            ResponseCode::Other => "other response code",
-        };
-        f.write_str(s)
+        match self {
+            ResponseCode::ServerFailure => f.write_str("SERVFAIL"),
+            ResponseCode::Refused => f.write_str("REFUSED"),
+            ResponseCode::FormatError => f.write_str("FORMERR"),
+            ResponseCode::NotImplemented => f.write_str("NOTIMP"),
+            ResponseCode::Other { code } => write!(f, "RCODE {code}"),
+        }
+    }
+}
+
+/// Why a DNS response was rejected as unusable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidResponseReason {
+    /// The packet could not be parsed.
+    Malformed,
+    /// The QR bit was not set, so this is not a response.
+    NotAResponse,
+    /// The transaction ID did not match the query.
+    IdMismatch,
+    /// The question section did not echo the query name, type, or class.
+    QuestionMismatch,
+    /// The CNAME chain exceeded the follow limit.
+    CnameLimit,
+}
+
+impl fmt::Display for InvalidResponseReason {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(match self {
+            InvalidResponseReason::Malformed => "malformed packet",
+            InvalidResponseReason::NotAResponse => "not a response",
+            InvalidResponseReason::IdMismatch => "transaction id mismatch",
+            InvalidResponseReason::QuestionMismatch => "question did not match query",
+            InvalidResponseReason::CnameLimit => "CNAME chain too long",
+        })
     }
 }

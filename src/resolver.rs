@@ -22,8 +22,9 @@ use tracing::{debug, trace};
 #[cfg(test)]
 use crate::system_config::Hosts;
 use crate::{
-    Builder, DnsProtocol, Error, FallbackMode, HttpsRecord, MxRecordData, Nameserver, Record,
-    RecordKind, SrvRecordData, SvcbRecordData, TxtRecordData, config::DnsConfig, system_config,
+    Builder, DnsProtocol, Error, FallbackMode, HttpsRecord, InvalidResponseReason, MxRecordData,
+    Nameserver, Record, RecordKind, SrvRecordData, SvcbRecordData, TxtRecordData,
+    config::DnsConfig, system_config,
 };
 
 mod cache;
@@ -69,9 +70,10 @@ impl From<QueryError> for Error {
     fn from(err: QueryError) -> Self {
         match err {
             QueryError::BuildQuery { name, .. } => e!(Error::InvalidName { name }),
-            QueryError::Malformed { .. } | QueryError::Unexpected { .. } => {
-                e!(Error::InvalidResponse)
-            }
+            QueryError::Malformed { .. } => e!(Error::InvalidResponse {
+                reason: InvalidResponseReason::Malformed,
+            }),
+            QueryError::Unexpected { reason, .. } => e!(Error::InvalidResponse { reason }),
             QueryError::NxDomain { .. } => e!(Error::NxDomain),
             QueryError::ServerFailure { rcode, .. } => {
                 e!(Error::ServerError {
@@ -681,8 +683,11 @@ impl DnsResolver {
             })?;
             let (id, query_bytes) = query::build_query(&current_host, qtype)?;
             let response = self.send_query(&query_bytes).await?;
-            let packet =
-                simple_dns::Packet::parse(&response).map_err(|_| e!(Error::InvalidResponse))?;
+            let packet = simple_dns::Packet::parse(&response).map_err(|_| {
+                e!(Error::InvalidResponse {
+                    reason: InvalidResponseReason::Malformed,
+                })
+            })?;
 
             // Validate the id, QR bit, question, and RCODE before trusting the
             // packet to decide the answer or the next CNAME target. This is the
@@ -705,7 +710,9 @@ impl DnsResolver {
             debug!(from = %current_host, to = %target, "following CNAME");
             current_host = target;
         }
-        Err(e!(Error::InvalidResponse))
+        Err(e!(Error::InvalidResponse {
+            reason: InvalidResponseReason::CnameLimit,
+        }))
     }
 
     /// Looks up the records of `kind` for `name`, following CNAME chains.
