@@ -173,9 +173,13 @@ const DEFAULT_NDOTS: usize = 1;
 /// Returns whether `host` is `localhost` or a name under it.
 ///
 /// RFC 6761 Section 6.3 reserves these to resolve to loopback without a query.
+/// DNS names are case-insensitive, so `foo.LOCALHOST` is one of them too, and
+/// must not go out to a nameserver that could answer it with any address.
 fn is_localhost(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
-    host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost")
+    host.rsplit('.')
+        .next()
+        .is_some_and(|label| label.eq_ignore_ascii_case("localhost"))
 }
 
 /// A stub DNS resolver over UDP/TCP (and, with a crypto provider, DoT/DoH).
@@ -915,25 +919,15 @@ impl DnsResolver {
             })?;
             let (id, query_bytes) = query::build_query(&current_host, qtype)?;
             let response = self.send_query(&query_bytes).await?;
-            let packet =
-                simple_dns::Packet::parse(&response).map_err(|_| e!(Error::InvalidResponse))?;
+            let packet = query::parse_packet(&response)?;
 
             // Validate the id, QR bit, question, and RCODE before trusting the
             // packet to decide the answer or the next CNAME target. This is the
             // only check of the response against the name we actually asked for.
             query::check_response(&packet, id, &name, qtype)?;
 
-            let has_answer = packet
-                .answers
-                .iter()
-                .any(|rr| rr.rdata.type_code() == qtype);
-
-            if has_answer {
-                return Ok(response);
-            }
-
-            // No records of the requested type -- follow CNAME if present.
-            let Some(target) = query::cname_target(&packet, &current_host) else {
+            // The response holds the answer, or has no CNAME to follow.
+            let Some(target) = query::unresolved_cname_target(&packet, &name, qtype) else {
                 return Ok(response);
             };
             debug!(from = %current_host, to = %target, "following CNAME");
@@ -1463,6 +1457,19 @@ mod tests {
             stream.flush().await.unwrap();
         });
         (addr, handle)
+    }
+
+    /// Names under `localhost` are recognized whatever their case.
+    ///
+    /// Only the last label decides; `localhost` elsewhere in the name does not.
+    #[test]
+    fn localhost_is_matched_case_insensitively() {
+        for host in ["localhost", "LOCALHOST.", "foo.LocalHost", "a.b.localhost."] {
+            assert!(super::is_localhost(host), "{host}");
+        }
+        for host in ["localhost.example", "notlocalhost", "", "."] {
+            assert!(!super::is_localhost(host), "{host}");
+        }
     }
 
     /// A FORMERR response triggers an EDNS-less retry to the same server.

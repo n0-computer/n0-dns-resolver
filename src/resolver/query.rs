@@ -49,6 +49,37 @@ pub(super) fn response_code(rcode: RCODE) -> ResponseCode {
 /// network input guard against shorter buffers first.
 const DNS_HEADER_LEN: usize = 12;
 
+/// Smallest wire size of a question: a root name, a type, and a class.
+const MIN_QUESTION_LEN: usize = 1 + 2 + 2;
+
+/// Smallest wire size of a resource record.
+///
+/// A root name, a type, a class, a TTL, and a zero rdata length.
+const MIN_RECORD_LEN: usize = 1 + 2 + 2 + 4 + 2;
+
+/// Parses a message from the network.
+///
+/// `simple_dns` reserves each section's vector from the header counts before
+/// it reads a record, so a datagram of a dozen bytes claiming 65535 records
+/// in every section has it allocate tens of megabytes and then fail on the
+/// first record. The counts are checked against the smallest wire form of a
+/// question and a record first, so a message can only make the parser reserve
+/// what its own length could hold.
+pub(super) fn parse_packet(data: &[u8]) -> Result<Packet<'_>, QueryError> {
+    if data.len() < DNS_HEADER_LEN {
+        return Err(e!(QueryError::Malformed));
+    }
+    let questions = usize::from(header_buffer::questions_unchecked(data));
+    let records = usize::from(header_buffer::answers_unchecked(data))
+        + usize::from(header_buffer::name_servers_unchecked(data))
+        + usize::from(header_buffer::additional_records_unchecked(data));
+    let min_len = DNS_HEADER_LEN + questions * MIN_QUESTION_LEN + records * MIN_RECORD_LEN;
+    if data.len() < min_len {
+        return Err(e!(QueryError::Malformed));
+    }
+    Packet::parse(data).map_err(|_| e!(QueryError::Malformed))
+}
+
 /// EDNS(0) advertised UDP payload size.
 ///
 /// 1232 bytes is the current recommended safe value per RFC 6891 and the
@@ -128,6 +159,57 @@ pub(super) fn is_format_error(data: &[u8]) -> bool {
     data.len() >= DNS_HEADER_LEN && matches!(header_buffer::rcode(data), Ok(RCODE::FormatError))
 }
 
+/// Returns whether a datagram answers `query`, for the UDP receive loop.
+///
+/// A datagram that does not is one the socket should keep listening past.
+/// Each query goes out from a fresh source port, so an off-path attacker who
+/// guesses that port can deliver whatever they like to it, and returning the
+/// first thing that arrives would let a spoofed datagram end the query with a
+/// mismatch before the real answer lands (hickory's GHSA-v44v-c8m4-gc43).
+///
+/// The transaction id must match and the QR bit must be set. A datagram that
+/// then parses must echo our question, name, type, and class, so one that
+/// carries no question or someone else's is ignored rather than taken as the
+/// answer to ours. One that does not parse is accepted once it carries our id:
+/// a truncated or malformed reply from the server itself then fails the lookup
+/// at once rather than at the timeout, and a truncated one still brings in the
+/// TCP query.
+///
+/// The one response accepted without a question is a FORMERR. A middlebox that
+/// could not parse the query, usually over its EDNS(0) OPT record, may answer
+/// with a bare header, and all a FORMERR does is have the caller retry the
+/// same server without EDNS. A spoofed one costs a round trip and nothing
+/// else.
+pub(super) fn answers_query(response: &[u8], query: &[u8]) -> bool {
+    let Ok(id) = header_buffer::id(response) else {
+        return false;
+    };
+    if header_buffer::id(query).ok() != Some(id)
+        || !header_buffer::has_flags(response, PacketFlag::RESPONSE).unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(packet) = parse_packet(response) else {
+        return true;
+    };
+    let Ok(sent) = Packet::parse(query) else {
+        return true;
+    };
+    if packet.questions.is_empty() && packet.rcode() == RCODE::FormatError {
+        return true;
+    }
+    packet.questions.len() == sent.questions.len()
+        && packet
+            .questions
+            .iter()
+            .zip(&sent.questions)
+            .all(|(got, want)| {
+                names_equal(&got.qname, &want.qname)
+                    && got.qtype == want.qtype
+                    && got.qclass == want.qclass
+            })
+}
+
 /// Rebuilds `query` without its EDNS(0) OPT record, or `None` if it has none.
 ///
 /// RFC 6891 Section 6.2.2 calls for retrying without EDNS when a server rejects
@@ -147,7 +229,7 @@ pub(super) fn strip_edns(query: &[u8]) -> Option<Vec<u8>> {
 /// than `min(SOA MINIMUM, SOA record TTL)`. Returns `None` when no SOA is
 /// present, so the caller can fall back to a fixed default.
 pub(super) fn negative_ttl(data: &[u8]) -> Option<u32> {
-    let packet = Packet::parse(data).ok()?;
+    let packet = parse_packet(data).ok()?;
     packet.name_servers.iter().find_map(|rr| match &rr.rdata {
         RData::SOA(soa) => Some(rr.ttl.min(soa.minimum)),
         _ => None,
@@ -157,6 +239,19 @@ pub(super) fn negative_ttl(data: &[u8]) -> Option<u32> {
 /// Maximum CNAME chain depth to prevent infinite loops.
 pub(super) const MAX_CNAME_DEPTH: usize = 8;
 
+/// Returns whether `a` and `b` are the same DNS name.
+///
+/// Labels are compared without regard to ASCII case, as RFC 4343 requires.
+/// `simple_dns` derives `PartialEq` for [`Name`] over the raw label bytes, so
+/// `Example.COM` and `example.com` compare unequal there, while a server may
+/// well return an owner name in a case other than the one we asked in.
+pub(super) fn names_equal(a: &Name<'_>, b: &Name<'_>) -> bool {
+    a.get_labels().len() == b.get_labels().len()
+        && a.as_bytes()
+            .zip(b.as_bytes())
+            .all(|(a, b)| a.eq_ignore_ascii_case(b))
+}
+
 /// Returns every name in the CNAME chain starting at `start_name`.
 ///
 /// The start name comes first, then each CNAME target, ending at the final
@@ -164,7 +259,8 @@ pub(super) const MAX_CNAME_DEPTH: usize = 8;
 ///
 /// Records of the queried type can be attached to any name along the chain, not
 /// just the final one, so extraction matches against the whole chain the way a
-/// recursive resolver does. Bounded by [`MAX_CNAME_DEPTH`].
+/// recursive resolver does. Bounded by [`MAX_CNAME_DEPTH`]. Only records of
+/// class IN take part; see [`parse_response`].
 fn cname_chain<'a>(packet: &'a Packet<'a>, start_name: &Name<'a>) -> Vec<Name<'a>> {
     let mut chain = vec![start_name.clone()];
     let mut current = start_name.clone();
@@ -172,7 +268,7 @@ fn cname_chain<'a>(packet: &'a Packet<'a>, start_name: &Name<'a>) -> Vec<Name<'a
         let Some(RData::CNAME(cname)) = packet
             .answers
             .iter()
-            .find(|rr| rr.name == current)
+            .find(|rr| rr.class == CLASS::IN && names_equal(&rr.name, &current))
             .map(|rr| &rr.rdata)
         else {
             break;
@@ -183,27 +279,31 @@ fn cname_chain<'a>(packet: &'a Packet<'a>, start_name: &Name<'a>) -> Vec<Name<'a
     chain
 }
 
-/// Resolves the CNAME chain in the answer section starting from `start_name`.
+/// Returns the name to query next when a response leaves its CNAME chain unresolved.
 ///
-/// Returns the final canonical name after following all CNAMEs, or the
-/// original name if no CNAME records are present.
-fn resolve_cname_chain<'a>(packet: &'a Packet<'a>, start_name: &Name<'a>) -> Name<'a> {
-    let mut chain = cname_chain(packet, start_name);
-    // `cname_chain` always includes at least the start name.
-    chain.pop().unwrap_or_else(|| start_name.clone())
-}
-
-/// Returns the CNAME target for a query name, if the chain is unresolved.
+/// That is the case when the answer section carries a CNAME chain from `qname`
+/// but no record of `qtype` on any name along it. A record of the type on a
+/// name off the chain is not an answer to this question, so it does not make
+/// the chain resolved: following the chain is still the way to the answer.
 ///
-/// That is the case when the response carries a CNAME but no records of the
-/// requested type for that name.
-///
-/// This is used for recursive CNAME following: when the server returns only a
-/// CNAME without the final record, the caller issues a new query for the target.
-pub(super) fn cname_target(packet: &Packet<'_>, qname: &str) -> Option<String> {
-    let name = Name::new(qname).ok()?;
-    let canonical = resolve_cname_chain(packet, &name);
-    (canonical != name).then(|| canonical.to_string())
+/// The caller issues a new query for the returned target.
+pub(super) fn unresolved_cname_target(
+    packet: &Packet<'_>,
+    qname: &Name<'_>,
+    qtype: TYPE,
+) -> Option<String> {
+    let chain = cname_chain(packet, qname);
+    let answered = packet.answers.iter().any(|rr| {
+        rr.class == CLASS::IN
+            && rr.rdata.type_code() == qtype
+            && chain.iter().any(|name| names_equal(name, &rr.name))
+    });
+    if answered {
+        return None;
+    }
+    // The chain always starts with `qname`.
+    let last = chain.last()?;
+    (!names_equal(last, qname)).then(|| last.to_string())
 }
 
 /// Validates a response against the query that produced it, then surfaces its RCODE.
@@ -230,7 +330,7 @@ pub(super) fn check_response(
     // The response must echo exactly the question we sent (RFC 1035 4.1.2).
     match packet.questions.as_slice() {
         [question]
-            if &question.qname == expected_name
+            if names_equal(&question.qname, expected_name)
                 && question.qtype == QTYPE::TYPE(expected_type)
                 && question.qclass == QCLASS::CLASS(CLASS::IN) => {}
         _ => return Err(e!(QueryError::Unexpected)),
@@ -248,11 +348,15 @@ pub(super) fn check_response(
 /// this walks the CNAME chain anchored on the question and extracts records of
 /// the requested type using `extract` at every name along the chain. Returns the
 /// records and the minimum TTL across them.
+///
+/// Every query is for class IN, and a record of another class is a different
+/// record even under the same name and type, so records of any other class are
+/// left out rather than returned as answers to an IN question.
 fn parse_response<T>(
     data: &[u8],
     extract: impl Fn(&Name<'_>, &RData<'_>) -> Option<T>,
 ) -> Result<(Vec<T>, u32), QueryError> {
-    let packet = Packet::parse(data).map_err(|_| e!(QueryError::Malformed))?;
+    let packet = parse_packet(data)?;
 
     // The chain is empty only for a response with no question section, which
     // `check_response` already rejects; extraction then matches nothing.
@@ -265,7 +369,7 @@ fn parse_response<T>(
     let mut results = Vec::new();
     let mut min_ttl = u32::MAX;
     for rr in &packet.answers {
-        if !chain.contains(&rr.name) {
+        if rr.class != CLASS::IN || !chain.iter().any(|name| names_equal(name, &rr.name)) {
             continue;
         }
         // A CNAME along the chain bounds the cached lifetime too: a short-TTL
@@ -656,6 +760,11 @@ mod tests {
         assert_eq!(addrs, [Ipv4Addr::new(5, 6, 7, 8)]);
     }
 
+    /// Returns the target to query next for `qname`, an A question.
+    fn cname_target(packet: &Packet<'_>, qname: &str) -> Option<String> {
+        unresolved_cname_target(packet, &Name::new_unchecked(qname), TYPE::A)
+    }
+
     #[test]
     fn cname_target_extracts_target_for_recursive_follow() {
         let id = 1234;
@@ -663,6 +772,48 @@ mod tests {
         let packet = Packet::parse(&resp).unwrap();
         let target = cname_target(&packet, "alias.example.com");
         assert_eq!(target.as_deref(), Some("real.example.com"));
+    }
+
+    /// The chain is resolved by a record of the type on a chain name only.
+    ///
+    /// One on an unrelated name is not an answer to the question, so the
+    /// chain is still followed; one on the target settles it.
+    #[test]
+    fn cname_target_ignores_records_off_the_chain() {
+        let id = 1234;
+        let mut packet = reply_with_question(id, "alias.example.com", TYPE::A);
+        packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked("alias.example.com"),
+            CLASS::IN,
+            300,
+            RData::CNAME(CNAME(Name::new_unchecked("real.example.com"))),
+        ));
+        packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked("unrelated.example.com"),
+            CLASS::IN,
+            300,
+            RData::A(A {
+                address: u32::from(Ipv4Addr::new(6, 6, 6, 6)),
+            }),
+        ));
+        let resp = packet.build_bytes_vec().unwrap();
+        let parsed = Packet::parse(&resp).unwrap();
+        assert_eq!(
+            cname_target(&parsed, "alias.example.com").as_deref(),
+            Some("real.example.com")
+        );
+
+        packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked("real.example.com"),
+            CLASS::IN,
+            300,
+            RData::A(A {
+                address: u32::from(Ipv4Addr::new(7, 7, 7, 7)),
+            }),
+        ));
+        let resp = packet.build_bytes_vec().unwrap();
+        let parsed = Packet::parse(&resp).unwrap();
+        assert_eq!(cname_target(&parsed, "alias.example.com"), None);
     }
 
     /// Builds a reply echoing one question for `name`/`qtype`, plus an A answer.
@@ -719,6 +870,34 @@ mod tests {
             check_response(&packet, 42, &name, TYPE::A),
             Err(QueryError::Unexpected { .. })
         ));
+    }
+
+    /// Names are matched without regard to case throughout.
+    ///
+    /// The echoed question, the owner names along the CNAME chain, and the
+    /// CNAME target may all come back in a case other than the one queried.
+    #[test]
+    fn names_match_case_insensitively() {
+        let name = Name::new_unchecked("example.com");
+        let packet = reply_with_question(42, "EXAMPLE.com", TYPE::A);
+        assert!(check_response(&packet, 42, &name, TYPE::A).is_ok());
+
+        // The owner names in the answer differ in case from the question.
+        let (id, _) = make_query("alias.example.com");
+        let resp = cname_with_a_response(
+            id,
+            "Alias.Example.COM",
+            "REAL.example.com",
+            &[Ipv4Addr::new(10, 0, 0, 3)],
+        );
+        let (addrs, _) = parse_a_addrs(&resp);
+        assert_eq!(addrs, [Ipv4Addr::new(10, 0, 0, 3)]);
+
+        // A CNAME whose target is the query name in another case leaves the
+        // chain where it started rather than looping back on itself.
+        let resp = cname_only_response(id, "alias.example.com", "ALIAS.example.com");
+        let packet = Packet::parse(&resp).unwrap();
+        assert_eq!(cname_target(&packet, "alias.example.com"), None);
     }
 
     #[test]
@@ -920,6 +1099,75 @@ mod tests {
         assert!(!bare.supports_http2());
         assert!(!bare.supports_http3());
         assert_eq!(alias.effective_target(), "svc.example.com");
+    }
+
+    /// Only a datagram carrying our id, the QR bit, and our question answers a query.
+    ///
+    /// Everything else is what the UDP receive loop keeps listening past.
+    #[test]
+    fn answers_query_demands_id_qr_bit_and_echoed_question() {
+        let (id, query) = make_query("example.com");
+        let good = a_response(id, "example.com", &[Ipv4Addr::new(1, 2, 3, 4)]);
+        assert!(answers_query(&good, &query));
+
+        // Wrong transaction id.
+        let other = a_response(id.wrapping_add(1), "example.com", &[]);
+        assert!(!answers_query(&other, &query));
+
+        // Our own query echoed back: right id, but no QR bit.
+        assert!(!answers_query(&query, &query));
+
+        // Someone else's question, or none at all (QDCOUNT=0).
+        let forged = a_response(id, "attacker.example", &[Ipv4Addr::new(6, 6, 6, 6)]);
+        assert!(!answers_query(&forged, &query));
+        let mut empty = Packet::new_reply(id);
+        assert!(!answers_query(&empty.build_bytes_vec().unwrap(), &query));
+
+        // Except a FORMERR, which a middlebox may send as a bare header.
+        *empty.rcode_mut() = RCODE::FormatError;
+        assert!(answers_query(&empty.build_bytes_vec().unwrap(), &query));
+
+        // Shorter than a header.
+        assert!(!answers_query(&good[..8], &query));
+
+        // Right id and QR bit but unparsable: accepted, so the server's own
+        // malformed reply fails the lookup now rather than at the timeout.
+        let mut cut = good.clone();
+        cut.truncate(good.len() - 2);
+        assert!(answers_query(&cut, &query));
+    }
+
+    /// A header that claims more records than the message could hold is rejected.
+    ///
+    /// Before the parser reserves a vector per section from those counts.
+    #[test]
+    fn parse_packet_rejects_overstated_section_counts() {
+        let (id, _) = make_query("example.com");
+        let mut resp = a_response(id, "example.com", &[Ipv4Addr::new(1, 2, 3, 4)]);
+        assert!(parse_packet(&resp).is_ok());
+
+        // ANCOUNT is header bytes 6 and 7; NSCOUNT 8 and 9; ARCOUNT 10 and 11.
+        resp[6..8].copy_from_slice(&u16::MAX.to_be_bytes());
+        assert!(matches!(
+            parse_packet(&resp),
+            Err(QueryError::Malformed { .. })
+        ));
+
+        // A bare header claiming one record of every kind is too short as well.
+        let mut header = [0u8; DNS_HEADER_LEN];
+        header[7] = 1;
+        header[9] = 1;
+        header[11] = 1;
+        assert!(matches!(
+            parse_packet(&header),
+            Err(QueryError::Malformed { .. })
+        ));
+
+        // Shorter than a header is malformed rather than a panic.
+        assert!(matches!(
+            parse_packet(&header[..4]),
+            Err(QueryError::Malformed { .. })
+        ));
     }
 
     /// The header-peek helpers must not panic on a short buffer.
@@ -1202,6 +1450,44 @@ mod tests {
             parse_records(&resp, RecordKind::A),
             Err(QueryError::Malformed { .. })
         ));
+    }
+
+    /// A record of a class other than IN is not an answer to an IN question.
+    ///
+    /// Neither as a record of the queried type nor as a link in the CNAME
+    /// chain.
+    #[test]
+    fn parse_ignores_records_of_another_class() {
+        let (id, _) = make_query("example.com");
+        let mut packet = reply_with_question(id, "example.com", TYPE::A);
+        packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked("example.com"),
+            CLASS::CH,
+            300,
+            RData::A(A {
+                address: u32::from(Ipv4Addr::new(6, 6, 6, 6)),
+            }),
+        ));
+        packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked("example.com"),
+            CLASS::CH,
+            300,
+            RData::CNAME(CNAME(Name::new_unchecked("other.example.com"))),
+        ));
+        packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked("other.example.com"),
+            CLASS::IN,
+            300,
+            RData::A(A {
+                address: u32::from(Ipv4Addr::new(7, 7, 7, 7)),
+            }),
+        ));
+        let resp = packet.build_bytes_vec().unwrap();
+
+        let (addrs, _) = parse_a_addrs(&resp);
+        assert!(addrs.is_empty(), "got {addrs:?}");
+        let packet = Packet::parse(&resp).unwrap();
+        assert_eq!(cname_target(&packet, "example.com"), None);
     }
 
     /// A record on an intermediate name in the CNAME chain is still collected.

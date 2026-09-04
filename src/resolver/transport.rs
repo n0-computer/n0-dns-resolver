@@ -6,8 +6,9 @@ use std::{io, net::SocketAddr};
 
 use n0_error::{e, stack_error};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tracing::debug;
 
-use super::pool::ConnPool;
+use super::{pool::ConnPool, query};
 
 /// A network or transport-level failure while querying a single nameserver.
 ///
@@ -22,19 +23,15 @@ pub enum TransportError {
         #[error(from)]
         source: io::Error,
     },
-    /// A UDP response arrived from an address other than the one queried.
-    ///
-    /// Rejected as a spoofing defence.
-    #[error("response from unexpected source {actual}, expected {expected}")]
-    UnexpectedSource {
-        /// The nameserver address the query was sent to.
-        expected: SocketAddr,
-        /// The address the response actually came from.
-        actual: SocketAddr,
-    },
     /// The query did not fit the 2-byte length prefix used for TCP and DoT.
     #[error("query too large for TCP framing")]
     QueryTooLarge {},
+    /// A TCP or DoT frame did not answer the query.
+    ///
+    /// A connection that delivers one is dropped rather than returned to the
+    /// pool, so a stale frame cannot be handed to the next query on it.
+    #[error("response frame does not answer the query")]
+    UnexpectedResponse {},
     /// The configured TLS server name is not a valid DNS name for SNI.
     #[cfg(transport_tls)]
     #[error("invalid TLS server name: {name}")]
@@ -57,6 +54,12 @@ pub enum TransportError {
         /// The reqwest error from building the client.
         source: reqwest::Error,
     },
+    /// A DNS-over-HTTPS response body grew past the largest DNS message.
+    ///
+    /// The body is dropped at that point rather than read to its end.
+    #[cfg(transport_https)]
+    #[error("DNS-over-HTTPS response body exceeds {MAX_HTTPS_BODY} bytes")]
+    ResponseTooLarge {},
 }
 
 // TCP and DoT connections are pooled (see the `pool` module) and reused across
@@ -77,9 +80,14 @@ const UDP_RECV_BUFFER: usize = 4096;
 /// Sends a DNS query over UDP and reads the response.
 ///
 /// Each query uses a fresh socket with a random ephemeral source port to
-/// prevent cache poisoning. The response source address is validated against
-/// the target nameserver. The returned flag is set when the datagram filled the
-/// receive buffer and may be truncated, so the caller can retry over TCP.
+/// prevent cache poisoning. The socket keeps listening until a datagram arrives
+/// from the nameserver that answers the query (see [`query::answers_query`]);
+/// anything else that reaches the port is logged and ignored, so a spoofed or
+/// stray datagram cannot end the query ahead of the real answer. The caller
+/// bounds the wait with its timeout.
+///
+/// The returned flag is set when the datagram filled the receive buffer and may
+/// be truncated, so the caller can retry over TCP.
 pub(super) async fn udp_query(
     addr: SocketAddr,
     query: &[u8],
@@ -94,26 +102,37 @@ pub(super) async fn udp_query(
     socket.send_to(query, addr).await?;
 
     let mut buf = vec![0u8; UDP_RECV_BUFFER];
-    let (len, src) = socket.recv_from(&mut buf).await?;
-    if src != addr {
-        return Err(e!(TransportError::UnexpectedSource {
-            expected: addr,
-            actual: src,
-        }));
+    loop {
+        let (len, src) = socket.recv_from(&mut buf).await?;
+        if src != addr {
+            debug!(%addr, %src, "ignoring UDP datagram from an unexpected source");
+            continue;
+        }
+        if !query::answers_query(&buf[..len], query) {
+            debug!(%addr, len, "ignoring UDP datagram that does not answer the query");
+            continue;
+        }
+        // A datagram that fills the whole buffer may have been truncated at the
+        // socket by a sender that ignored our advertised EDNS payload size. The
+        // DNS TC bit only covers server-side truncation, so flag this separately
+        // and let the caller retry over TCP rather than parse a partial message.
+        let maybe_truncated = len == buf.len();
+        buf.truncate(len);
+        return Ok((buf, maybe_truncated));
     }
-    // A datagram that fills the whole buffer may have been truncated at the
-    // socket by a sender that ignored our advertised EDNS payload size. The DNS
-    // TC bit only covers server-side truncation, so flag this separately and let
-    // the caller retry over TCP rather than parse a partial message.
-    let maybe_truncated = len == buf.len();
-    buf.truncate(len);
-    Ok((buf, maybe_truncated))
 }
 
 /// Sends a length-prefixed DNS query on an established stream and reads the reply.
 ///
 /// Uses the 2-byte length prefix framing from RFC 1035 Section 4.2.2. Shared by
 /// TCP and DoT.
+///
+/// The frame read back must answer the query (see [`query::answers_query`]).
+/// One query is in flight per connection, so the next frame can only be the
+/// answer or something the server sent unasked, such as a second frame after
+/// its last answer. Taking that as the answer would fail this query, and
+/// leaving it unread would hand it to the next query on the connection once
+/// pooled. The error makes the caller drop the connection instead.
 async fn framed_query<S>(stream: &mut S, query: &[u8]) -> Result<Vec<u8>, TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -128,14 +147,18 @@ where
     let resp_len = stream.read_u16().await? as usize;
     let mut buf = vec![0u8; resp_len];
     stream.read_exact(&mut buf).await?;
+    if !query::answers_query(&buf, query) {
+        return Err(e!(TransportError::UnexpectedResponse));
+    }
     Ok(buf)
 }
 
 /// Sends a DNS query over TCP, reusing a pooled connection when one is available.
 ///
-/// A pooled connection may have been closed by the server while idle; that only
-/// surfaces on the first read/write, so on failure we dial a fresh connection
-/// and retry the query once.
+/// A pooled connection may have been closed by the server while idle, or hold
+/// a frame the server sent after its last answer; either only surfaces on the
+/// first use, so on failure we dial a fresh connection and retry the query
+/// once.
 pub(super) async fn tcp_query(
     pool: &ConnPool,
     addr: SocketAddr,
@@ -218,6 +241,34 @@ pub(super) fn build_https_client(
         .map_err(|source| e!(TransportError::BuildClient { source }))
 }
 
+/// Largest DNS-over-HTTPS response body read, in bytes.
+///
+/// A DNS message is at most 65535 bytes, the most the length prefix of the
+/// TCP framing can express, so a body past that cannot be one. Reading the
+/// body to its end before checking would let a server have us buffer as much
+/// as it cares to send; [`read_body`] stops at this point instead.
+#[cfg(transport_https)]
+const MAX_HTTPS_BODY: usize = u16::MAX as usize;
+
+/// Reads a DNS-over-HTTPS response body, giving up once it exceeds [`MAX_HTTPS_BODY`].
+#[cfg(transport_https)]
+async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>, TransportError> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_HTTPS_BODY as u64)
+    {
+        return Err(e!(TransportError::ResponseTooLarge));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_HTTPS_BODY {
+            return Err(e!(TransportError::ResponseTooLarge));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Sends a DNS query over HTTPS (DNS-over-HTTPS, RFC 8484).
 ///
 /// With `server_name`, the URL is addressed by hostname (the client pins it to
@@ -243,8 +294,7 @@ pub(super) async fn https_query(
         .send()
         .await?;
 
-    let bytes = response.error_for_status()?.bytes().await?;
-    Ok(bytes.to_vec())
+    read_body(response.error_for_status()?).await
 }
 
 #[cfg(test)]
@@ -277,11 +327,16 @@ mod tests {
     }
 
     fn build_a_response(id: u16, addrs: &[Ipv4Addr]) -> Vec<u8> {
+        build_a_response_for(id, "example.com", addrs)
+    }
+
+    /// Builds an A response for `name`, echoing a question for it.
+    fn build_a_response_for(id: u16, name: &str, addrs: &[Ipv4Addr]) -> Vec<u8> {
         let mut packet = Packet::new_reply(id);
         packet.set_flags(PacketFlag::RECURSION_DESIRED | PacketFlag::RECURSION_AVAILABLE);
         // Echo the question section, as a real server does.
         packet.questions.push(Question::new(
-            Name::new_unchecked("example.com"),
+            Name::new_unchecked(name),
             QTYPE::TYPE(TYPE::A),
             QCLASS::CLASS(CLASS::IN),
             false,
@@ -291,7 +346,7 @@ mod tests {
                 address: u32::from(*addr),
             });
             packet.answers.push(ResourceRecord::new(
-                Name::new_unchecked("example.com"),
+                Name::new_unchecked(name),
                 CLASS::IN,
                 300,
                 rdata,
@@ -388,6 +443,135 @@ mod tests {
         handle.await.unwrap();
     }
 
+    /// The socket keeps listening past datagrams that do not answer the query.
+    ///
+    /// An off-path attacker who guesses the source port can deliver anything to
+    /// it. The mock sends, ahead of the real answer, an answer from another
+    /// socket, one with a wrong id, one for a different question, and a short
+    /// datagram. Each would have ended the query with a mismatch or the wrong
+    /// records had it been accepted.
+    #[tokio::test]
+    async fn udp_query_ignores_datagrams_that_do_not_answer_the_query() {
+        let expected = Ipv4Addr::new(93, 184, 216, 34);
+        let spoofed = Ipv4Addr::new(6, 6, 6, 6);
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            let id = Packet::parse(&buf[..len]).unwrap().id();
+
+            let other = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            other
+                .send_to(&build_a_response(id, &[spoofed]), peer)
+                .await
+                .unwrap();
+            for datagram in [
+                build_a_response(id.wrapping_add(1), &[spoofed]),
+                build_a_response_for(id, "attacker.example", &[spoofed]),
+                vec![0u8; 4],
+                build_a_response(id, &[expected]),
+            ] {
+                server.send_to(&datagram, peer).await.unwrap();
+            }
+        });
+
+        let (_, query) = build_query();
+        let (addrs, _) = parse_a_addrs(&udp_query(addr, &query).await.unwrap().0);
+        assert_eq!(addrs, [expected]);
+        handle.await.unwrap();
+    }
+
+    /// A DoH body past the largest DNS message is dropped, not buffered.
+    ///
+    /// One that just fits is read whole.
+    #[cfg(transport_https)]
+    #[tokio::test]
+    async fn https_body_is_capped_at_the_dns_message_maximum() {
+        let fits = vec![0u8; MAX_HTTPS_BODY];
+        let response = reqwest::Response::from(http::Response::new(fits.clone()));
+        assert_eq!(read_body(response).await.unwrap(), fits);
+
+        let too_large = vec![0u8; MAX_HTTPS_BODY + 1];
+        let response = reqwest::Response::from(http::Response::new(too_large));
+        assert!(matches!(
+            read_body(response).await,
+            Err(TransportError::ResponseTooLarge { .. })
+        ));
+    }
+
+    /// A frame that does not answer the query is an error, not the answer.
+    #[tokio::test]
+    async fn framed_query_rejects_a_frame_for_another_query() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (id, query) = build_query();
+        let stale = build_a_response(id.wrapping_add(1), &[Ipv4Addr::new(6, 6, 6, 6)]);
+        server
+            .write_all(&(stale.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        server.write_all(&stale).await.unwrap();
+
+        assert!(matches!(
+            framed_query(&mut client, &query).await,
+            Err(TransportError::UnexpectedResponse { .. })
+        ));
+    }
+
+    /// A pooled connection holding a stale frame is dropped, not reused.
+    ///
+    /// The mock answers the first query and then sends a frame nobody asked
+    /// for. The next query on the pooled connection reads that frame, must not
+    /// take it as its answer, and gets a fresh connection instead, which is why
+    /// the mock accepts twice.
+    #[tokio::test]
+    async fn tcp_query_drops_a_pooled_connection_with_a_stale_frame() {
+        let expected = Ipv4Addr::new(93, 184, 216, 34);
+        let spoofed = Ipv4Addr::new(6, 6, 6, 6);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            /// Reads one framed query and returns its id.
+            async fn read_query(stream: &mut tokio::net::TcpStream) -> u16 {
+                let len = stream.read_u16().await.unwrap() as usize;
+                let mut buf = vec![0u8; len];
+                stream.read_exact(&mut buf).await.unwrap();
+                Packet::parse(&buf).unwrap().id()
+            }
+            /// Writes one framed message.
+            async fn write_frame(stream: &mut tokio::net::TcpStream, frame: &[u8]) {
+                stream
+                    .write_all(&(frame.len() as u16).to_be_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(frame).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+
+            let (mut first, _) = listener.accept().await.unwrap();
+            let id = read_query(&mut first).await;
+            write_frame(&mut first, &build_a_response(id, &[expected])).await;
+            write_frame(&mut first, &build_a_response(id ^ 1, &[spoofed])).await;
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let id = read_query(&mut second).await;
+            write_frame(&mut second, &build_a_response(id, &[expected])).await;
+            // Keep the first connection open until the second query is done,
+            // so the stale frame is read rather than a reset.
+            drop(first);
+        });
+
+        let pool = ConnPool::new();
+        let (_, query) = build_query();
+        let (addrs, _) = parse_a_addrs(&tcp_query(&pool, addr, &query).await.unwrap());
+        assert_eq!(addrs, [expected]);
+
+        let (_, query) = build_query();
+        let (addrs, _) = parse_a_addrs(&tcp_query(&pool, addr, &query).await.unwrap());
+        assert_eq!(addrs, [expected]);
+        handle.await.unwrap();
+    }
+
     /// A datagram that exactly fills the receive buffer is flagged as truncated.
     ///
     /// It may have been cut off, so the caller can retry over TCP.
@@ -397,13 +581,15 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             let mut buf = [0u8; 512];
-            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
-            server
-                .send_to(&vec![0u8; UDP_RECV_BUFFER], peer)
-                .await
-                .unwrap();
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            // A real answer, padded out to the buffer.
+            let id = Packet::parse(&buf[..len]).unwrap().id();
+            let mut reply = build_a_response(id, &[Ipv4Addr::new(1, 2, 3, 4)]);
+            reply.resize(UDP_RECV_BUFFER, 0);
+            server.send_to(&reply, peer).await.unwrap();
         });
-        let (resp, maybe_truncated) = udp_query(addr, b"query").await.unwrap();
+        let (_, query) = build_query();
+        let (resp, maybe_truncated) = udp_query(addr, &query).await.unwrap();
         assert_eq!(resp.len(), UDP_RECV_BUFFER);
         assert!(maybe_truncated);
         handle.await.unwrap();
