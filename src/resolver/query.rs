@@ -159,6 +159,57 @@ pub(super) fn is_format_error(data: &[u8]) -> bool {
     data.len() >= DNS_HEADER_LEN && matches!(header_buffer::rcode(data), Ok(RCODE::FormatError))
 }
 
+/// Returns whether a datagram answers `query`, for the UDP receive loop.
+///
+/// A datagram that does not is one the socket should keep listening past.
+/// Each query goes out from a fresh source port, so an off-path attacker who
+/// guesses that port can deliver whatever they like to it, and returning the
+/// first thing that arrives would let a spoofed datagram end the query with a
+/// mismatch before the real answer lands (hickory's GHSA-v44v-c8m4-gc43).
+///
+/// The transaction id must match and the QR bit must be set. A datagram that
+/// then parses must echo our question, name, type, and class, so one that
+/// carries no question or someone else's is ignored rather than taken as the
+/// answer to ours. One that does not parse is accepted once it carries our id:
+/// a truncated or malformed reply from the server itself then fails the lookup
+/// at once rather than at the timeout, and a truncated one still brings in the
+/// TCP query.
+///
+/// The one response accepted without a question is a FORMERR. A middlebox that
+/// could not parse the query, usually over its EDNS(0) OPT record, may answer
+/// with a bare header, and all a FORMERR does is have the caller retry the
+/// same server without EDNS. A spoofed one costs a round trip and nothing
+/// else.
+pub(super) fn answers_query(response: &[u8], query: &[u8]) -> bool {
+    let Ok(id) = header_buffer::id(response) else {
+        return false;
+    };
+    if header_buffer::id(query).ok() != Some(id)
+        || !header_buffer::has_flags(response, PacketFlag::RESPONSE).unwrap_or(false)
+    {
+        return false;
+    }
+    let Ok(packet) = parse_packet(response) else {
+        return true;
+    };
+    let Ok(sent) = Packet::parse(query) else {
+        return true;
+    };
+    if packet.questions.is_empty() && packet.rcode() == RCODE::FormatError {
+        return true;
+    }
+    packet.questions.len() == sent.questions.len()
+        && packet
+            .questions
+            .iter()
+            .zip(&sent.questions)
+            .all(|(got, want)| {
+                names_equal(&got.qname, &want.qname)
+                    && got.qtype == want.qtype
+                    && got.qclass == want.qclass
+            })
+}
+
 /// Rebuilds `query` without its EDNS(0) OPT record, or `None` if it has none.
 ///
 /// RFC 6891 Section 6.2.2 calls for retrying without EDNS when a server rejects
@@ -992,6 +1043,42 @@ mod tests {
         assert!(!bare.supports_http2());
         assert!(!bare.supports_http3());
         assert_eq!(alias.effective_target(), "svc.example.com");
+    }
+
+    /// Only a datagram carrying our id, the QR bit, and our question answers a query.
+    ///
+    /// Everything else is what the UDP receive loop keeps listening past.
+    #[test]
+    fn answers_query_demands_id_qr_bit_and_echoed_question() {
+        let (id, query) = make_query("example.com");
+        let good = a_response(id, "example.com", &[Ipv4Addr::new(1, 2, 3, 4)]);
+        assert!(answers_query(&good, &query));
+
+        // Wrong transaction id.
+        let other = a_response(id.wrapping_add(1), "example.com", &[]);
+        assert!(!answers_query(&other, &query));
+
+        // Our own query echoed back: right id, but no QR bit.
+        assert!(!answers_query(&query, &query));
+
+        // Someone else's question, or none at all (QDCOUNT=0).
+        let forged = a_response(id, "attacker.example", &[Ipv4Addr::new(6, 6, 6, 6)]);
+        assert!(!answers_query(&forged, &query));
+        let mut empty = Packet::new_reply(id);
+        assert!(!answers_query(&empty.build_bytes_vec().unwrap(), &query));
+
+        // Except a FORMERR, which a middlebox may send as a bare header.
+        *empty.rcode_mut() = RCODE::FormatError;
+        assert!(answers_query(&empty.build_bytes_vec().unwrap(), &query));
+
+        // Shorter than a header.
+        assert!(!answers_query(&good[..8], &query));
+
+        // Right id and QR bit but unparseable: accepted, so the server's own
+        // malformed reply fails the lookup now rather than at the timeout.
+        let mut cut = good.clone();
+        cut.truncate(good.len() - 2);
+        assert!(answers_query(&cut, &query));
     }
 
     /// A header that claims more records than the message could hold is rejected.

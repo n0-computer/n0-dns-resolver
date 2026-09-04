@@ -6,8 +6,9 @@ use std::{io, net::SocketAddr};
 
 use n0_error::{e, stack_error};
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tracing::debug;
 
-use super::pool::ConnPool;
+use super::{pool::ConnPool, query};
 
 /// A network or transport-level failure while querying a single nameserver.
 ///
@@ -21,16 +22,6 @@ pub enum TransportError {
         /// The underlying I/O error.
         #[error(from)]
         source: io::Error,
-    },
-    /// A UDP response arrived from an address other than the one queried.
-    ///
-    /// Rejected as a spoofing defence.
-    #[error("response from unexpected source {actual}, expected {expected}")]
-    UnexpectedSource {
-        /// The nameserver address the query was sent to.
-        expected: SocketAddr,
-        /// The address the response actually came from.
-        actual: SocketAddr,
     },
     /// The query did not fit the 2-byte length prefix used for TCP and DoT.
     #[error("query too large for TCP framing")]
@@ -77,9 +68,14 @@ const UDP_RECV_BUFFER: usize = 4096;
 /// Sends a DNS query over UDP and reads the response.
 ///
 /// Each query uses a fresh socket with a random ephemeral source port to
-/// prevent cache poisoning. The response source address is validated against
-/// the target nameserver. The returned flag is set when the datagram filled the
-/// receive buffer and may be truncated, so the caller can retry over TCP.
+/// prevent cache poisoning. The socket keeps listening until a datagram arrives
+/// from the nameserver that answers the query (see [`query::answers_query`]);
+/// anything else that reaches the port is logged and ignored, so a spoofed or
+/// stray datagram cannot end the query ahead of the real answer. The caller
+/// bounds the wait with its timeout.
+///
+/// The returned flag is set when the datagram filled the receive buffer and may
+/// be truncated, so the caller can retry over TCP.
 pub(super) async fn udp_query(
     addr: SocketAddr,
     query: &[u8],
@@ -94,20 +90,24 @@ pub(super) async fn udp_query(
     socket.send_to(query, addr).await?;
 
     let mut buf = vec![0u8; UDP_RECV_BUFFER];
-    let (len, src) = socket.recv_from(&mut buf).await?;
-    if src != addr {
-        return Err(e!(TransportError::UnexpectedSource {
-            expected: addr,
-            actual: src,
-        }));
+    loop {
+        let (len, src) = socket.recv_from(&mut buf).await?;
+        if src != addr {
+            debug!(%addr, %src, "ignoring UDP datagram from an unexpected source");
+            continue;
+        }
+        if !query::answers_query(&buf[..len], query) {
+            debug!(%addr, len, "ignoring UDP datagram that does not answer the query");
+            continue;
+        }
+        // A datagram that fills the whole buffer may have been truncated at the
+        // socket by a sender that ignored our advertised EDNS payload size. The
+        // DNS TC bit only covers server-side truncation, so flag this separately
+        // and let the caller retry over TCP rather than parse a partial message.
+        let maybe_truncated = len == buf.len();
+        buf.truncate(len);
+        return Ok((buf, maybe_truncated));
     }
-    // A datagram that fills the whole buffer may have been truncated at the
-    // socket by a sender that ignored our advertised EDNS payload size. The DNS
-    // TC bit only covers server-side truncation, so flag this separately and let
-    // the caller retry over TCP rather than parse a partial message.
-    let maybe_truncated = len == buf.len();
-    buf.truncate(len);
-    Ok((buf, maybe_truncated))
 }
 
 /// Sends a length-prefixed DNS query on an established stream and reads the reply.
@@ -277,11 +277,16 @@ mod tests {
     }
 
     fn build_a_response(id: u16, addrs: &[Ipv4Addr]) -> Vec<u8> {
+        build_a_response_for(id, "example.com", addrs)
+    }
+
+    /// Builds an A response for `name`, echoing a question for it.
+    fn build_a_response_for(id: u16, name: &str, addrs: &[Ipv4Addr]) -> Vec<u8> {
         let mut packet = Packet::new_reply(id);
         packet.set_flags(PacketFlag::RECURSION_DESIRED | PacketFlag::RECURSION_AVAILABLE);
         // Echo the question section, as a real server does.
         packet.questions.push(Question::new(
-            Name::new_unchecked("example.com"),
+            Name::new_unchecked(name),
             QTYPE::TYPE(TYPE::A),
             QCLASS::CLASS(CLASS::IN),
             false,
@@ -291,7 +296,7 @@ mod tests {
                 address: u32::from(*addr),
             });
             packet.answers.push(ResourceRecord::new(
-                Name::new_unchecked("example.com"),
+                Name::new_unchecked(name),
                 CLASS::IN,
                 300,
                 rdata,
@@ -388,6 +393,45 @@ mod tests {
         handle.await.unwrap();
     }
 
+    /// The socket keeps listening past datagrams that do not answer the query.
+    ///
+    /// An off-path attacker who guesses the source port can deliver anything to
+    /// it. The mock sends, ahead of the real answer, an answer from another
+    /// socket, one with a wrong id, one for a different question, and a short
+    /// datagram. Each would have ended the query with a mismatch or the wrong
+    /// records had it been accepted.
+    #[tokio::test]
+    async fn udp_query_ignores_datagrams_that_do_not_answer_the_query() {
+        let expected = Ipv4Addr::new(93, 184, 216, 34);
+        let spoofed = Ipv4Addr::new(6, 6, 6, 6);
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            let id = Packet::parse(&buf[..len]).unwrap().id();
+
+            let other = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            other
+                .send_to(&build_a_response(id, &[spoofed]), peer)
+                .await
+                .unwrap();
+            for datagram in [
+                build_a_response(id.wrapping_add(1), &[spoofed]),
+                build_a_response_for(id, "attacker.example", &[spoofed]),
+                vec![0u8; 4],
+                build_a_response(id, &[expected]),
+            ] {
+                server.send_to(&datagram, peer).await.unwrap();
+            }
+        });
+
+        let (_, query) = build_query();
+        let (addrs, _) = parse_a_addrs(&udp_query(addr, &query).await.unwrap().0);
+        assert_eq!(addrs, [expected]);
+        handle.await.unwrap();
+    }
+
     /// A datagram that exactly fills the receive buffer is flagged as truncated.
     ///
     /// It may have been cut off, so the caller can retry over TCP.
@@ -397,13 +441,15 @@ mod tests {
         let addr = server.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             let mut buf = [0u8; 512];
-            let (_, peer) = server.recv_from(&mut buf).await.unwrap();
-            server
-                .send_to(&vec![0u8; UDP_RECV_BUFFER], peer)
-                .await
-                .unwrap();
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            // A real answer, padded out to the buffer.
+            let id = Packet::parse(&buf[..len]).unwrap().id();
+            let mut reply = build_a_response(id, &[Ipv4Addr::new(1, 2, 3, 4)]);
+            reply.resize(UDP_RECV_BUFFER, 0);
+            server.send_to(&reply, peer).await.unwrap();
         });
-        let (resp, maybe_truncated) = udp_query(addr, b"query").await.unwrap();
+        let (_, query) = build_query();
+        let (resp, maybe_truncated) = udp_query(addr, &query).await.unwrap();
         assert_eq!(resp.len(), UDP_RECV_BUFFER);
         assert!(maybe_truncated);
         handle.await.unwrap();
