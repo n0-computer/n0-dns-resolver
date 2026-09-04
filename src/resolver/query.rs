@@ -279,27 +279,31 @@ fn cname_chain<'a>(packet: &'a Packet<'a>, start_name: &Name<'a>) -> Vec<Name<'a
     chain
 }
 
-/// Resolves the CNAME chain in the answer section starting from `start_name`.
+/// Returns the name to query next when a response leaves its CNAME chain unresolved.
 ///
-/// Returns the final canonical name after following all CNAMEs, or the
-/// original name if no CNAME records are present.
-fn resolve_cname_chain<'a>(packet: &'a Packet<'a>, start_name: &Name<'a>) -> Name<'a> {
-    let mut chain = cname_chain(packet, start_name);
-    // `cname_chain` always includes at least the start name.
-    chain.pop().unwrap_or_else(|| start_name.clone())
-}
-
-/// Returns the CNAME target for a query name, if the chain is unresolved.
+/// That is the case when the answer section carries a CNAME chain from `qname`
+/// but no record of `qtype` on any name along it. A record of the type on a
+/// name off the chain is not an answer to this question, so it does not make
+/// the chain resolved: following the chain is still the way to the answer.
 ///
-/// That is the case when the response carries a CNAME but no records of the
-/// requested type for that name.
-///
-/// This is used for recursive CNAME following: when the server returns only a
-/// CNAME without the final record, the caller issues a new query for the target.
-pub(super) fn cname_target(packet: &Packet<'_>, qname: &str) -> Option<String> {
-    let name = Name::new(qname).ok()?;
-    let canonical = resolve_cname_chain(packet, &name);
-    (!names_equal(&canonical, &name)).then(|| canonical.to_string())
+/// The caller issues a new query for the returned target.
+pub(super) fn unresolved_cname_target(
+    packet: &Packet<'_>,
+    qname: &Name<'_>,
+    qtype: TYPE,
+) -> Option<String> {
+    let chain = cname_chain(packet, qname);
+    let answered = packet.answers.iter().any(|rr| {
+        rr.class == CLASS::IN
+            && rr.rdata.type_code() == qtype
+            && chain.iter().any(|name| names_equal(name, &rr.name))
+    });
+    if answered {
+        return None;
+    }
+    // The chain always starts with `qname`.
+    let last = chain.last()?;
+    (!names_equal(last, qname)).then(|| last.to_string())
 }
 
 /// Validates a response against the query that produced it, then surfaces its RCODE.
@@ -756,6 +760,11 @@ mod tests {
         assert_eq!(addrs, [Ipv4Addr::new(5, 6, 7, 8)]);
     }
 
+    /// Returns the target to query next for `qname`, an A question.
+    fn cname_target(packet: &Packet<'_>, qname: &str) -> Option<String> {
+        unresolved_cname_target(packet, &Name::new_unchecked(qname), TYPE::A)
+    }
+
     #[test]
     fn cname_target_extracts_target_for_recursive_follow() {
         let id = 1234;
@@ -763,6 +772,48 @@ mod tests {
         let packet = Packet::parse(&resp).unwrap();
         let target = cname_target(&packet, "alias.example.com");
         assert_eq!(target.as_deref(), Some("real.example.com"));
+    }
+
+    /// The chain is resolved by a record of the type on a chain name only.
+    ///
+    /// One on an unrelated name is not an answer to the question, so the
+    /// chain is still followed; one on the target settles it.
+    #[test]
+    fn cname_target_ignores_records_off_the_chain() {
+        let id = 1234;
+        let mut packet = reply_with_question(id, "alias.example.com", TYPE::A);
+        packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked("alias.example.com"),
+            CLASS::IN,
+            300,
+            RData::CNAME(CNAME(Name::new_unchecked("real.example.com"))),
+        ));
+        packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked("unrelated.example.com"),
+            CLASS::IN,
+            300,
+            RData::A(A {
+                address: u32::from(Ipv4Addr::new(6, 6, 6, 6)),
+            }),
+        ));
+        let resp = packet.build_bytes_vec().unwrap();
+        let parsed = Packet::parse(&resp).unwrap();
+        assert_eq!(
+            cname_target(&parsed, "alias.example.com").as_deref(),
+            Some("real.example.com")
+        );
+
+        packet.answers.push(ResourceRecord::new(
+            Name::new_unchecked("real.example.com"),
+            CLASS::IN,
+            300,
+            RData::A(A {
+                address: u32::from(Ipv4Addr::new(7, 7, 7, 7)),
+            }),
+        ));
+        let resp = packet.build_bytes_vec().unwrap();
+        let parsed = Packet::parse(&resp).unwrap();
+        assert_eq!(cname_target(&parsed, "alias.example.com"), None);
     }
 
     /// Builds a reply echoing one question for `name`/`qtype`, plus an A answer.

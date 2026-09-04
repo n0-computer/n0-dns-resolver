@@ -922,17 +922,8 @@ impl DnsResolver {
             // only check of the response against the name we actually asked for.
             query::check_response(&packet, id, &name, qtype)?;
 
-            let has_answer = packet
-                .answers
-                .iter()
-                .any(|rr| rr.rdata.type_code() == qtype);
-
-            if has_answer {
-                return Ok(response);
-            }
-
-            // No records of the requested type -- follow CNAME if present.
-            let Some(target) = query::cname_target(&packet, &current_host) else {
+            // The response holds the answer, or has no CNAME to follow.
+            let Some(target) = query::unresolved_cname_target(&packet, &name, qtype) else {
                 return Ok(response);
             };
             debug!(from = %current_host, to = %target, "following CNAME");
