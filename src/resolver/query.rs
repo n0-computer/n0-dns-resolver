@@ -1130,7 +1130,7 @@ mod tests {
         // Shorter than a header.
         assert!(!answers_query(&good[..8], &query));
 
-        // Right id and QR bit but unparseable: accepted, so the server's own
+        // Right id and QR bit but unparsable: accepted, so the server's own
         // malformed reply fails the lookup now rather than at the timeout.
         let mut cut = good.clone();
         cut.truncate(good.len() - 2);
