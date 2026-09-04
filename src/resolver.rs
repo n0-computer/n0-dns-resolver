@@ -173,9 +173,13 @@ const DEFAULT_NDOTS: usize = 1;
 /// Returns whether `host` is `localhost` or a name under it.
 ///
 /// RFC 6761 Section 6.3 reserves these to resolve to loopback without a query.
+/// DNS names are case-insensitive, so `foo.LOCALHOST` is one of them too, and
+/// must not go out to a nameserver that could answer it with any address.
 fn is_localhost(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
-    host.eq_ignore_ascii_case("localhost") || host.ends_with(".localhost")
+    host.rsplit('.')
+        .next()
+        .is_some_and(|label| label.eq_ignore_ascii_case("localhost"))
 }
 
 /// A stub DNS resolver over UDP/TCP (and, with a crypto provider, DoT/DoH).
@@ -1453,6 +1457,19 @@ mod tests {
             stream.flush().await.unwrap();
         });
         (addr, handle)
+    }
+
+    /// Names under `localhost` are recognized whatever their case.
+    ///
+    /// Only the last label decides; `localhost` elsewhere in the name does not.
+    #[test]
+    fn localhost_is_matched_case_insensitively() {
+        for host in ["localhost", "LOCALHOST.", "foo.LocalHost", "a.b.localhost."] {
+            assert!(super::is_localhost(host), "{host}");
+        }
+        for host in ["localhost.example", "notlocalhost", "", "."] {
+            assert!(!super::is_localhost(host), "{host}");
+        }
     }
 
     /// A FORMERR response triggers an EDNS-less retry to the same server.
