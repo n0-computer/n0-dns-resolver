@@ -1119,6 +1119,7 @@ dependencies = [
  "android-activity",
  "derive_more",
  "hickory-resolver",
+ "http",
  "ipconfig",
  "iroh-base",
  "jni",

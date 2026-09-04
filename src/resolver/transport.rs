@@ -48,6 +48,12 @@ pub enum TransportError {
         /// The reqwest error from building the client.
         source: reqwest::Error,
     },
+    /// A DNS-over-HTTPS response body grew past the largest DNS message.
+    ///
+    /// The body is dropped at that point rather than read to its end.
+    #[cfg(transport_https)]
+    #[error("DNS-over-HTTPS response body exceeds {MAX_HTTPS_BODY} bytes")]
+    ResponseTooLarge {},
 }
 
 // TCP and DoT connections are pooled (see the `pool` module) and reused across
@@ -218,6 +224,34 @@ pub(super) fn build_https_client(
         .map_err(|source| e!(TransportError::BuildClient { source }))
 }
 
+/// Largest DNS-over-HTTPS response body read, in bytes.
+///
+/// A DNS message is at most 65535 bytes, the most the length prefix of the
+/// TCP framing can express, so a body past that cannot be one. Reading the
+/// body to its end before checking would let a server have us buffer as much
+/// as it cares to send; [`read_body`] stops at this point instead.
+#[cfg(transport_https)]
+const MAX_HTTPS_BODY: usize = u16::MAX as usize;
+
+/// Reads a DNS-over-HTTPS response body, giving up once it exceeds [`MAX_HTTPS_BODY`].
+#[cfg(transport_https)]
+async fn read_body(mut response: reqwest::Response) -> Result<Vec<u8>, TransportError> {
+    if response
+        .content_length()
+        .is_some_and(|len| len > MAX_HTTPS_BODY as u64)
+    {
+        return Err(e!(TransportError::ResponseTooLarge));
+    }
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if body.len() + chunk.len() > MAX_HTTPS_BODY {
+            return Err(e!(TransportError::ResponseTooLarge));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
+}
+
 /// Sends a DNS query over HTTPS (DNS-over-HTTPS, RFC 8484).
 ///
 /// With `server_name`, the URL is addressed by hostname (the client pins it to
@@ -243,8 +277,7 @@ pub(super) async fn https_query(
         .send()
         .await?;
 
-    let bytes = response.error_for_status()?.bytes().await?;
-    Ok(bytes.to_vec())
+    read_body(response.error_for_status()?).await
 }
 
 #[cfg(test)]
@@ -430,6 +463,24 @@ mod tests {
         let (addrs, _) = parse_a_addrs(&udp_query(addr, &query).await.unwrap().0);
         assert_eq!(addrs, [expected]);
         handle.await.unwrap();
+    }
+
+    /// A DoH body past the largest DNS message is dropped, not buffered.
+    ///
+    /// One that just fits is read whole.
+    #[cfg(transport_https)]
+    #[tokio::test]
+    async fn https_body_is_capped_at_the_dns_message_maximum() {
+        let fits = vec![0u8; MAX_HTTPS_BODY];
+        let response = reqwest::Response::from(http::Response::new(fits.clone()));
+        assert_eq!(read_body(response).await.unwrap(), fits);
+
+        let too_large = vec![0u8; MAX_HTTPS_BODY + 1];
+        let response = reqwest::Response::from(http::Response::new(too_large));
+        assert!(matches!(
+            read_body(response).await,
+            Err(TransportError::ResponseTooLarge { .. })
+        ));
     }
 
     /// A datagram that exactly fills the receive buffer is flagged as truncated.

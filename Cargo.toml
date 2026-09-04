@@ -62,6 +62,7 @@ paranoid-android = "0.2.2"
 
 [dev-dependencies]
 hickory-resolver = { version = "0.26.0", features = ["tokio", "system-config"] }
+http = "1"
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 tokio = { version = "1", features = ["macros", "rt"] }
 tracing-subscriber = "0.3.23"
