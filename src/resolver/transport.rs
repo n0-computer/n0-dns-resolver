@@ -26,6 +26,12 @@ pub enum TransportError {
     /// The query did not fit the 2-byte length prefix used for TCP and DoT.
     #[error("query too large for TCP framing")]
     QueryTooLarge {},
+    /// A TCP or DoT frame did not answer the query.
+    ///
+    /// A connection that delivers one is dropped rather than returned to the
+    /// pool, so a stale frame cannot be handed to the next query on it.
+    #[error("response frame does not answer the query")]
+    UnexpectedResponse {},
     /// The configured TLS server name is not a valid DNS name for SNI.
     #[cfg(transport_tls)]
     #[error("invalid TLS server name: {name}")]
@@ -120,6 +126,13 @@ pub(super) async fn udp_query(
 ///
 /// Uses the 2-byte length prefix framing from RFC 1035 Section 4.2.2. Shared by
 /// TCP and DoT.
+///
+/// The frame read back must answer the query (see [`query::answers_query`]).
+/// One query is in flight per connection, so the next frame can only be the
+/// answer or something the server sent unasked, such as a second frame after
+/// its last answer. Taking that as the answer would fail this query, and
+/// leaving it unread would hand it to the next query on the connection once
+/// pooled. The error makes the caller drop the connection instead.
 async fn framed_query<S>(stream: &mut S, query: &[u8]) -> Result<Vec<u8>, TransportError>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -134,14 +147,18 @@ where
     let resp_len = stream.read_u16().await? as usize;
     let mut buf = vec![0u8; resp_len];
     stream.read_exact(&mut buf).await?;
+    if !query::answers_query(&buf, query) {
+        return Err(e!(TransportError::UnexpectedResponse));
+    }
     Ok(buf)
 }
 
 /// Sends a DNS query over TCP, reusing a pooled connection when one is available.
 ///
-/// A pooled connection may have been closed by the server while idle; that only
-/// surfaces on the first read/write, so on failure we dial a fresh connection
-/// and retry the query once.
+/// A pooled connection may have been closed by the server while idle, or hold
+/// a frame the server sent after its last answer; either only surfaces on the
+/// first use, so on failure we dial a fresh connection and retry the query
+/// once.
 pub(super) async fn tcp_query(
     pool: &ConnPool,
     addr: SocketAddr,
@@ -481,6 +498,78 @@ mod tests {
             read_body(response).await,
             Err(TransportError::ResponseTooLarge { .. })
         ));
+    }
+
+    /// A frame that does not answer the query is an error, not the answer.
+    #[tokio::test]
+    async fn framed_query_rejects_a_frame_for_another_query() {
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let (id, query) = build_query();
+        let stale = build_a_response(id.wrapping_add(1), &[Ipv4Addr::new(6, 6, 6, 6)]);
+        server
+            .write_all(&(stale.len() as u16).to_be_bytes())
+            .await
+            .unwrap();
+        server.write_all(&stale).await.unwrap();
+
+        assert!(matches!(
+            framed_query(&mut client, &query).await,
+            Err(TransportError::UnexpectedResponse { .. })
+        ));
+    }
+
+    /// A pooled connection holding a stale frame is dropped, not reused.
+    ///
+    /// The mock answers the first query and then sends a frame nobody asked
+    /// for. The next query on the pooled connection reads that frame, must not
+    /// take it as its answer, and gets a fresh connection instead, which is why
+    /// the mock accepts twice.
+    #[tokio::test]
+    async fn tcp_query_drops_a_pooled_connection_with_a_stale_frame() {
+        let expected = Ipv4Addr::new(93, 184, 216, 34);
+        let spoofed = Ipv4Addr::new(6, 6, 6, 6);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            /// Reads one framed query and returns its id.
+            async fn read_query(stream: &mut tokio::net::TcpStream) -> u16 {
+                let len = stream.read_u16().await.unwrap() as usize;
+                let mut buf = vec![0u8; len];
+                stream.read_exact(&mut buf).await.unwrap();
+                Packet::parse(&buf).unwrap().id()
+            }
+            /// Writes one framed message.
+            async fn write_frame(stream: &mut tokio::net::TcpStream, frame: &[u8]) {
+                stream
+                    .write_all(&(frame.len() as u16).to_be_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(frame).await.unwrap();
+                stream.flush().await.unwrap();
+            }
+
+            let (mut first, _) = listener.accept().await.unwrap();
+            let id = read_query(&mut first).await;
+            write_frame(&mut first, &build_a_response(id, &[expected])).await;
+            write_frame(&mut first, &build_a_response(id ^ 1, &[spoofed])).await;
+
+            let (mut second, _) = listener.accept().await.unwrap();
+            let id = read_query(&mut second).await;
+            write_frame(&mut second, &build_a_response(id, &[expected])).await;
+            // Keep the first connection open until the second query is done,
+            // so the stale frame is read rather than a reset.
+            drop(first);
+        });
+
+        let pool = ConnPool::new();
+        let (_, query) = build_query();
+        let (addrs, _) = parse_a_addrs(&tcp_query(&pool, addr, &query).await.unwrap());
+        assert_eq!(addrs, [expected]);
+
+        let (_, query) = build_query();
+        let (addrs, _) = parse_a_addrs(&tcp_query(&pool, addr, &query).await.unwrap());
+        assert_eq!(addrs, [expected]);
+        handle.await.unwrap();
     }
 
     /// A datagram that exactly fills the receive buffer is flagged as truncated.
