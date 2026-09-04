@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::{
     future::Future,
-    net::{Ipv4Addr, Ipv6Addr},
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::OnceLock,
 };
@@ -86,40 +86,82 @@ impl From<QueryError> for Error {
     }
 }
 
-/// Per-attempt timeout for a UDP query.
+/// Total time one nameserver gets for a query sent over UDP.
 ///
-/// UDP is retried [`UDP_ATTEMPTS`] times and servers are raced, so a lost or
-/// slow datagram is recovered by another attempt or another server; the timeout
-/// only needs to cover a healthy server answering over a slow link. Kept below
-/// [`STREAM_TIMEOUT`] so a silent server fails over quickly rather than stalling
-/// the whole lookup. Higher than the historical 2s but below the 5s that glibc,
-/// Go, and hickory-resolver use for their (un-raced) queries.
-const UDP_TIMEOUT: Duration = Duration::from_secs(3);
+/// Covers every datagram [`DnsResolver::udp_query`] sends plus the TCP query
+/// that joins them, which is what lets a retransmit go out while the previous
+/// one is still outstanding. Leaves TCP roughly [`STREAM_TIMEOUT`] once started.
+const UDP_NAMESERVER_TIMEOUT: Duration = Duration::from_secs(6);
 
 /// Per-attempt timeout for a connection-oriented query (TCP, DoT, DoH).
 ///
-/// Longer than [`UDP_TIMEOUT`] because it must also cover connection setup and,
-/// for DoT/DoH, the TLS handshake, on top of the query round trip. Matches the
-/// ~5s query timeout used by glibc, Go, hickory-resolver, and systemd-resolved.
+/// Covers connection setup and, for DoT/DoH, the TLS handshake on top of the
+/// round trip. Matches the ~5s used by glibc, Go, hickory-resolver, and
+/// systemd-resolved.
 const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Maximum number of nameserver queries in flight at once.
 ///
-/// Bounds how many servers we race so that growing the nameserver list does
-/// not turn every lookup into an N-way fan-out.
+/// Keeps a long nameserver list from turning every lookup into an N-way fan-out.
 const MAX_CONCURRENT_QUERIES: usize = 3;
 
 /// Delay before starting the next nameserver attempt.
 ///
-/// An in-flight attempt failing starts the next one immediately instead. The
-/// delay gives faster servers a head start without blasting the whole list at
-/// once, happy-eyeballs style.
+/// Gives faster servers a head start without blasting the whole list at once,
+/// happy-eyeballs style. An attempt that fails starts the next one at once.
 const QUERY_ATTEMPT_DELAY: Duration = Duration::from_millis(100);
 
-/// Number of UDP attempts per nameserver before giving up on it.
+/// Number of UDP datagrams sent to one nameserver for a single query.
 ///
-/// UDP is unreliable, so a single dropped datagram should not be fatal.
-const UDP_ATTEMPTS: usize = 2;
+/// The first [`UDP_PACED_DATAGRAMS`] go out at the interval
+/// [`DnsResolver::retransmit_interval`] gives, the rest at double the one
+/// before, so the last lands around five seconds in. Stopping after the paced
+/// run left UDP silent for most of [`UDP_NAMESERVER_TIMEOUT`], resting on a TCP
+/// query that on a lossy link is the weaker of the two. The later datagrams cost
+/// nothing when they are not needed, since an answer over either transport drops
+/// the whole set.
+const UDP_DATAGRAMS: usize = 6;
+
+/// Number of UDP datagrams sent before the interval starts doubling.
+///
+/// Matches hickory-resolver's `max_retries`. Datagrams overlap rather than run
+/// in sequence: each goes out while the earlier ones are still outstanding, and
+/// any may carry the answer.
+const UDP_PACED_DATAGRAMS: usize = 3;
+
+/// Multiplier on a nameserver's datagram round trip to get its retransmit
+/// interval.
+///
+/// A server that answers in 400ms is not late until well past 400ms, so scaling
+/// off the measurement keeps us from retransmitting into a merely slow link.
+/// hickory-resolver uses 1.2; the wider margin is a judgement call, and below
+/// [`UDP_RETRANSMIT_MIN`] the floor governs either way.
+const UDP_RETRANSMIT_SRTT_FACTOR: f64 = 1.5;
+
+/// Lower bound on the UDP retransmit interval.
+///
+/// Below this the retransmit races the answer rather than replacing a lost
+/// datagram, costing every healthy lookup an extra packet. Sits between
+/// c-ares's 250ms and hickory-resolver's 333ms.
+const UDP_RETRANSMIT_MIN: Duration = Duration::from_millis(300);
+
+/// Upper bound on the UDP retransmit interval.
+///
+/// Caps how long a badly degraded nameserver can stall the next datagram.
+const UDP_RETRANSMIT_MAX: Duration = Duration::from_secs(1);
+
+/// How long a nameserver may leave UDP unanswered before the query also goes
+/// out over TCP.
+///
+/// [`UDP_RETRANSMIT_MIN`] times [`UDP_PACED_DATAGRAMS`], so at the floor the
+/// paced run has gone out with an interval to spare and a link that merely
+/// loses datagrams never pays for a connection.
+///
+/// Fixed, where the retransmit interval is measured. A delay derived from how
+/// long this server takes would grow with the fallback it exists to reach: the
+/// server answers over TCP, that answer is what the measurement sees, and the
+/// switch slips further on every lookup.
+const TCP_JOIN_DELAY: Duration = UDP_RETRANSMIT_MIN.saturating_mul(UDP_PACED_DATAGRAMS as u32);
 
 /// Default value for `ndots` per resolv.conf(5).
 ///
@@ -200,11 +242,11 @@ struct ResolverState {
     config: Config,
     /// Number of leading `config.nameservers` entries forming the primary tier.
     primary_count: usize,
-    /// Smoothed round-trip time per nameserver.
+    /// Smoothed round-trip times per nameserver.
     ///
-    /// Indexed in parallel to `config.nameservers`.
-    ///
-    /// Orders servers fastest-first and re-probes ones that were demoted.
+    /// Indexed in parallel to `config.nameservers`. Orders servers
+    /// fastest-first, re-probes ones that were demoted, and paces UDP
+    /// retransmits.
     rtt_map: RttMap,
 }
 
@@ -486,10 +528,8 @@ impl DnsResolver {
         soa_ttl.unwrap_or(NEGATIVE_TTL_SECS).min(max_secs)
     }
 
-    /// Run a transport future with a per-attempt `timeout`.
-    ///
-    /// Callers pass [`UDP_TIMEOUT`] for datagram queries and [`STREAM_TIMEOUT`]
-    /// for connection-oriented ones (TCP, DoT, DoH).
+    /// Runs a transport future with a `timeout`, mapping both failures to
+    /// [`Error`].
     async fn with_timeout<T>(
         timeout: Duration,
         fut: impl Future<Output = Result<T, TransportError>>,
@@ -502,6 +542,12 @@ impl DnsResolver {
 
     /// Query a single nameserver, retrying without EDNS on a FORMERR.
     ///
+    /// `retransmit` is how long to wait between UDP datagrams, from
+    /// [`Self::retransmit_interval`]; it is ignored for the other transports.
+    ///
+    /// Returns the response, and the round trip of the datagram that carried it
+    /// when one did. See [`Self::query_nameserver_once`].
+    ///
     /// A FORMERR response often means the server or a middlebox rejected our
     /// EDNS(0) OPT record, so retry the same server once without it (RFC 6891
     /// Section 6.2.2) before letting the caller move on. If the query carries no
@@ -511,72 +557,49 @@ impl DnsResolver {
         &self,
         ns: &Nameserver,
         query_bytes: &[u8],
-    ) -> Result<Vec<u8>, Error> {
-        let resp = self.query_nameserver_once(ns, query_bytes).await?;
+        retransmit: Duration,
+    ) -> Result<(Vec<u8>, Option<Duration>), Error> {
+        let (resp, datagram_rtt) = self
+            .query_nameserver_once(ns, query_bytes, retransmit)
+            .await?;
         if query::is_format_error(&resp)
             && let Some(stripped) = query::strip_edns(query_bytes)
         {
             debug!(addr = %ns.addr, "FORMERR with EDNS, retrying without OPT");
-            return self.query_nameserver_once(ns, &stripped).await;
+            return self.query_nameserver_once(ns, &stripped, retransmit).await;
         }
-        Ok(resp)
+        Ok((resp, datagram_rtt))
     }
 
-    /// Query a single nameserver once, retrying UDP and falling back to TCP.
+    /// Query a single nameserver once over its configured transport.
     ///
-    /// A UDP query is retried [`UDP_ATTEMPTS`] times, then falls back to TCP on
-    /// the same server if every attempt failed, so lookups still succeed on
-    /// networks that drop outbound UDP/53 but allow TCP/53. A truncated UDP
-    /// response also falls back to TCP, to fetch the full answer.
+    /// Returns the response, and the round trip of the datagram that carried it
+    /// when one did. That sample paces the next lookup, so it is narrow on
+    /// purpose: only a datagram that came back can say how long a datagram
+    /// takes. What the attempt cost is the caller's to measure, for ordering.
     async fn query_nameserver_once(
         &self,
         ns: &Nameserver,
         query_bytes: &[u8],
-    ) -> Result<Vec<u8>, Error> {
+        retransmit: Duration,
+    ) -> Result<(Vec<u8>, Option<Duration>), Error> {
         let addr = ns.addr;
-        match ns.protocol {
+        // Only UDP has a datagram round trip to report; the rest send one query.
+        let resp = match ns.protocol {
             DnsProtocol::Udp => {
-                let mut last_err = None;
-                for attempt in 0..UDP_ATTEMPTS {
-                    trace!(%addr, attempt, "sending UDP query");
-                    match Self::with_timeout(UDP_TIMEOUT, transport::udp_query(addr, query_bytes))
-                        .await
-                    {
-                        Ok((resp, maybe_truncated))
-                            if maybe_truncated || query::is_truncated(&resp) =>
-                        {
-                            debug!(%addr, "UDP response truncated, retrying over TCP");
-                            return Self::with_timeout(
-                                STREAM_TIMEOUT,
-                                transport::tcp_query(&self.conn_pool, addr, query_bytes),
-                            )
-                            .await;
-                        }
-                        Ok((resp, _)) => return Ok(resp),
-                        Err(e) => {
-                            trace!(%addr, attempt, err = %e, "UDP query failed");
-                            last_err = Some(e);
-                        }
-                    }
-                }
-                // Every UDP attempt failed (timed out or errored). The server may
-                // still answer over TCP: some networks (locked-down containers,
-                // egress firewalls) drop outbound UDP/53 while permitting TCP/53,
-                // so fall back to TCP on the same server before giving up.
-                let last_err = last_err.unwrap_or_else(|| e!(Error::NoResponse));
-                debug!(%addr, err = %last_err, "UDP attempts failed, falling back to TCP");
-                Self::with_timeout(
-                    STREAM_TIMEOUT,
-                    transport::tcp_query(&self.conn_pool, addr, query_bytes),
+                return time::timeout(
+                    UDP_NAMESERVER_TIMEOUT,
+                    self.udp_query(addr, query_bytes, retransmit),
                 )
                 .await
+                .map_err(|_| e!(Error::Timeout))?;
             }
             DnsProtocol::Tcp => {
                 Self::with_timeout(
                     STREAM_TIMEOUT,
                     transport::tcp_query(&self.conn_pool, addr, query_bytes),
                 )
-                .await
+                .await?
             }
             #[cfg(transport_tls)]
             DnsProtocol::Tls => {
@@ -594,7 +617,7 @@ impl DnsResolver {
                         ns.server_name.as_deref(),
                     ),
                 )
-                .await
+                .await?
             }
             #[cfg(transport_https)]
             DnsProtocol::Https => {
@@ -603,9 +626,142 @@ impl DnsResolver {
                     STREAM_TIMEOUT,
                     transport::https_query(addr, ns.server_name.as_deref(), query_bytes, &client),
                 )
-                .await
+                .await?
+            }
+        };
+        Ok((resp, None))
+    }
+
+    /// Queries a nameserver over UDP, overlapping retransmits and then TCP.
+    ///
+    /// Sends up to [`UDP_DATAGRAMS`] datagrams, each from its own socket and all
+    /// left outstanding, so one that never arrives costs an interval rather than
+    /// a timeout. After [`TCP_JOIN_DELAY`] unanswered a TCP query joins them,
+    /// which is how a lookup survives a network that drops outbound UDP/53 but
+    /// permits TCP/53. Whichever answers first wins, and a truncated response
+    /// brings TCP in early since the full answer only fits there. Duplicates are
+    /// safe: every datagram carries the same transaction id from a fresh source
+    /// port, and the caller validates the id, the QR bit, and the question.
+    ///
+    /// Returns the response, and how long the datagram that carried it was in
+    /// flight, timed from its own send. `None` when TCP answered instead. That
+    /// sample paces the next lookup, so it must not contain the intervals this
+    /// one waited: a sample that did would stretch the next interval, which
+    /// would stretch the next sample.
+    ///
+    /// Has no internal deadline; the caller bounds it with
+    /// [`UDP_NAMESERVER_TIMEOUT`].
+    async fn udp_query(
+        &self,
+        addr: SocketAddr,
+        query_bytes: &[u8],
+        retransmit: Duration,
+    ) -> Result<(Vec<u8>, Option<Duration>), Error> {
+        // Outstanding datagrams, each carrying the instant it went out. Dropping
+        // the set on return closes their sockets.
+        let mut datagrams = FuturesUnordered::new();
+        // Cancelling the TCP query is safe: the pool hands out a connection by
+        // removing it and only takes it back on success, so a dropped query
+        // closes its connection rather than returning a half-read one.
+        let tcp = MaybeFuture::None;
+        tokio::pin!(tcp);
+        let next_send = MaybeFuture::None;
+        tokio::pin!(next_send);
+        let tcp_due = MaybeFuture::Some(time::sleep(TCP_JOIN_DELAY));
+        tokio::pin!(tcp_due);
+        let mut sends_left = UDP_DATAGRAMS;
+        let mut interval = retransmit;
+        // Only the pacing releases a datagram, or a send that failed outright. A
+        // wakeup from the TCP side must not spend one early.
+        let mut send_due = true;
+        let mut last_err = None;
+
+        loop {
+            if send_due && sends_left > 0 {
+                let nth = UDP_DATAGRAMS - sends_left;
+                trace!(%addr, datagram = nth, ?interval, "sending UDP query");
+                let sent = Instant::now();
+                datagrams
+                    .push(async move { (sent, transport::udp_query(addr, query_bytes).await) });
+                sends_left -= 1;
+                if sends_left > 0 {
+                    if UDP_DATAGRAMS - sends_left >= UDP_PACED_DATAGRAMS {
+                        interval *= 2;
+                    }
+                    next_send.as_mut().set_future(time::sleep(interval));
+                } else {
+                    // A timer left running here would hold the loop open past
+                    // the last failure.
+                    next_send.as_mut().set_none();
+                }
+            }
+            send_due = false;
+
+            // Nothing outstanding and nothing left to send, so the rest of the
+            // delay cannot produce an answer. This is a server that refuses UDP
+            // rather than dropping it, or an interface with no route to it.
+            if datagrams.is_empty() && sends_left == 0 && tcp_due.is_some() {
+                tcp_due.as_mut().set_future(time::sleep(Duration::ZERO));
+            }
+
+            tokio::select! {
+                biased;
+                // A datagram came back.
+                Some((sent, res)) = datagrams.next(), if !datagrams.is_empty() => match res {
+                    Ok((resp, maybe_truncated)) if maybe_truncated || query::is_truncated(&resp) => {
+                        debug!(%addr, "UDP response truncated, fetching the answer over TCP");
+                        // The answer does not fit in a datagram: stop sending
+                        // them and bring TCP forward.
+                        sends_left = 0;
+                        next_send.as_mut().set_none();
+                        if tcp.is_none() {
+                            tcp_due.as_mut().set_future(time::sleep(Duration::ZERO));
+                        }
+                    }
+                    Ok((resp, _)) => return Ok((resp, Some(sent.elapsed()))),
+                    Err(err) => {
+                        trace!(%addr, %err, "UDP query failed");
+                        last_err = Some(Error::from(err));
+                        // Nothing left in flight to wait for, so replace it now.
+                        send_due = true;
+                    }
+                },
+                // The TCP query came back.
+                res = &mut tcp, if tcp.is_some() => match res {
+                    Ok(resp) => return Ok((resp, None)),
+                    Err(err) => {
+                        debug!(%addr, %err, "TCP query failed");
+                        last_err = Some(Error::from(err));
+                    }
+                },
+                // Time to send the next datagram.
+                () = &mut next_send, if next_send.is_some() => send_due = true,
+                // Time to bring TCP in.
+                () = &mut tcp_due, if tcp_due.is_some() => {
+                    // The datagrams may be in flight rather than lost, so they
+                    // keep their sockets and TCP races them.
+                    debug!(%addr, "UDP unanswered, joining with TCP");
+                    tcp.as_mut().set_future(transport::tcp_query(
+                        &self.conn_pool,
+                        addr,
+                        query_bytes,
+                    ));
+                },
+                // Nothing left in flight and nothing left to start.
+                else => return Err(last_err.unwrap_or_else(|| e!(Error::NoResponse))),
             }
         }
+    }
+
+    /// Returns how long to wait between UDP datagrams to a nameserver.
+    ///
+    /// `datagram_micros` is one datagram exchange with that server, as
+    /// [`RttMap::get_datagram`] reports it, so a slow link gets proportionally
+    /// longer before we send again.
+    fn retransmit_interval(datagram_rtt: Duration) -> Duration {
+        datagram_rtt
+            .mul_f64(UDP_RETRANSMIT_SRTT_FACTOR)
+            .clamp(UDP_RETRANSMIT_MIN, UDP_RETRANSMIT_MAX)
     }
 
     /// Returns the given nameserver indices ordered fastest-first by smoothed RTT.
@@ -655,9 +811,14 @@ impl DnsResolver {
     /// fails, whichever comes first, and in-flight attempts are capped at
     /// [`MAX_CONCURRENT_QUERIES`].
     ///
-    /// The first successful response wins; UDP queries are retried per
-    /// nameserver on failure. Per-server success and failure update the
-    /// smoothed RTT used for ordering, so the server list is self-healing.
+    /// The first successful response wins. Within each attempt a UDP query
+    /// overlaps its own retransmits, paced by how long that server's datagrams
+    /// take to come back (see [`Self::udp_query`]).
+    ///
+    /// A completed attempt updates both of the server's estimates, so the list
+    /// is self-healing and the pacing adapts with it. Ordering measures the whole
+    /// attempt, retransmit intervals and TCP fallback included, since that is
+    /// what the server costs us. Pacing sees only a datagram's flight time.
     async fn race(&self, indices: &[usize], query_bytes: &[u8]) -> Result<Vec<u8>, Error> {
         let state = self.state();
         let order = self.order_indices(indices);
@@ -678,9 +839,11 @@ impl DnsResolver {
                 let idx = order[next];
                 next += 1;
                 let start = Instant::now();
+                let retransmit = Self::retransmit_interval(state.rtt_map.get_datagram(idx));
                 dials.push(async move {
                     let ns = &state.config.nameservers[idx];
-                    (idx, start, self.query_nameserver(ns, query_bytes).await)
+                    let res = self.query_nameserver(ns, query_bytes, retransmit).await;
+                    (idx, start, res)
                 });
                 // Pace the following attempt, unless this was the last server.
                 if next < order.len() {
@@ -698,7 +861,7 @@ impl DnsResolver {
                 biased;
                 // A dial attempt completed.
                 Some((idx, start, res)) = dials.next(), if !dials.is_empty() => match res {
-                    Ok(resp) => {
+                    Ok((resp, datagram_rtt)) => {
                         // A SERVFAIL, REFUSED, or FORMERR response means this server
                         // will not answer for the name (overloaded, not authoritative,
                         // policy block, or it rejected the query even without EDNS).
@@ -713,7 +876,9 @@ impl DnsResolver {
                             // Fail fast: start the next attempt now rather than waiting.
                             next_attempt.as_mut().set_none();
                         } else {
-                            state.rtt_map.record_success(idx, start.elapsed());
+                            state
+                                .rtt_map
+                                .record_success(idx, start.elapsed(), datagram_rtt);
                             return Ok(resp);
                         }
                     }
@@ -1153,7 +1318,7 @@ impl DnsResolver {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-        time::Duration,
+        time::{Duration, Instant},
     };
 
     use simple_dns::{
@@ -1163,7 +1328,9 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tracing::info;
 
-    use super::{CachedResult, DnsResolver, Hosts};
+    use super::{
+        CachedResult, DnsResolver, Hosts, TCP_JOIN_DELAY, UDP_PACED_DATAGRAMS, UDP_RETRANSMIT_MIN,
+    };
     use crate::{DnsProtocol, FallbackMode, Nameserver, Record, RecordKind, public_resolvers};
 
     /// Builds a resolver with no nameservers at all.
@@ -1202,6 +1369,102 @@ mod tests {
         assert!(!addrs.is_empty(), "{host} should have IPv4 addresses");
     }
 
+    /// Builds an A response for `example.com`, echoing the question as a real
+    /// server does.
+    fn a_reply(id: u16, answer: Ipv4Addr) -> Vec<u8> {
+        let mut reply = Packet::new_reply(id);
+        reply.set_flags(PacketFlag::RECURSION_DESIRED | PacketFlag::RECURSION_AVAILABLE);
+        reply.questions.push(Question::new(
+            Name::new_unchecked("example.com"),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        reply.answers.push(ResourceRecord::new(
+            Name::new_unchecked("example.com"),
+            CLASS::IN,
+            300,
+            RData::A(A {
+                address: u32::from(answer),
+            }),
+        ));
+        reply.build_bytes_vec().unwrap()
+    }
+
+    /// Spawns a nameserver that swallows `losses` datagrams and answers the next.
+    ///
+    /// Asserts along the way that every datagram of a run reuses the first one's
+    /// transaction id, which is what makes duplicates safe.
+    async fn udp_nameserver_losing(
+        mut losses: usize,
+        answer: Ipv4Addr,
+    ) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let mut first_id = None;
+            loop {
+                let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+                let id = Packet::parse(&buf[..len]).unwrap().id();
+                assert_eq!(
+                    id,
+                    *first_id.get_or_insert(id),
+                    "a retransmit reuses the transaction id"
+                );
+                if losses == 0 {
+                    server.send_to(&a_reply(id, answer), peer).await.unwrap();
+                    return;
+                }
+                losses -= 1;
+            }
+        });
+        (addr, handle)
+    }
+
+    /// Spawns a nameserver that answers one query over TCP and never over UDP.
+    ///
+    /// The shape of a network that permits TCP/53 and drops datagrams, so a
+    /// lookup only completes once the TCP query joins them at
+    /// [`TCP_JOIN_DELAY`].
+    ///
+    /// The UDP port is bound and then ignored rather than left closed. A closed
+    /// port makes a datagram refused rather than dropped, and Windows reports
+    /// that back on the socket as `WSAECONNRESET` where Unix delivers nothing to
+    /// an unconnected socket. The refusal leaves nothing in flight, the resolver
+    /// correctly brings TCP forward, and there is no join delay left to measure.
+    async fn tcp_only_nameserver(answer: Ipv4Addr) -> (SocketAddr, tokio::task::JoinHandle<()>) {
+        // Both transports share one port, and a test running in parallel may
+        // hold the UDP side of whichever port the OS picks for TCP.
+        let (listener, udp) = 'bind: {
+            for _ in 0..16 {
+                let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                if let Ok(udp) = tokio::net::UdpSocket::bind(tcp.local_addr().unwrap()).await {
+                    break 'bind (tcp, udp);
+                }
+            }
+            panic!("no port free for both UDP and TCP");
+        };
+        let addr = listener.local_addr().unwrap();
+        let handle = tokio::spawn(async move {
+            // Held open for the lifetime of the task so the datagrams are
+            // dropped rather than refused.
+            let _udp = udp;
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let len = stream.read_u16().await.unwrap() as usize;
+            let mut buf = vec![0u8; len];
+            stream.read_exact(&mut buf).await.unwrap();
+            let bytes = a_reply(Packet::parse(&buf).unwrap().id(), answer);
+            stream
+                .write_all(&(bytes.len() as u16).to_be_bytes())
+                .await
+                .unwrap();
+            stream.write_all(&bytes).await.unwrap();
+            stream.flush().await.unwrap();
+        });
+        (addr, handle)
+    }
+
     /// A FORMERR response triggers an EDNS-less retry to the same server.
     ///
     /// RFC 6891. The mock rejects the EDNS query with FORMERR, then answers the
@@ -1226,24 +1489,10 @@ mod tests {
             let (n, peer) = server.recv_from(&mut buf).await.unwrap();
             let retry = Packet::parse(&buf[..n]).unwrap();
             assert!(retry.opt().is_none(), "retry should drop EDNS");
-            let mut reply = Packet::new_reply(retry.id());
-            reply.set_flags(PacketFlag::RECURSION_DESIRED | PacketFlag::RECURSION_AVAILABLE);
-            reply.questions.push(Question::new(
-                Name::new_unchecked("example.com"),
-                QTYPE::TYPE(TYPE::A),
-                QCLASS::CLASS(CLASS::IN),
-                false,
-            ));
-            reply.answers.push(ResourceRecord::new(
-                Name::new_unchecked("example.com"),
-                CLASS::IN,
-                300,
-                RData::A(A {
-                    address: u32::from(expected),
-                }),
-            ));
-            let bytes = reply.build_bytes_vec().unwrap();
-            server.send_to(&bytes, peer).await.unwrap();
+            server
+                .send_to(&a_reply(retry.id(), expected), peer)
+                .await
+                .unwrap();
         });
 
         let resolver = with_proto(addr, DnsProtocol::Udp);
@@ -1252,54 +1501,159 @@ mod tests {
         handle.await.unwrap();
     }
 
+    /// A lost datagram costs a retransmit interval, not a timeout.
+    #[tokio::test]
+    async fn lost_datagram_recovers_within_a_retransmit_interval() {
+        let expected = Ipv4Addr::new(198, 51, 100, 23);
+        let (addr, handle) = udp_nameserver_losing(1, expected).await;
+        let resolver = with_proto(addr, DnsProtocol::Udp);
+
+        let start = Instant::now();
+        let addrs = resolver.lookup_ipv4("example.com").await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(addrs, [expected]);
+        assert!(
+            elapsed < UDP_RETRANSMIT_MIN * 2,
+            "recovery took {elapsed:?}, expected about {UDP_RETRANSMIT_MIN:?}"
+        );
+        handle.await.unwrap();
+    }
+
+    /// A prompt UDP answer cancels the scheduled TCP fallback before it dials.
+    #[tokio::test]
+    async fn udp_answer_does_not_start_tcp() {
+        let answer = Ipv4Addr::new(198, 51, 100, 24);
+        let (listener, udp) = 'bind: {
+            for _ in 0..16 {
+                let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                if let Ok(udp) = tokio::net::UdpSocket::bind(tcp.local_addr().unwrap()).await {
+                    break 'bind (tcp, udp);
+                }
+            }
+            panic!("no port free for both UDP and TCP");
+        };
+        let addr = listener.local_addr().unwrap();
+        let udp_task = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            let (len, peer) = udp.recv_from(&mut buf).await.unwrap();
+            let id = Packet::parse(&buf[..len]).unwrap().id();
+            udp.send_to(&a_reply(id, answer), peer).await.unwrap();
+        });
+        let (tcp_started, mut tcp_started_rx) = tokio::sync::oneshot::channel();
+        let tcp_task = tokio::spawn(async move {
+            let _ = listener.accept().await;
+            let _ = tcp_started.send(());
+        });
+
+        let resolver = with_proto(addr, DnsProtocol::Udp);
+        assert_eq!(resolver.lookup_ipv4("example.com").await.unwrap(), [answer]);
+        udp_task.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut tcp_started_rx)
+                .await
+                .is_err(),
+            "a UDP answer before the join delay must not open TCP"
+        );
+        tcp_task.abort();
+    }
+
+    /// Datagrams keep going once the paced run is used up.
+    ///
+    /// The paced run is all swallowed and nothing listens on TCP, so the query
+    /// that joins at [`TCP_JOIN_DELAY`] is refused. Only a later datagram can
+    /// carry this lookup. That is the case the harness meets under heavy random
+    /// loss, where a datagram is likelier to get through than a TCP exchange.
+    #[tokio::test]
+    async fn datagrams_continue_past_the_paced_run() {
+        let expected = Ipv4Addr::new(198, 51, 100, 41);
+        let (addr, handle) = udp_nameserver_losing(UDP_PACED_DATAGRAMS, expected).await;
+        let resolver = with_proto(addr, DnsProtocol::Udp);
+
+        let start = Instant::now();
+        let addrs = resolver.lookup_ipv4("example.com").await.unwrap();
+        let elapsed = start.elapsed();
+
+        assert_eq!(addrs, [expected]);
+        // Due one doubled interval after the paced run, so about four floors in,
+        // well short of the limit a resolver that had stopped would wait out.
+        assert!(
+            elapsed < UDP_RETRANSMIT_MIN * 8,
+            "recovered after {elapsed:?}, expected about {:?}",
+            UDP_RETRANSMIT_MIN * 4
+        );
+        handle.await.unwrap();
+    }
+
+    /// A nameserver that rejects UDP outright does not wait out the TCP delay.
+    ///
+    /// Port 0 is not a valid destination, so every send fails at once and
+    /// nothing is ever in flight. Waiting there would only delay the TCP query
+    /// that is about to fail too, and behind it the next nameserver in the race.
+    /// This is the shape of an interface with no route to the server.
+    #[tokio::test]
+    async fn udp_rejected_outright_skips_the_tcp_delay() {
+        let resolver = with_proto("127.0.0.1:0".parse().unwrap(), DnsProtocol::Udp);
+        let start = Instant::now();
+        assert!(resolver.lookup_ipv4("example.com").await.is_err());
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < TCP_JOIN_DELAY,
+            "gave up after {elapsed:?}, expected well inside the {TCP_JOIN_DELAY:?} TCP join delay"
+        );
+    }
+
     /// A server that fails over UDP is retried over TCP.
     ///
     /// This keeps lookups working on a network that drops UDP/53 but allows
-    /// TCP/53. The mock serves DNS over TCP only and leaves the UDP port
-    /// unbound, so the UDP attempts time out.
+    /// TCP/53.
     #[tokio::test]
     async fn udp_failure_falls_back_to_tcp() {
         let expected = Ipv4Addr::new(93, 184, 216, 34);
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let addr = listener.local_addr().unwrap();
-        // Answer a single query over TCP, echoing the question with one A record.
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let len = stream.read_u16().await.unwrap() as usize;
-            let mut buf = vec![0u8; len];
-            stream.read_exact(&mut buf).await.unwrap();
-            let id = Packet::parse(&buf).unwrap().id();
-            let mut reply = Packet::new_reply(id);
-            reply.set_flags(PacketFlag::RECURSION_DESIRED | PacketFlag::RECURSION_AVAILABLE);
-            reply.questions.push(Question::new(
-                Name::new_unchecked("example.com"),
-                QTYPE::TYPE(TYPE::A),
-                QCLASS::CLASS(CLASS::IN),
-                false,
-            ));
-            reply.answers.push(ResourceRecord::new(
-                Name::new_unchecked("example.com"),
-                CLASS::IN,
-                300,
-                RData::A(A {
-                    address: u32::from(expected),
-                }),
-            ));
-            let bytes = reply.build_bytes_vec().unwrap();
-            stream
-                .write_all(&(bytes.len() as u16).to_be_bytes())
-                .await
-                .unwrap();
-            stream.write_all(&bytes).await.unwrap();
-            stream.flush().await.unwrap();
-        });
-
-        // Nothing listens on UDP at `addr`, so the UDP attempts time out and the
-        // resolver falls back to TCP.
+        let (addr, server) = tcp_only_nameserver(expected).await;
         let resolver = with_proto(addr, DnsProtocol::Udp);
         let addrs = resolver.lookup_ipv4("example.com").await.unwrap();
         assert_eq!(addrs, [expected]);
         server.await.unwrap();
+    }
+
+    /// A lookup the TCP query rescued is priced at what it cost.
+    ///
+    /// This nameserver leaves UDP unanswered, so it spends [`TCP_JOIN_DELAY`] on
+    /// every lookup. Ordering has to see that, or a server reachable only over
+    /// TCP outranks one answering datagrams in 40ms and gets dialled first
+    /// forever. Pacing must not see it. Both estimates come from this one
+    /// attempt, and this is the case that separates them.
+    #[tokio::test]
+    async fn tcp_rescued_lookup_is_priced_at_what_it_cost() {
+        let (addr, server) = tcp_only_nameserver(Ipv4Addr::new(93, 184, 216, 34)).await;
+        let resolver = with_proto(addr, DnsProtocol::Udp);
+        let rtt_map = &resolver.state().rtt_map;
+        let (untried_cost, untried_pacing) = (rtt_map.get_decayed(0), rtt_map.get_datagram(0));
+
+        let start = Instant::now();
+        resolver.lookup_ipv4("example.com").await.unwrap();
+        let elapsed = start.elapsed();
+        server.await.unwrap();
+
+        // A lower bound, so a loaded runner only makes it truer. It states the
+        // premise: without the join delay there is no cost to price.
+        assert!(
+            elapsed >= TCP_JOIN_DELAY,
+            "lookup took {elapsed:?}, so it never spent the {TCP_JOIN_DELAY:?} \
+             join delay this test is about"
+        );
+        assert!(
+            rtt_map.get_decayed(0) > untried_cost * 4.0,
+            "a TCP-rescued lookup should rank the server well below an untried one, \
+             got {} against a {untried_cost} baseline",
+            rtt_map.get_decayed(0)
+        );
+        assert_eq!(
+            rtt_map.get_datagram(0),
+            untried_pacing,
+            "no datagram came back, so there is nothing to pace off"
+        );
     }
 
     /// Serve-stale answers from an expired entry when no nameserver responds.
