@@ -229,6 +229,16 @@ pub enum FallbackMode {
     /// This is the default. The fallback stays a lower-priority second tier
     /// rather than joining the initial race, so a working primary nameserver
     /// always answers first.
+    ///
+    /// "Failed" covers every way a primary can fail to produce an answer, not
+    /// just silence: a timeout, a transport error, a SERVFAIL, REFUSED or
+    /// FORMERR response, and a permanent configuration fault such as a DoT
+    /// server name that does not match its certificate. So a name that a
+    /// policy-filtering corporate resolver refuses is asked of the fallback
+    /// tier instead, and a misconfigured encrypted primary sends all of its
+    /// lookups there. Callers who need every query to stay encrypted should
+    /// make the fallback tier encrypted too, since the public resolvers in
+    /// [`public_resolvers`] default to plaintext UDP.
     #[default]
     Deferred,
 }

@@ -21,7 +21,7 @@ use n0_future::{
     time::{self, Duration, Instant},
 };
 use simple_dns::TYPE;
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 #[cfg(test)]
 use crate::system_config::Hosts;
@@ -193,6 +193,79 @@ fn validate_name(name: &str) -> Result<(), Error> {
         }));
     }
     Ok(())
+}
+
+/// Returns whether `err` is a permanent configuration fault, not a transient one.
+///
+/// These fail identically on every lookup, so escalating past them means the
+/// resolver is answering from a tier the caller did not configure it to use.
+fn is_configuration_error(err: &Error) -> bool {
+    match err {
+        Error::MissingTlsConfig { .. } => true,
+        #[cfg(transport_tls)]
+        Error::Transport {
+            source: TransportError::InvalidServerName { .. },
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// Warns about DoT and DoH nameservers that cannot succeed as configured.
+///
+/// A permanent configuration error is indistinguishable from a timeout to
+/// [`DnsResolver::send_query`], which escalates to the fallback tier on any
+/// primary failure. So a missing TLS config or a server name that is not a
+/// valid DNS name does not surface as an error; it surfaces as every lookup
+/// quietly going out in plaintext to the fallback nameservers. The resolver is
+/// built infallibly and lazily, and an existing caller's build must not start
+/// failing, so this warns rather than returning an error.
+#[cfg(with_rustls)]
+fn warn_on_unusable_encrypted_nameservers(builder: &Builder, have_tls_config: bool) {
+    for ns in builder
+        .nameservers
+        .iter()
+        .chain(&builder.fallback_nameservers)
+    {
+        if let Some(fault) = encrypted_nameserver_fault(ns, have_tls_config) {
+            warn!(
+                addr = %ns.addr,
+                protocol = ?ns.protocol,
+                server_name = ?ns.server_name,
+                "{fault}: this nameserver cannot be queried, and its lookups will fall back \
+                 to the plaintext nameservers",
+            );
+        }
+    }
+}
+
+/// Returns why `ns` can never be queried as configured, if it cannot be.
+///
+/// Only DoT and DoH nameservers can fail this way; everything else, and every
+/// well-configured encrypted nameserver, returns `None`.
+#[cfg(with_rustls)]
+fn encrypted_nameserver_fault(ns: &Nameserver, have_tls_config: bool) -> Option<&'static str> {
+    let encrypted = match ns.protocol {
+        #[cfg(transport_tls)]
+        DnsProtocol::Tls => true,
+        #[cfg(transport_https)]
+        DnsProtocol::Https => true,
+        _ => false,
+    };
+    if !encrypted {
+        return None;
+    }
+    if !have_tls_config {
+        return Some("no TLS client config and no compiled-in crypto provider");
+    }
+    // rustls validates the certificate against this name, so a name it cannot
+    // parse fails every handshake rather than some of them.
+    if let Some(name) = ns.server_name.as_deref()
+        && rustls::pki_types::ServerName::try_from(name).is_err()
+    {
+        return Some("the TLS server name is not a valid DNS name");
+    }
+    None
 }
 
 /// Returns whether `name` is an IP address literal rather than a DNS name.
@@ -390,6 +463,12 @@ impl DnsResolver {
     /// equivalent to
     /// `DnsResolver::builder().use_system_config().default_fallback_nameservers().build()`.
     ///
+    /// The public resolvers are queried over plaintext UDP, and a system
+    /// nameserver counts as not answering whenever it fails to produce an
+    /// answer, including a SERVFAIL or REFUSED response. See
+    /// [`FallbackMode::Deferred`] for what that means for a name the system
+    /// resolver deliberately refuses.
+    ///
     /// Every other configuration goes through [`Self::builder`].
     pub fn system_with_fallback() -> Self {
         Self::builder()
@@ -428,6 +507,8 @@ impl DnsResolver {
             .as_ref()
             .map(|config| Arc::new(config.clone()))
             .or_else(Self::default_tls_config);
+        #[cfg(with_rustls)]
+        warn_on_unusable_encrypted_nameservers(&builder, tls_config.is_some());
         Self {
             #[cfg(with_rustls)]
             tls_config,
@@ -856,7 +937,19 @@ impl DnsResolver {
                 if state.primary_count == state.config.nameservers.len() {
                     return Err(primary_err);
                 }
-                debug!(err = %primary_err, "primary nameservers failed, escalating to fallback");
+                // A transient failure here is ordinary and stays at debug. A
+                // configuration error is not: it will fail identically on every
+                // lookup, so an encrypted-only setup is silently answering all
+                // of its queries from the plaintext tier. That deserves to be
+                // visible without turning on debug logging.
+                if is_configuration_error(&primary_err) {
+                    warn!(
+                        err = %primary_err,
+                        "primary nameservers are misconfigured, escalating to fallback",
+                    );
+                } else {
+                    debug!(err = %primary_err, "primary nameservers failed, escalating to fallback");
+                }
                 let fallback: Vec<usize> =
                     (state.primary_count..state.config.nameservers.len()).collect();
                 self.race(&fallback, query_bytes).await
@@ -1979,6 +2072,96 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::InvalidName { .. }), "{err:?}");
+        }
+    }
+
+    /// A configuration fault is told apart from a transient failure.
+    ///
+    /// Both escalate a lookup to the fallback tier, but a configuration fault
+    /// does so on every lookup, which means an encrypted-only primary is
+    /// silently answering all of its queries from a plaintext tier. Only that
+    /// case is worth a warning.
+    mod configuration_errors {
+        use n0_error::e;
+
+        #[cfg(transport_tls)]
+        use super::super::TransportError;
+        use super::super::is_configuration_error;
+        #[cfg(with_rustls)]
+        use super::{DnsProtocol, Nameserver};
+        use crate::Error;
+
+        /// Whichever encrypted transport this build has.
+        #[cfg(transport_tls)]
+        const ENCRYPTED_PROTOCOL: DnsProtocol = DnsProtocol::Tls;
+        #[cfg(all(transport_https, not(transport_tls)))]
+        const ENCRYPTED_PROTOCOL: DnsProtocol = DnsProtocol::Https;
+
+        #[test]
+        fn a_missing_tls_config_is_a_configuration_error() {
+            assert!(is_configuration_error(&e!(Error::MissingTlsConfig)));
+        }
+
+        #[cfg(transport_tls)]
+        #[test]
+        fn an_invalid_server_name_is_a_configuration_error() {
+            let err = e!(Error::Transport {
+                source: e!(TransportError::InvalidServerName {
+                    name: "not a name".to_string(),
+                }),
+            });
+            assert!(is_configuration_error(&err));
+        }
+
+        /// An encrypted nameserver with no TLS config can never be queried.
+        #[cfg(with_rustls)]
+        #[test]
+        fn an_encrypted_nameserver_without_a_tls_config_is_a_fault() {
+            use super::super::encrypted_nameserver_fault;
+
+            let ns = Nameserver::new("192.0.2.1:853".parse().unwrap(), ENCRYPTED_PROTOCOL);
+            assert!(encrypted_nameserver_fault(&ns, false).is_some());
+            assert!(encrypted_nameserver_fault(&ns, true).is_none());
+
+            // A plaintext nameserver needs no TLS config, so it is never a fault.
+            let plain = Nameserver::new("192.0.2.1:53".parse().unwrap(), DnsProtocol::Udp);
+            assert!(encrypted_nameserver_fault(&plain, false).is_none());
+        }
+
+        /// A server name rustls cannot parse fails every handshake.
+        #[cfg(with_rustls)]
+        #[test]
+        fn an_unparsable_server_name_is_a_fault() {
+            use super::super::encrypted_nameserver_fault;
+
+            let bad = Nameserver::with_server_name(
+                "192.0.2.1:853".parse().unwrap(),
+                ENCRYPTED_PROTOCOL,
+                "not a valid name",
+            );
+            assert!(encrypted_nameserver_fault(&bad, true).is_some());
+
+            let good = Nameserver::with_server_name(
+                "192.0.2.1:853".parse().unwrap(),
+                ENCRYPTED_PROTOCOL,
+                "dns.example",
+            );
+            assert!(encrypted_nameserver_fault(&good, true).is_none());
+        }
+
+        /// A server that is merely down or slow is not a configuration fault.
+        #[test]
+        fn transient_failures_are_not_configuration_errors() {
+            for err in [
+                e!(Error::Timeout),
+                e!(Error::NoResponse),
+                e!(Error::InvalidResponse),
+                e!(Error::ServerError {
+                    code: crate::ResponseCode::ServerFailure,
+                }),
+            ] {
+                assert!(!is_configuration_error(&err), "{err:?}");
+            }
         }
     }
 
