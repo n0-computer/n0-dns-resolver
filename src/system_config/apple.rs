@@ -11,23 +11,13 @@
 //!
 //! # Known limitations
 //!
-//! Supplemental (split-DNS) resolvers are not read. A split-DNS VPN publishes
-//! its resolver under `State:/Network/Service/<id>/DNS` with
-//! `SupplementalMatchDomains`, and configd merges those into the list that
-//! `scutil --dns` and libresolv use, but they never appear in the global key.
-//! So a VPN-only name is sent to the primary ISP or home resolver, reported
-//! NXDOMAIN, and after escalation leaked to the public fallbacks, while `ping`
-//! on the same machine resolves it.
+//! Supplemental (split-DNS) resolvers, published under
+//! `State:/Network/Service/<id>/DNS` with `SupplementalMatchDomains`, are not
+//! read, so a VPN-only name goes to the primary resolver and is reported
+//! NXDOMAIN. Honoring them needs per-name nameserver selection. hickory main
+//! reads only the global key too.
 //!
-//! Honoring them means routing a name under a match domain to that resolver set
-//! and no further, which needs a resolver that selects nameservers per name
-//! rather than racing one tier. hickory-resolver reads only the global key too
-//! (as of main, 2026-09-06), so this is not a regression against the resolver
-//! this replaced; it is a deliberate follow-up.
-//!
-//! Note that unlike hickory, a scoped address such as `fe80::1%en0` keeps its
-//! zone here rather than having it stripped: without it a link-local resolver
-//! cannot be reached at all.
+//! Unlike hickory, a scoped address such as `fe80::1%en0` keeps its zone here.
 
 use std::borrow::Cow;
 
@@ -58,11 +48,8 @@ pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
         .and_then(|value| value.downcast_into::<CFDictionary>())
         .ok_or_else(|| std::io::Error::other("no DNS dictionary in SystemConfiguration"))?;
 
-    // `ServerAddresses` carries a link-local resolver in scoped form,
-    // `fe80::1%en0`, which `IpAddr::from_str` rejects outright: such an entry
-    // used to be dropped with a warning, and on an IPv6-only network it may be
-    // the only resolver there is. The zone is what selects the interface, so
-    // keep it (see `super::parse_nameserver_addr`).
+    // A link-local resolver arrives scoped, `fe80::1%en0`, which
+    // `IpAddr::from_str` rejects outright. See `super::parse_nameserver_addr`.
     let nameservers = read_string_array(&dns_cfg, "ServerAddresses")
         .into_iter()
         .filter_map(|s| {

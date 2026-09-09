@@ -7,11 +7,10 @@
 //! ndk-glue or android-activity (both do this before `main`) or by an explicit
 //! [`install_android_jni_context`] call.
 //!
-//! `getDnsServers()` returns the link's plaintext DHCP or RA servers even when
-//! Private DNS is in strict mode, where Android's own resolver refuses
-//! cleartext. `getPrivateDnsServerName()` is read alongside it so that those
-//! addresses are queried over DNS-over-TLS under the configured name instead,
-//! which is what the user or an MDM policy asked for.
+//! `getDnsServers()` returns plaintext servers even when Private DNS is in
+//! strict mode, where Android's own resolver refuses cleartext, so
+//! `getPrivateDnsServerName()` is read alongside it and those addresses are
+//! queried over DoT under that name instead.
 //!
 //! Without an initialized [`ndk_context`] the JNI lookup panics. Debug builds
 //! wrap the call in `std::panic::catch_unwind` so unit tests on Android (where
@@ -126,20 +125,13 @@ fn read_system_dns_jni() -> Result<Config, std::io::Error> {
                     16 => {
                         let mut arr = [0u8; 16];
                         arr.copy_from_slice(&ip_bytes);
-                        // `getAddress` returns the 16 raw bytes and drops the
-                        // zone. Android delivers an RDNSS link-local resolver as
-                        // a scoped address, and does not do DHCPv6, so on an
-                        // RA-only network that entry is the whole DNS
-                        // configuration; unscoped it is ambiguous and cannot be
-                        // reached. `Inet6Address.getScopeId` is the zone.
-                        //
+                        // `getAddress` drops the zone, without which a
+                        // link-local resolver is unreachable.
                         // https://developer.android.com/reference/java/net/Inet6Address#getScopeId()
                         let scope_id = env
                             .call_method(&server, jni_str!("getScopeId"), jni_sig!("()I"), &[])
                             .and_then(|value| value.i())
                             .unwrap_or_else(|err| {
-                                // Not an Inet6Address, which is the only way
-                                // this call fails on a 16-byte address.
                                 warn!(%err, "could not read the IPv6 scope id, using none");
                                 0
                             });
@@ -158,12 +150,8 @@ fn read_system_dns_jni() -> Result<Config, std::io::Error> {
                 nameservers.push(Nameserver::new(addr, DnsProtocol::Udp));
             }
 
-            // Private DNS in strict mode: the plaintext list above is the
-            // link's DHCP or RA servers, which Android's own resolver refuses
-            // to use in that mode. Re-point them at the configured DoT
-            // endpoint instead, or the user's explicit choice of a resolver
-            // that a hostile Wi-Fi can neither observe nor forge is undone.
-            //
+            // In strict mode the list above is plaintext DHCP or RA servers,
+            // which Android's own resolver refuses to use.
             // https://developer.android.com/reference/android/net/LinkProperties#getPrivateDnsServerName()
             let private_dns_name = env
                 .call_method(
@@ -180,10 +168,8 @@ fn read_system_dns_jni() -> Result<Config, std::io::Error> {
                 trace!(%name, "Private DNS is in strict mode");
                 #[cfg(transport_tls)]
                 {
-                    // The DoT endpoint is addressed by name, and the addresses
-                    // to reach it at are the ones the link already gave us: the
-                    // OS resolved that name over DoT itself, so this does not
-                    // leak a bootstrap lookup.
+                    // The link's addresses reach the endpoint; the OS already
+                    // resolved the name over DoT, so no bootstrap leaks.
                     nameservers = nameservers
                         .into_iter()
                         .map(|ns| {

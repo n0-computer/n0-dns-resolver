@@ -76,13 +76,10 @@ pub enum Record {
 impl Record {
     /// Returns roughly how much memory this record holds, in bytes.
     ///
-    /// Counts the enum slot plus the heap behind it, as an upper bound: the
-    /// cache spends this against a byte budget, so overestimating costs a
-    /// little cache room while underestimating would let the bound be evaded.
-    /// Nothing here is exact, and none of it needs to be.
+    /// The enum slot plus its heap, as an upper bound: the cache spends this
+    /// against a byte budget, and undercounting would let the bound be evaded.
     pub(crate) fn approx_bytes(&self) -> usize {
         let heap = match self {
-            // The addresses live in the enum slot.
             Record::A(_) | Record::Aaaa(_) => 0,
             Record::Txt(txt) => txt.approx_heap_bytes(),
             Record::Ns(name) => name.len(),
@@ -164,11 +161,9 @@ impl SvcbRecordData {
 
     /// Returns roughly how much heap this record holds, in bytes.
     ///
-    /// Walks the parameters, since a single SVCB record can carry kilobytes of
-    /// `ech` or unknown-key bytes. An `alpn` identifier is charged at the
-    /// largest a character string can be, because `simple_dns` does not expose
-    /// its length; that overestimates a short identifier, which is the safe
-    /// direction for a memory bound.
+    /// Walks the parameters, since one record can carry kilobytes of `ech` or
+    /// unknown-key bytes. `alpn` is charged at the maximum character-string
+    /// length, since `simple_dns` does not expose the real one.
     fn approx_heap_bytes(&self) -> usize {
         /// The most a `CharacterString` can hold (RFC 1035).
         const MAX_CHARACTER_STRING: usize = 255;
@@ -184,7 +179,6 @@ impl SvcbRecordData {
                 SVCParam::Ipv6Hint(ips) => ips.len() * size_of::<u128>(),
                 SVCParam::Ech(bytes) => bytes.len(),
                 SVCParam::Unknown(_, bytes) => bytes.len(),
-                // The rest are a discriminant and at most a u16.
                 _ => 0,
             })
             .map(|bytes| bytes + size_of::<SVCParam<'static>>())
@@ -478,10 +472,8 @@ impl TxtRecordData {
 
     /// Returns roughly how much heap this record's strings hold, in bytes.
     ///
-    /// Every character string is boxed separately, so the per-box overhead
-    /// dominates for a TXT record made of many short strings and has to be
-    /// counted: a record of 65,000 empty strings costs over a megabyte from
-    /// 65 KB on the wire.
+    /// Each string is boxed separately, so the per-box overhead dominates for
+    /// many short strings and has to be counted.
     fn approx_heap_bytes(&self) -> usize {
         let strings: usize = self.0.iter().map(|string| string.len()).sum();
         self.0.len() * size_of::<Box<[u8]>>() + strings

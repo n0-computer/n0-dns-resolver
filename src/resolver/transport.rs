@@ -62,8 +62,7 @@ pub enum TransportError {
     ResponseTooLarge {},
     /// A DNS-over-HTTPS server answered with a status other than 2xx.
     ///
-    /// Redirects are not followed, so a 3xx arrives here rather than being
-    /// replayed against the redirect target.
+    /// Redirects are not followed, so a 3xx arrives here.
     #[cfg(transport_https)]
     #[error("DNS-over-HTTPS server returned HTTP status {status}")]
     UnexpectedStatus {
@@ -232,14 +231,10 @@ pub(super) async fn tls_query(
 
 /// Returns the caller's TLS config with its ALPN list replaced by `http/1.1`.
 ///
-/// reqwest is built here with `rustls-no-provider` and no `http2` feature, so
-/// hyper-util is compiled without HTTP/2 and panics with "http2 feature is not
-/// enabled" if a connection ever negotiates `h2`. reqwest normalizes ALPN
-/// itself when it builds the TLS config, but a config handed to
-/// `use_preconfigured_tls` is passed through untouched, so an application's own
-/// `ClientConfig` -- which will list `h2`, and every public DoH provider
-/// negotiates it when offered -- would turn each DoH lookup into a panic inside
-/// the caller's task. Advertise only what this build can actually speak.
+/// reqwest is built without `http2`, so hyper-util panics with "http2 feature
+/// is not enabled" on a connection that negotiates `h2`. `use_preconfigured_tls`
+/// passes a config through untouched, so a caller config listing `h2` -- as an
+/// application's own will -- would panic every DoH lookup.
 #[cfg(transport_https)]
 fn https_tls_config(tls_config: &rustls::ClientConfig) -> rustls::ClientConfig {
     let mut tls_config = tls_config.clone();
@@ -252,16 +247,10 @@ fn https_tls_config(tls_config: &rustls::ClientConfig) -> rustls::ClientConfig {
 /// `resolves` pins each named DoH host to a fixed address, so a hostname-based
 /// DoH URL connects to that IP instead of being resolved recursively.
 ///
-/// The redirect, scheme and proxy defaults are all overridden. reqwest follows
-/// up to ten redirects by default, allows an `https` to `http` downgrade, and
-/// reads the environment proxy variables; a DoH query is a POST, so a 307 or
-/// 308 replays its body. Left at those defaults, a DoH server could have the
-/// query re-posted in cleartext to a host of its choosing: the redirect target
-/// is not in the pin map, so it would be resolved through the very system
-/// resolver this crate exists to replace, and `error_for_status` would not
-/// catch it because only the final 2xx is checked. That silently defeats the
-/// two properties DoH is configured for, confidentiality on the wire and not
-/// touching the system resolver, so none of the three is wanted here.
+/// The redirect, scheme and proxy defaults are all overridden. A DoH query is a
+/// POST, so a 307 replays its body; left at reqwest's defaults the server could
+/// have it re-posted in cleartext to an unpinned host, resolved through the very
+/// system resolver DoH exists to avoid.
 #[cfg(transport_https)]
 pub(super) fn build_https_client(
     tls_config: &Arc<rustls::ClientConfig>,
@@ -336,9 +325,8 @@ pub(super) async fn https_query(
         .send()
         .await?;
 
-    // Only a 2xx carries an answer. `error_for_status` rejects 4xx and 5xx but
-    // passes a 3xx through, and with redirects disabled a 3xx reaches us as an
-    // ordinary response whose body would otherwise be read as the DNS answer.
+    // `error_for_status` passes a 3xx through, and with redirects off its body
+    // would be read as the answer.
     let status = response.status();
     if !status.is_success() {
         return Err(e!(TransportError::UnexpectedStatus {
@@ -648,18 +636,11 @@ mod tests {
     }
 
     /// A caller TLS config advertising `h2` does not reach the DoH client.
-    ///
-    /// reqwest here is built without HTTP/2, so hyper-util panics with "http2
-    /// feature is not enabled" on a connection that negotiates `h2`. A config
-    /// handed to `use_preconfigured_tls` is passed through untouched, so an
-    /// application's own `ClientConfig` -- which lists `h2` -- used to turn
-    /// every DoH lookup into a panic in the caller's task.
     #[cfg(transport_https)]
     #[test]
     fn https_tls_config_advertises_only_http1() {
         let mut caller_config =
             (*crate::DnsResolver::default_tls_config().expect("crypto provider")).clone();
-        // The shape of any application-owned, HTTP/2-capable config.
         caller_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
 
         let config = https_tls_config(&caller_config);
@@ -673,14 +654,7 @@ mod tests {
 
     /// The DoH client refuses cleartext, so a query cannot leave over plain HTTP.
     ///
-    /// A DoH server that answers 307 or 308 has the POST body, which is the DNS
-    /// query, replayed against the redirect target. With reqwest's defaults
-    /// that target could be an `http` URL and the query would go out in the
-    /// clear. Redirects are off, and this pins the second half of that: the
-    /// client will not speak `http` even when handed such a URL directly.
-    ///
-    /// The listener is never expected to accept a connection; if it does, the
-    /// request reached the wire in cleartext.
+    /// The listener accepting at all means the query reached the wire.
     #[cfg(transport_https)]
     #[tokio::test]
     async fn https_client_refuses_a_cleartext_url() {

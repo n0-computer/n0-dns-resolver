@@ -144,11 +144,9 @@ impl Builder {
     /// config, DoT/DoH use one built from the crypto provider (`tls-ring` or
     /// `tls-aws-lc-rs`); with neither a config nor a provider, they error.
     ///
-    /// The config is used as given except for `alpn_protocols`, which
-    /// DNS-over-HTTPS replaces with `http/1.1`: this crate builds its HTTP
-    /// client without HTTP/2, so a config that advertises `h2` (as an
-    /// application's shared config generally does) would negotiate a protocol
-    /// the client cannot speak. DNS-over-TLS uses the ALPN list as given.
+    /// Used as given except for `alpn_protocols`, which DNS-over-HTTPS replaces
+    /// with `http/1.1`, since its HTTP client is built without HTTP/2 and could
+    /// not speak an `h2` it negotiated. DNS-over-TLS uses the list as given.
     #[cfg(with_rustls)]
     #[must_use]
     pub fn tls_client_config(mut self, config: rustls::ClientConfig) -> Self {
@@ -164,9 +162,8 @@ impl Builder {
     /// 8767. Only positive answers are served stale; an authoritative NXDOMAIN
     /// is never overridden. Off by default.
     ///
-    /// `max_age` is measured from the answer's expiry, not from when it was
-    /// stored, and is not clamped: [`Duration::MAX`] means an expired answer
-    /// stays servable for as long as it stays in the cache.
+    /// `max_age` runs from the answer's expiry, not from when it was stored,
+    /// and is not clamped: [`Duration::MAX`] means for as long as it is cached.
     #[must_use]
     pub fn serve_stale(mut self, max_age: Duration) -> Self {
         self.serve_stale = Some(max_age);
@@ -230,15 +227,12 @@ pub enum FallbackMode {
     /// rather than joining the initial race, so a working primary nameserver
     /// always answers first.
     ///
-    /// "Failed" covers every way a primary can fail to produce an answer, not
-    /// just silence: a timeout, a transport error, a SERVFAIL, REFUSED or
-    /// FORMERR response, and a permanent configuration fault such as a DoT
-    /// server name that does not match its certificate. So a name that a
-    /// policy-filtering corporate resolver refuses is asked of the fallback
-    /// tier instead, and a misconfigured encrypted primary sends all of its
-    /// lookups there. Callers who need every query to stay encrypted should
-    /// make the fallback tier encrypted too, since the public resolvers in
-    /// [`public_resolvers`] default to plaintext UDP.
+    /// "Failed" is any way of not producing an answer: a timeout, a transport
+    /// error, a SERVFAIL, REFUSED or FORMERR, or a configuration fault such as a
+    /// DoT server name that does not match its certificate. So a name a
+    /// corporate resolver refuses by policy is asked of the fallback tier
+    /// instead. Callers needing every query encrypted should make that tier
+    /// encrypted too; [`public_resolvers`] defaults to plaintext UDP.
     #[default]
     Deferred,
 }

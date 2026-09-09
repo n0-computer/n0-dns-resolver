@@ -45,11 +45,6 @@ fn parse_resolv_conf(content: &str) -> Config {
         match parts.next() {
             Some("nameserver") => {
                 if let Some(addr_str) = parts.next() {
-                    // Handles a plain address, one with a port, and a scoped
-                    // IPv6 address such as `fe80::1%eth0`, whose zone is kept:
-                    // it is what selects the interface the resolver is on, and
-                    // on an IPv6-only network that entry may be the whole DNS
-                    // configuration.
                     match super::parse_nameserver_addr(addr_str, DnsProtocol::Udp.port()) {
                         Some(addr) => servers.push(Nameserver::new(addr, DnsProtocol::Udp)),
                         None => warn!(nameserver = %addr_str, "ignoring unparsable nameserver"),
@@ -194,11 +189,6 @@ mod tests {
     }
 
     /// A numeric zone is kept in the address, not stripped from it.
-    ///
-    /// `sin6_scope_id` is what selects the interface a link-local nameserver is
-    /// reachable on. Without it `fe80::1` is ambiguous and every query to it
-    /// fails, which on an IPv6-only network whose router advertises only an
-    /// RDNSS resolver means every lookup falls through to the public tier.
     #[test]
     fn parse_scoped_ipv6_keeps_a_numeric_zone() {
         let config = parse_resolv_conf("nameserver fe80::1%2\nnameserver 8.8.8.8\n");
@@ -215,8 +205,6 @@ mod tests {
         assert_eq!(config.nameservers[1].addr.ip(), ipv4(8, 8, 8, 8));
     }
 
-    /// A named zone resolves through `if_nametoindex`.
-    ///
     /// `lo` is the one interface name that can be relied on to exist.
     #[test]
     fn parse_scoped_ipv6_resolves_an_interface_name() {
@@ -228,10 +216,7 @@ mod tests {
         assert_ne!(addr.scope_id(), 0, "the interface name did not resolve");
     }
 
-    /// A zone naming no interface on this host is dropped, not silently unscoped.
-    ///
-    /// An unscoped link-local address cannot be reached, so keeping it would
-    /// only spend a timeout on every lookup.
+    /// Dropped, not silently unscoped: unscoped it would only spend a timeout.
     #[test]
     fn parse_scoped_ipv6_drops_an_unknown_interface() {
         let config = parse_resolv_conf("nameserver fe80::1%nosuchif0\nnameserver 8.8.8.8\n");
@@ -239,7 +224,6 @@ mod tests {
         assert_eq!(ips(&config), [ipv4(8, 8, 8, 8)]);
     }
 
-    /// A scoped address with a port keeps both.
     #[test]
     fn parse_scoped_ipv6_with_a_port() {
         let config = parse_resolv_conf("nameserver [fe80::1%2]:5353\n");

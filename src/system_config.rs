@@ -12,44 +12,36 @@ use super::{DnsProtocol, Nameserver, config::Config};
 
 /// Parses a nameserver address that may carry an IPv6 zone id.
 ///
-/// Accepts the forms the platform readers see: a bare address (`8.8.8.8`,
-/// `fe80::1`), one with a port (`8.8.8.8:5353`, `[::1]:5353`), and either of
-/// those with a zone (`fe80::1%eth0`, `fe80::1%2`, `[fe80::1%eth0]:5353`).
-/// `default_port` is used when no port is given.
+/// Accepts `8.8.8.8`, `fe80::1`, `8.8.8.8:5353`, `[::1]:5353`, `fe80::1%eth0`,
+/// `fe80::1%2` and `[fe80::1%eth0]:5353`. `default_port` applies when unset.
 ///
-/// The zone is the point of this. A router that advertises a link-local
-/// resolver over RDNSS is the whole DNS configuration on an IPv6-only network,
-/// and `fe80::1` is ambiguous without knowing which interface it is on:
-/// `sin6_scope_id` in the destination address is exactly what selects that, so
-/// dropping it leaves an address that can never be reached. std parses only the
-/// bracketed numeric form, hence the hand-rolled split here.
+/// The zone is the point: `sin6_scope_id` is what selects the interface a
+/// link-local resolver is on, so dropping it leaves an unreachable address. std
+/// parses only the bracketed numeric form, hence the hand-rolled split.
 ///
-/// Returns `None` when the address does not parse, or when a named zone does
-/// not correspond to an interface on this host.
-///
-/// Only the readers that see addresses as text need this. Windows takes the
-/// zone from the adapter an address came from, and Android from `getScopeId`.
+/// Returns `None` when the address does not parse or names no local interface.
+/// Windows takes the zone from the adapter instead, and Android from
+/// `getScopeId`.
 #[cfg(all(unix, not(target_os = "android")))]
 pub(crate) fn parse_nameserver_addr(text: &str, default_port: u16) -> Option<std::net::SocketAddr> {
     use std::net::{IpAddr, SocketAddr, SocketAddrV6};
 
-    // `[addr]:port`, which std handles itself for a numeric zone.
+    // std handles `[addr]:port`, including a numeric zone.
     if let Ok(addr) = text.parse::<SocketAddr>() {
         return Some(addr);
     }
-    // `[addr%zone]:port` with a named zone: unwrap the brackets and recurse on
-    // the address, then apply the port that was outside them.
+    // `[addr%zone]:port` with a named zone.
     if let Some(rest) = text.strip_prefix('[')
         && let Some((inner, port)) = rest.rsplit_once("]:")
     {
         let port = port.parse().ok()?;
         return parse_nameserver_addr(inner, port);
     }
-    // `addr:port` for IPv4, or a bare address, both without a zone.
+    // A bare address, or IPv4 with a port.
     if let Ok(ip) = text.parse::<IpAddr>() {
         return Some(SocketAddr::new(ip, default_port));
     }
-    // What is left is a bare scoped address, `addr%zone`.
+    // `addr%zone`.
     let (ip, zone) = text.split_once('%')?;
     let ip = ip.parse().ok()?;
     let scope_id = parse_zone_id(zone)?;
@@ -61,10 +53,7 @@ pub(crate) fn parse_nameserver_addr(text: &str, default_port: u16) -> Option<std
     )))
 }
 
-/// Resolves an IPv6 zone to its numeric scope id.
-///
-/// A zone is written either as the index itself or as an interface name, which
-/// is what `/etc/resolv.conf` and the Apple dynamic store both carry.
+/// Resolves an IPv6 zone, written as an index or an interface name, to its id.
 #[cfg(all(unix, not(target_os = "android")))]
 fn parse_zone_id(zone: &str) -> Option<u32> {
     if let Ok(index) = zone.parse::<u32>() {
@@ -77,10 +66,8 @@ fn parse_zone_id(zone: &str) -> Option<u32> {
 #[cfg(all(unix, not(target_os = "android")))]
 fn if_nametoindex(name: &str) -> Option<u32> {
     let name = std::ffi::CString::new(name).ok()?;
-    // SAFETY: `if_nametoindex` reads the NUL-terminated string it is given and
-    // writes nothing. `CString` guarantees the NUL, and the pointer is valid
-    // for the length of this call because `name` outlives it. The call returns
-    // 0 for an unknown interface, which is never a valid index.
+    // SAFETY: reads the NUL-terminated string and writes nothing. `CString`
+    // guarantees the NUL and outlives the call. Returns 0 if unknown.
     let index = unsafe { libc::if_nametoindex(name.as_ptr()) };
     (index != 0).then_some(index)
 }

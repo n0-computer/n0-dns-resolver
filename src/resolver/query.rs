@@ -229,8 +229,7 @@ pub(super) fn strip_edns(query: &[u8]) -> Option<Vec<u8>> {
 /// than `min(SOA MINIMUM, SOA record TTL)`. Returns `None` when no SOA is
 /// present, so the caller can fall back to a fixed default.
 ///
-/// Takes the parsed packet rather than the bytes: a response is walked by
-/// several steps in a row, and re-parsing for each multiplies the cost of a
+/// Takes the parsed packet: re-parsing for each step multiplies the cost of a
 /// hostile one (see [`parse_packet`]).
 pub(super) fn negative_ttl(packet: &Packet<'_>) -> Option<u32> {
     packet.name_servers.iter().find_map(|rr| match &rr.rdata {
@@ -528,15 +527,11 @@ mod tests {
         build_query(host, TYPE::A).unwrap()
     }
 
-    /// Parses `data` and extracts the records of `kind`.
-    ///
-    /// The resolver parses a response once and passes the packet through each
-    /// step; these tests start from bytes, so they parse here.
+    /// The resolver parses once and passes the packet on; these start from bytes.
     fn parse_records_from(data: &[u8], kind: RecordKind) -> Result<(Vec<Record>, u32), QueryError> {
         parse_records(&parse_packet(data)?, kind)
     }
 
-    /// Parses `data` and derives its negative-caching TTL.
     fn negative_ttl_from(data: &[u8]) -> Option<u32> {
         negative_ttl(&parse_packet(data).ok()?)
     }
@@ -1622,20 +1617,15 @@ mod tests {
     }
     /// Builds a response carrying a compression-pointer ladder.
     ///
-    /// The ladder is a chain of pointer-to-pointer cells inside an opaque
-    /// (unknown-type) record, whose rdata `simple_dns` keeps as raw bytes and
-    /// does not walk. Every following record's owner name points at the top of
-    /// the ladder, so parsing that one name walks every hop down to the single
-    /// real label at the bottom.
+    /// The ladder is `hops` pointer-to-pointer cells inside an opaque record,
+    /// whose rdata `simple_dns` keeps as raw bytes. Every later record's owner
+    /// name points at its top, so parsing one name walks every hop down to the
+    /// real label at the bottom. `size` is how large the response grows.
     ///
-    /// `hops` sets how many cells the ladder has, and `size` how large the
-    /// whole response grows.
-    ///
-    /// A ladder is legal on the wire: `simple_dns` 0.12 bounds a name by its
-    /// 255-byte length, which counts real labels and not hops, and by requiring
-    /// each pointer to point backwards, which rules out a loop but not a
-    /// ladder. A fixed version caps the hops, and then a deep ladder is
-    /// rejected instead; both outcomes are fine here, and neither is a hang.
+    /// This is legal against `simple_dns` 0.12, which bounds a name by its
+    /// 255-byte length (real labels, not hops) and requires pointers to point
+    /// backwards, ruling out a loop but not a ladder. A version that caps hops
+    /// rejects a deep one instead; neither outcome is a hang.
     fn pointer_ladder_response(hops: usize, size: usize) -> (Vec<u8>, u16) {
         let mut buf = vec![0u8; DNS_HEADER_LEN];
         buf[2] = 0x80; // QR
@@ -1675,12 +1665,8 @@ mod tests {
 
     /// A chain of compression pointers resolves to the name at its foot.
     ///
-    /// Pointer-to-pointer is unusual but legal, and the cost of walking a long
-    /// chain of them is why a response is parsed once and the packet passed on
-    /// rather than the bytes being re-parsed by each step. The chain here is
-    /// short enough to stay under the hop cap a fixed `simple_dns` applies, so
-    /// this pins the correctness half regardless of the version in the lock
-    /// file.
+    /// Short enough to stay under the hop cap a fixed `simple_dns` applies, so
+    /// it holds whichever version is in the lock file.
     #[test]
     fn a_pointer_chain_resolves_to_its_foot() {
         let (buf, count) = pointer_ladder_response(8, 4096);
@@ -1688,7 +1674,6 @@ mod tests {
         let packet = parse_packet(&buf).expect("a short chain is legal on the wire");
 
         assert_eq!(packet.answers.len(), count as usize);
-        // Every pointer resolves to the one real label at the foot of the ladder.
         for rr in packet.answers.iter().skip(1) {
             assert_eq!(rr.name.to_string(), "a");
         }
@@ -1696,15 +1681,12 @@ mod tests {
 
     /// Reports what one parse of a 64 KB pointer ladder costs.
     ///
-    /// Ignored: it is a measurement, not an assertion, and the figure is
-    /// machine-dependent. Run with `--ignored --nocapture`.
+    /// Ignored: a machine-dependent measurement. Run with `--ignored --nocapture`.
     ///
-    /// Against `simple_dns` 0.12, which puts no bound on how many pointer hops
-    /// one name may take, this is about 55ms on the machine it was written on,
+    /// Against `simple_dns` 0.12, which does not bound pointer hops, ~55ms here
     /// against well under a millisecond for a legitimate response of the same
     /// record count; the resolver used to pay it three times per lookup. A
-    /// version that caps the hops, as hickory, unbound and BIND do, rejects the
-    /// packet in microseconds instead, which is the outcome to hope for.
+    /// version that caps hops rejects the packet in microseconds instead.
     #[test]
     #[ignore = "a measurement, not an assertion"]
     fn bench_pointer_ladder_parse() {

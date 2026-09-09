@@ -2,24 +2,12 @@
 //!
 //! # Known limitations
 //!
-//! Every adapter that is up contributes its DNS servers to one flat tier, and
-//! the search list comes from the global registry `SearchList` key alone.
-//!
-//! Two consequences, both of which need a resolver that can pick nameservers
-//! per name rather than racing one tier:
-//!
-//! - With a LAN resolver and a corporate VPN resolver in the same tier, the LAN
-//!   resolver's fast NXDOMAIN can win the race for a VPN-only name, so the name
-//!   is reported as nonexistent and was sent to the LAN resolver in plaintext.
-//!   Windows prefers the VPN adapter by interface metric, which `ipconfig`
-//!   exposes as `ipv4_metric`/`ipv6_metric` but we do not read.
-//! - Connection-specific DNS suffixes (DHCP option 15) are not applied, because
-//!   `ipconfig` 0.3 does not expose an adapter's `DnsSuffix` at all; reading it
-//!   would mean calling `GetAdaptersAddresses` ourselves.
-//!
-//! hickory-resolver has both limitations too (as of main, 2026-09-06), so this
-//! is not a regression against the resolver this replaced. Split-DNS support is
-//! a deliberate follow-up rather than an oversight.
+//! No split-DNS: every adapter that is up contributes to one flat tier, so a
+//! LAN resolver's fast NXDOMAIN can win the race for a VPN-only name. The
+//! interface metric Windows prefers by is in `ipconfig` but unread, and
+//! connection-specific suffixes (DHCP option 15) are unreachable, since
+//! `ipconfig` 0.3 exposes no `DnsSuffix`. Both need per-name nameserver
+//! selection. hickory main has the same limitations.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
@@ -56,11 +44,8 @@ pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
             if WINDOWS_BAD_SITE_LOCAL_DNS_SERVERS.contains(&ip) {
                 continue;
             }
-            // A link-local resolver is only reachable on the interface it was
-            // advertised on, and `dns_servers()` hands back a bare address with
-            // no zone. The adapter it came from is the zone, so take the index
-            // from there; without it the address is ambiguous and every query
-            // to it fails, falling the lookup through to the public tier.
+            // `dns_servers()` drops the zone, so take it from the adapter; a
+            // link-local resolver is unreachable without it.
             let addr =
                 match ip {
                     IpAddr::V6(ip) if ip.is_unicast_link_local() => SocketAddr::V6(

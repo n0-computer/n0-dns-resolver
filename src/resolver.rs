@@ -172,19 +172,9 @@ const DEFAULT_NDOTS: usize = 1;
 
 /// Rejects a name whose text form does not map one-to-one onto a wire name.
 ///
-/// `simple_dns::Name` silently drops empty labels, so `localhost..`,
-/// `.example.com` and `""` all build wire names that differ from the string
-/// they came from. Every policy check we run before the query -- the RFC 6761
-/// `localhost` rule, the hosts-file override, the cache key -- reads the
-/// string, so a name that survives to the wire in a different shape sidesteps
-/// all of them: `localhost..` is checked as an empty last label and queried as
-/// `localhost.`, and `relay..example` misses a hosts pin for `relay.example`
-/// and is queried as it. Rejecting the mismatch here, ahead of any of those
-/// checks, keeps the caller's string, the hosts key, the cache key and the wire
-/// name in one-to-one correspondence. glibc and hickory reject the same shapes.
-///
-/// One trailing dot is the FQDN marker and is allowed; a second one is an empty
-/// label like any other.
+/// `simple_dns::Name` drops empty labels, so `localhost..` would reach the wire
+/// as `localhost.` while the localhost rule, hosts override and cache key all
+/// read the string. One trailing dot is the FQDN marker and is kept.
 fn validate_name(name: &str) -> Result<(), Error> {
     let stripped = name.strip_suffix('.').unwrap_or(name);
     if stripped.is_empty() || stripped.split('.').any(str::is_empty) {
@@ -195,10 +185,7 @@ fn validate_name(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
-/// Returns whether `err` is a permanent configuration fault, not a transient one.
-///
-/// These fail identically on every lookup, so escalating past them means the
-/// resolver is answering from a tier the caller did not configure it to use.
+/// Returns whether `err` will repeat on every lookup rather than being transient.
 fn is_configuration_error(err: &Error) -> bool {
     match err {
         Error::MissingTlsConfig { .. } => true,
@@ -213,13 +200,9 @@ fn is_configuration_error(err: &Error) -> bool {
 
 /// Warns about DoT and DoH nameservers that cannot succeed as configured.
 ///
-/// A permanent configuration error is indistinguishable from a timeout to
-/// [`DnsResolver::send_query`], which escalates to the fallback tier on any
-/// primary failure. So a missing TLS config or a server name that is not a
-/// valid DNS name does not surface as an error; it surfaces as every lookup
-/// quietly going out in plaintext to the fallback nameservers. The resolver is
-/// built infallibly and lazily, and an existing caller's build must not start
-/// failing, so this warns rather than returning an error.
+/// Such a failure is indistinguishable from a timeout to [`DnsResolver::send_query`],
+/// so it surfaces only as every lookup escalating to the plaintext fallback tier.
+/// Warns rather than errors, since `build` is infallible.
 #[cfg(with_rustls)]
 fn warn_on_unusable_encrypted_nameservers(builder: &Builder, have_tls_config: bool) {
     for ns in builder
@@ -239,10 +222,7 @@ fn warn_on_unusable_encrypted_nameservers(builder: &Builder, have_tls_config: bo
     }
 }
 
-/// Returns why `ns` can never be queried as configured, if it cannot be.
-///
-/// Only DoT and DoH nameservers can fail this way; everything else, and every
-/// well-configured encrypted nameserver, returns `None`.
+/// Returns why `ns` can never be queried as configured. Only DoT and DoH can.
 #[cfg(with_rustls)]
 fn encrypted_nameserver_fault(ns: &Nameserver, have_tls_config: bool) -> Option<&'static str> {
     let encrypted = match ns.protocol {
@@ -258,8 +238,6 @@ fn encrypted_nameserver_fault(ns: &Nameserver, have_tls_config: bool) -> Option<
     if !have_tls_config {
         return Some("no TLS client config and no compiled-in crypto provider");
     }
-    // rustls validates the certificate against this name, so a name it cannot
-    // parse fails every handshake rather than some of them.
     if let Some(name) = ns.server_name.as_deref()
         && rustls::pki_types::ServerName::try_from(name).is_err()
     {
@@ -275,18 +253,9 @@ fn is_ip_literal(name: &str) -> bool {
 
 /// Returns the answer for `name` when it is an IP address literal.
 ///
-/// An address is already the answer to an address lookup, so sending it to a
-/// nameserver is both pointless and unsafe: an all-numeric label is a valid DNS
-/// name, so `192.0.2.1` is queried, answered NXDOMAIN, and then retried as
-/// `192.0.2.1.<search>`. A search-domain operator, or a hostile network that
-/// supplied the search list over DHCP, can answer that from a wildcard zone and
-/// so redirect any caller that passes a literal through -- including
-/// `127.0.0.1`. `getaddrinfo`, hickory and Go all return a literal without
-/// touching the network.
-///
-/// The literal answers only its own family; the other family has no records,
-/// which is the same empty result a name with no `AAAA` would give. Returns
-/// `None` when `name` is not a literal, and the lookup proceeds as a name.
+/// All-numeric labels are valid DNS names, so `192.0.2.1` would otherwise be
+/// queried and search-expanded, which a wildcard search zone can answer. The
+/// literal answers only its own family; `None` means it is not a literal.
 fn ip_literal_records(name: &str, kind: RecordKind) -> Option<Vec<Record>> {
     let ip: IpAddr = name.parse().ok()?;
     Some(match (ip, kind) {
@@ -302,8 +271,7 @@ fn ip_literal_records(name: &str, kind: RecordKind) -> Option<Vec<Record>> {
 /// DNS names are case-insensitive, so `foo.LOCALHOST` is one of them too, and
 /// must not go out to a nameserver that could answer it with any address.
 ///
-/// Assumes `host` passed [`validate_name`], so the last label is only empty for
-/// the one permitted trailing dot.
+/// Assumes `host` passed [`validate_name`].
 fn is_localhost(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
     host.rsplit('.')
@@ -463,11 +431,8 @@ impl DnsResolver {
     /// equivalent to
     /// `DnsResolver::builder().use_system_config().default_fallback_nameservers().build()`.
     ///
-    /// The public resolvers are queried over plaintext UDP, and a system
-    /// nameserver counts as not answering whenever it fails to produce an
-    /// answer, including a SERVFAIL or REFUSED response. See
-    /// [`FallbackMode::Deferred`] for what that means for a name the system
-    /// resolver deliberately refuses.
+    /// The public resolvers are queried over plaintext UDP, and a SERVFAIL or
+    /// REFUSED counts as not answering. See [`FallbackMode::Deferred`].
     ///
     /// Every other configuration goes through [`Self::builder`].
     pub fn system_with_fallback() -> Self {
@@ -937,11 +902,8 @@ impl DnsResolver {
                 if state.primary_count == state.config.nameservers.len() {
                     return Err(primary_err);
                 }
-                // A transient failure here is ordinary and stays at debug. A
-                // configuration error is not: it will fail identically on every
-                // lookup, so an encrypted-only setup is silently answering all
-                // of its queries from the plaintext tier. That deserves to be
-                // visible without turning on debug logging.
+                // A configuration fault repeats on every lookup, so an
+                // encrypted-only setup is silently answering from plaintext.
                 if is_configuration_error(&primary_err) {
                     warn!(
                         err = %primary_err,
@@ -1055,14 +1017,10 @@ impl DnsResolver {
     /// A nameserver that answers with a CNAME but no records of the requested
     /// type has left the chain unresolved, so the target is queried in turn.
     ///
-    /// `read_answer` is handed the validated packet of the response that ends
-    /// the chain. It takes the packet rather than this returning the bytes so
-    /// that a response is parsed exactly once: `simple_dns` follows compression
-    /// pointers with no bound on how many hops a single name may take, only
-    /// that each points backwards, so a 64 KB response built as a ladder of
-    /// pointers costs a large fraction of a second to parse. Parsing such a
-    /// response once to validate it and again to extract its records, and again
-    /// for its negative TTL, multiplied that cost by three.
+    /// `read_answer` gets the validated packet of the response that ends the
+    /// chain, rather than this returning bytes, so a response is parsed once.
+    /// Parsing is not cheap: `simple_dns` 0.12 does not bound compression
+    /// pointer hops, so a 64 KB ladder costs ~55ms.
     async fn send_query_following_cnames<T>(
         &self,
         host: String,
@@ -1117,12 +1075,8 @@ impl DnsResolver {
         name: String,
         kind: RecordKind,
     ) -> Result<Vec<Record>, Error> {
-        // Ahead of the cache probe and search expansion: a name whose wire form
-        // differs from its string would be stored under a key that no later
-        // lookup of the same wire name can hit.
+        // Both ahead of the cache: the key is the caller's string.
         validate_name(&name)?;
-        // Ahead of the cache too: a literal is its own answer, so there is
-        // nothing to store and nothing to ask a nameserver.
         if let Some(records) = ip_literal_records(&name, kind) {
             trace!(%name, ?kind, "resolved from IP literal");
             return Ok(records);
@@ -1162,13 +1116,9 @@ impl DnsResolver {
         let total = names.len();
         for (i, name) in names.into_iter().enumerate() {
             trace!(%name, ?kind, "resolving");
-            // Both the records and the negative TTL are read from the one
-            // parsed packet, inside the query call, so a response is never
-            // parsed twice.
             let read_answer = |packet: &Packet<'_>| {
                 let parsed = query::parse_records(packet, kind).map_err(Error::from);
-                // Derive the RFC 2308 negative TTL from the authority SOA; only
-                // meaningful for a negative answer (empty or NXDOMAIN).
+                // RFC 2308, only meaningful for a negative answer.
                 let soa = match &parsed {
                     Ok((records, _)) if records.is_empty() => query::negative_ttl(packet),
                     Err(Error::NxDomain { .. }) => query::negative_ttl(packet),
@@ -1276,17 +1226,14 @@ impl DnsResolver {
     /// Looks up the IPv4 (A) records for `name`.
     pub async fn lookup_ipv4(&self, name: impl Into<String>) -> Result<Vec<Ipv4Addr>, Error> {
         let name = name.into();
-        // Before the localhost rule and the hosts override, both of which read
-        // the string: a name that reaches the wire in another shape would
-        // sidestep them.
+        // Ahead of the localhost rule and hosts override, which read the string.
         validate_name(&name)?;
         // RFC 6761: localhost always resolves to loopback.
         if is_localhost(&name) {
             return Ok(vec![Ipv4Addr::LOCALHOST]);
         }
-        // A hosts-file entry overrides DNS, so check it ahead of the cache. A
-        // literal is skipped: it answers itself in `lookup_record`, and nothing
-        // in the hosts file should be able to shadow it.
+        // A hosts entry overrides DNS, so check it ahead of the cache, but must
+        // not shadow a literal.
         if !is_ip_literal(&name)
             && let Some(addrs) = self
                 .search_names(&name)
@@ -1311,14 +1258,11 @@ impl DnsResolver {
     /// Looks up the IPv6 (AAAA) records for `name`.
     pub async fn lookup_ipv6(&self, name: impl Into<String>) -> Result<Vec<Ipv6Addr>, Error> {
         let name = name.into();
-        // See [`Self::lookup_ipv4`]: validation runs ahead of both string-based
-        // policy checks.
         validate_name(&name)?;
         // RFC 6761: localhost always resolves to loopback.
         if is_localhost(&name) {
             return Ok(vec![Ipv6Addr::LOCALHOST]);
         }
-        // See [`Self::lookup_ipv4`]: the hosts file cannot shadow a literal.
         if !is_ip_literal(&name)
             && let Some(addrs) = self
                 .search_names(&name)
@@ -1848,11 +1792,8 @@ mod tests {
 
     /// An unbounded serve-stale window does not take the resolver down.
     ///
-    /// `serve_stale(Duration::MAX)` used to overflow the window arithmetic on
-    /// the first failed lookup that found an expired entry. The panic happened
-    /// under the cache guard, so the mutex was poisoned and every subsequent
-    /// lookup, for any name, panicked at the cache probe: one configuration
-    /// value turned the first upstream failure into a permanent outage.
+    /// The overflow used to panic under the cache guard, poisoning the mutex,
+    /// after which every lookup for any name panicked at the cache probe.
     #[tokio::test]
     async fn serve_stale_with_an_unbounded_window_survives_a_failed_lookup() {
         let expected = Ipv4Addr::new(203, 0, 113, 7);
@@ -1867,8 +1808,7 @@ mod tests {
             "stale.test",
             RecordKind::A,
             CachedResult::Positive(vec![Record::A(expected)]),
-            // A day, the TTL cap: the largest window the cache can hold.
-            Duration::from_secs(86_400),
+            Duration::from_secs(86_400), // the TTL cap
             Duration::from_secs(5),
         );
 
@@ -1876,8 +1816,7 @@ mod tests {
             resolver.lookup_ipv4("stale.test").await.unwrap(),
             [expected]
         );
-        // A second lookup for an unrelated name still reaches the network
-        // rather than panicking on a poisoned cache.
+        // Would panic on a poisoned cache.
         assert!(resolver.lookup_ipv4("other.test").await.is_err());
     }
 
@@ -1983,16 +1922,11 @@ mod tests {
         assert!(err.is_err(), "expected NXDOMAIN, got {err:?}");
     }
 
-    /// Names whose wire form would differ from the string are rejected.
-    ///
-    /// `simple_dns::Name` drops empty labels, so without this the string and the
-    /// wire name disagree and every string-based policy check is looking at a
-    /// name that is not the one queried.
     mod name_validation {
         use super::{super::validate_name, *};
         use crate::Error;
 
-        /// The shapes `Name::new` would silently rewrite.
+        /// The shapes `Name::new` would rewrite.
         const REWRITTEN: &[&str] = &[
             "",
             ".",
@@ -2027,13 +1961,8 @@ mod tests {
             }
         }
 
-        /// An empty label must not carry a `localhost` name onto the wire.
-        ///
-        /// `is_localhost` strips one trailing dot and reads the last label, so
-        /// `localhost..` used to leave it empty, fail the check, and be sent to
-        /// a nameserver as `localhost.` -- which could answer it with any
-        /// address. The resolver here has no nameservers, so reaching the query
-        /// path at all surfaces as `NoNameservers`.
+        /// `localhost..` used to fail the check and reach a nameserver as
+        /// `localhost.`, which could answer it with any address.
         #[tokio::test]
         async fn localhost_with_an_empty_label_never_reaches_a_nameserver() {
             let resolver = empty_resolver();
@@ -2046,7 +1975,6 @@ mod tests {
             }
         }
 
-        /// An extra dot must not sidestep an operator's hosts-file pin.
         #[tokio::test]
         async fn an_empty_label_does_not_bypass_the_hosts_file() {
             let mut resolver = empty_resolver();
@@ -2059,11 +1987,8 @@ mod tests {
             );
         }
 
-        /// The empty name must not resolve to a search domain's address.
-        ///
         /// `search_names("")` expands to `".example.com"`, which `Name::new`
-        /// rewrites to `example.com`, so an empty lookup used to return whatever
-        /// the search domain resolves to.
+        /// used to rewrite to `example.com`.
         #[tokio::test]
         async fn the_empty_name_is_not_expanded_to_a_search_domain() {
             let mut resolver = empty_resolver();
@@ -2076,7 +2001,6 @@ mod tests {
             );
         }
 
-        /// The generic lookup path validates too, not just the typed ones.
         #[tokio::test]
         async fn lookup_record_validates() {
             let resolver = empty_resolver();
@@ -2089,11 +2013,6 @@ mod tests {
     }
 
     /// A configuration fault is told apart from a transient failure.
-    ///
-    /// Both escalate a lookup to the fallback tier, but a configuration fault
-    /// does so on every lookup, which means an encrypted-only primary is
-    /// silently answering all of its queries from a plaintext tier. Only that
-    /// case is worth a warning.
     mod configuration_errors {
         use n0_error::e;
 
@@ -2126,7 +2045,6 @@ mod tests {
             assert!(is_configuration_error(&err));
         }
 
-        /// An encrypted nameserver with no TLS config can never be queried.
         #[cfg(with_rustls)]
         #[test]
         fn an_encrypted_nameserver_without_a_tls_config_is_a_fault() {
@@ -2136,12 +2054,10 @@ mod tests {
             assert!(encrypted_nameserver_fault(&ns, false).is_some());
             assert!(encrypted_nameserver_fault(&ns, true).is_none());
 
-            // A plaintext nameserver needs no TLS config, so it is never a fault.
             let plain = Nameserver::new("192.0.2.1:53".parse().unwrap(), DnsProtocol::Udp);
             assert!(encrypted_nameserver_fault(&plain, false).is_none());
         }
 
-        /// A server name rustls cannot parse fails every handshake.
         #[cfg(with_rustls)]
         #[test]
         fn an_unparsable_server_name_is_a_fault() {
@@ -2162,7 +2078,6 @@ mod tests {
             assert!(encrypted_nameserver_fault(&good, true).is_none());
         }
 
-        /// A server that is merely down or slow is not a configuration fault.
         #[test]
         fn transient_failures_are_not_configuration_errors() {
             for err in [
@@ -2178,19 +2093,11 @@ mod tests {
         }
     }
 
-    /// An IP literal answers itself and never reaches a nameserver.
-    ///
-    /// All-numeric labels are valid DNS names, so without this a literal is
-    /// queried and then search-expanded, which a wildcard search zone can
-    /// answer.
     mod ip_literals {
         use super::*;
         use crate::Error;
 
-        /// A resolver with no nameservers but a search domain.
-        ///
-        /// Any lookup that reaches the query path fails with `NoNameservers`,
-        /// which is what distinguishes a short-circuit from a network attempt.
+        /// No nameservers, so reaching the query path gives `NoNameservers`.
         fn resolver() -> DnsResolver {
             let mut resolver = empty_resolver();
             resolver.set_search(vec!["example.com".to_string()], 1);
@@ -2209,15 +2116,12 @@ mod tests {
                 resolver.lookup_ipv6("2001:db8::1").await.unwrap(),
                 ["2001:db8::1".parse::<Ipv6Addr>().unwrap()]
             );
-            // Loopback is the case that matters most: a wildcard search zone
-            // must not be able to redirect a caller that passes 127.0.0.1.
             assert_eq!(
                 resolver.lookup_ipv4("127.0.0.1").await.unwrap(),
                 [Ipv4Addr::LOCALHOST]
             );
         }
 
-        /// The other family has no records, rather than erroring or querying.
         #[tokio::test]
         async fn a_literal_has_no_records_of_the_other_family() {
             let resolver = resolver();
@@ -2232,7 +2136,6 @@ mod tests {
             );
         }
 
-        /// The generic path short-circuits too, so no lookup kind leaks it.
         #[tokio::test]
         async fn lookup_record_short_circuits_a_literal() {
             let resolver = resolver();
@@ -2253,7 +2156,6 @@ mod tests {
             );
         }
 
-        /// A hosts entry naming a literal must not shadow the literal itself.
         #[tokio::test]
         async fn the_hosts_file_does_not_shadow_a_literal() {
             let mut resolver = resolver();
@@ -2265,16 +2167,14 @@ mod tests {
             );
         }
 
-        /// A name that merely looks numeric is still a name.
         #[tokio::test]
         async fn a_non_literal_still_goes_to_the_nameservers() {
             let resolver = resolver();
 
-            // Four labels but out of range for an octet, so not an address.
+            // Out of range for an octet, so not an address.
             let err = resolver.lookup_ipv4("192.0.2.999").await.unwrap_err();
             assert!(matches!(err, Error::NoNameservers { .. }), "{err:?}");
 
-            // A trailing dot makes it an explicit FQDN, not a literal.
             let err = resolver.lookup_ipv4("192.0.2.1.").await.unwrap_err();
             assert!(matches!(err, Error::NoNameservers { .. }), "{err:?}");
         }
