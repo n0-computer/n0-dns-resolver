@@ -20,7 +20,7 @@ use n0_future::{
     FuturesUnordered, MaybeFuture, StreamExt,
     time::{self, Duration, Instant},
 };
-use simple_dns::TYPE;
+use simple_dns::{Packet, TYPE};
 use tracing::{debug, trace};
 
 #[cfg(test)]
@@ -938,15 +938,19 @@ impl DnsResolver {
         }
     }
 
-    /// Sends a query, following CNAME chains across responses.
+    /// Sends a query, following CNAME chains across responses, and reads the answer.
     ///
     /// A nameserver that answers with a CNAME but no records of the requested
     /// type has left the chain unresolved, so the target is queried in turn.
-    async fn send_query_following_cnames(
+    ///
+    /// `read_answer` gets the validated packet that ends the chain, so each
+    /// response is parsed once.
+    async fn send_query_following_cnames<T>(
         &self,
         host: String,
         qtype: TYPE,
-    ) -> Result<Vec<u8>, Error> {
+        read_answer: impl Fn(&Packet<'_>) -> T,
+    ) -> Result<T, Error> {
         let mut current_host = host;
         for _ in 0..MAX_CNAME_DEPTH {
             let name = simple_dns::Name::new(&current_host).map_err(|_| {
@@ -965,7 +969,7 @@ impl DnsResolver {
 
             // The response holds the answer, or has no CNAME to follow.
             let Some(target) = query::unresolved_cname_target(&packet, &name, qtype) else {
-                return Ok(response);
+                return Ok(read_answer(&packet));
             };
             debug!(from = %current_host, to = %target, "following CNAME");
             current_host = target;
@@ -1036,22 +1040,21 @@ impl DnsResolver {
         let total = names.len();
         for (i, name) in names.into_iter().enumerate() {
             trace!(%name, ?kind, "resolving");
+            let read_answer = |packet: &Packet<'_>| {
+                let parsed = query::parse_records(packet, kind).map_err(Error::from);
+                // RFC 2308 TTL of a NODATA answer. An NXDOMAIN comes back from
+                // `check_response` as an error and gets the default TTL.
+                let soa = match &parsed {
+                    Ok((records, _)) if records.is_empty() => query::negative_ttl(packet),
+                    _ => None,
+                };
+                (parsed, soa)
+            };
             let (res, soa_negative_ttl) = match self
-                .send_query_following_cnames(name.clone(), kind.dns_type())
+                .send_query_following_cnames(name.clone(), kind.dns_type(), read_answer)
                 .await
             {
-                Ok(response) => {
-                    let parsed = query::parse_records(&response, kind).map_err(Error::from);
-                    // Derive the RFC 2308 negative TTL from the authority SOA while
-                    // the response bytes are still in scope; only meaningful for a
-                    // negative answer (empty or NXDOMAIN).
-                    let soa = match &parsed {
-                        Ok((records, _)) if records.is_empty() => query::negative_ttl(&response),
-                        Err(Error::NxDomain { .. }) => query::negative_ttl(&response),
-                        _ => None,
-                    };
-                    (parsed, soa)
-                }
+                Ok(answer) => answer,
                 Err(e) => (Err(e), None),
             };
             match res {
