@@ -157,6 +157,10 @@ impl Builder {
     /// upstream outage does not break resolution. This is serve-stale, RFC
     /// 8767. Only positive answers are served stale; an authoritative NXDOMAIN
     /// is never overridden. Off by default.
+    ///
+    /// `max_age` is measured from the answer's expiry, not from when it was
+    /// stored, and is not clamped: [`Duration::MAX`] means an expired answer
+    /// stays servable for as long as it stays in the cache.
     #[must_use]
     pub fn serve_stale(mut self, max_age: Duration) -> Self {
         self.serve_stale = Some(max_age);

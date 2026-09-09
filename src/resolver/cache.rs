@@ -186,8 +186,13 @@ impl DnsCache {
             return None;
         }
         // Only expired entries within the stale window, and only positive ones.
+        // The window is caller-supplied and the TTL can be a day, so the sum is
+        // saturated: `serve_stale(Duration::MAX)` is the obvious way to ask for
+        // "serve stale forever", and a plain `+` would overflow and panic here,
+        // holding the guard, poisoning the mutex and taking every later lookup
+        // for any name down with it.
         let age = entry.inserted_at.elapsed();
-        if age <= entry.ttl || age > entry.ttl + max_stale {
+        if age <= entry.ttl || age > entry.ttl.saturating_add(max_stale) {
             return None;
         }
         match &entry.result {
@@ -316,6 +321,34 @@ mod tests {
         let cache = DnsCache::new();
         cache.insert("example.com", RecordKind::A, positive(), 300);
         assert_single_a(cache.get("Example.COM.", RecordKind::A), ADDR);
+    }
+
+    /// An unbounded stale window serves the entry instead of panicking.
+    ///
+    /// `Duration::MAX` is the obvious way to ask for "serve stale forever".
+    /// Adding it to the entry TTL used to overflow and panic while holding the
+    /// cache guard, which poisoned the mutex and made every later lookup for
+    /// any name panic at the cache probe.
+    #[test]
+    fn get_stale_with_an_unbounded_window_does_not_overflow() {
+        let cache = DnsCache::new();
+        cache.insert_expired(
+            "stale.example",
+            RecordKind::A,
+            positive(),
+            // A day, the TTL cap, so the sum is nowhere near representable.
+            Duration::from_secs(86_400),
+            Duration::from_secs(5),
+        );
+
+        assert!(
+            cache
+                .get_stale("stale.example", RecordKind::A, Duration::MAX)
+                .is_some(),
+            "an unbounded window should serve the expired entry"
+        );
+        // The lock is still usable, which it would not be after a poisoning panic.
+        assert!(cache.get("stale.example", RecordKind::A).is_none());
     }
 
     #[test]
