@@ -1,4 +1,25 @@
 //! System DNS configuration from Windows network adapters.
+//!
+//! # Known limitations
+//!
+//! Every adapter that is up contributes its DNS servers to one flat tier, and
+//! the search list comes from the global registry `SearchList` key alone.
+//!
+//! Two consequences, both of which need a resolver that can pick nameservers
+//! per name rather than racing one tier:
+//!
+//! - With a LAN resolver and a corporate VPN resolver in the same tier, the LAN
+//!   resolver's fast NXDOMAIN can win the race for a VPN-only name, so the name
+//!   is reported as nonexistent and was sent to the LAN resolver in plaintext.
+//!   Windows prefers the VPN adapter by interface metric, which `ipconfig`
+//!   exposes as `ipv4_metric`/`ipv6_metric` but we do not read.
+//! - Connection-specific DNS suffixes (DHCP option 15) are not applied, because
+//!   `ipconfig` 0.3 does not expose an adapter's `DnsSuffix` at all; reading it
+//!   would mean calling `GetAdaptersAddresses` ourselves.
+//!
+//! hickory-resolver has both limitations too (as of main, 2026-09-06), so this
+//! is not a regression against the resolver this replaced. Split-DNS support is
+//! a deliberate follow-up rather than an oversight.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
