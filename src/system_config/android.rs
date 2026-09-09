@@ -7,6 +7,12 @@
 //! ndk-glue or android-activity (both do this before `main`) or by an explicit
 //! [`install_android_jni_context`] call.
 //!
+//! `getDnsServers()` returns the link's plaintext DHCP or RA servers even when
+//! Private DNS is in strict mode, where Android's own resolver refuses
+//! cleartext. `getPrivateDnsServerName()` is read alongside it so that those
+//! addresses are queried over DNS-over-TLS under the configured name instead,
+//! which is what the user or an MDM policy asked for.
+//!
 //! Without an initialized [`ndk_context`] the JNI lookup panics. Debug builds
 //! wrap the call in `std::panic::catch_unwind` so unit tests on Android (where
 //! no Java Virtual Machine (JVM) is in scope) fall back to the resolver's
@@ -29,7 +35,7 @@ use std::{
 #[cfg(target_os = "android")]
 use jni::{
     jni_sig, jni_str,
-    objects::{IntoAuto as _, JByteArray, JList, JObject, JValue},
+    objects::{IntoAuto as _, JByteArray, JList, JObject, JString, JValue},
 };
 #[cfg(target_os = "android")]
 use tracing::{trace, warn};
@@ -150,6 +156,48 @@ fn read_system_dns_jni() -> Result<Config, std::io::Error> {
                     }
                 };
                 nameservers.push(Nameserver::new(addr, DnsProtocol::Udp));
+            }
+
+            // Private DNS in strict mode: the plaintext list above is the
+            // link's DHCP or RA servers, which Android's own resolver refuses
+            // to use in that mode. Re-point them at the configured DoT
+            // endpoint instead, or the user's explicit choice of a resolver
+            // that a hostile Wi-Fi can neither observe nor forge is undone.
+            //
+            // https://developer.android.com/reference/android/net/LinkProperties#getPrivateDnsServerName()
+            let private_dns_name = env
+                .call_method(
+                    &link_properties,
+                    jni_str!("getPrivateDnsServerName"),
+                    jni_sig!("()Ljava/lang/String;"),
+                    &[],
+                )?
+                .l()?;
+            if !private_dns_name.is_null() {
+                let name = env
+                    .cast_local::<JString<'_>>(private_dns_name)?
+                    .try_to_string(env)?;
+                trace!(%name, "Private DNS is in strict mode");
+                #[cfg(transport_tls)]
+                {
+                    // The DoT endpoint is addressed by name, and the addresses
+                    // to reach it at are the ones the link already gave us: the
+                    // OS resolved that name over DoT itself, so this does not
+                    // leak a bootstrap lookup.
+                    nameservers = nameservers
+                        .into_iter()
+                        .map(|ns| {
+                            let addr = SocketAddr::new(ns.addr.ip(), DnsProtocol::Tls.port());
+                            Nameserver::with_server_name(addr, DnsProtocol::Tls, name.clone())
+                        })
+                        .collect();
+                }
+                #[cfg(not(transport_tls))]
+                warn!(
+                    %name,
+                    "Private DNS is in strict mode but this build has no DNS-over-TLS \
+                     support, so queries stay in plaintext; enable the transport-tls feature",
+                );
             }
 
             trace!("Got DNS servers: {:?}", nameservers);
