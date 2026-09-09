@@ -261,8 +261,10 @@ impl DnsCache {
             return None;
         }
         // Only expired entries within the stale window, and only positive ones.
+        // Saturating: `serve_stale(Duration::MAX)` is the obvious way to ask for
+        // "forever", and a plain `+` would panic here holding the guard.
         let age = entry.inserted_at.elapsed();
-        if age <= entry.ttl || age > entry.ttl + max_stale {
+        if age <= entry.ttl || age > entry.ttl.saturating_add(max_stale) {
             return None;
         }
         match &entry.result {
@@ -424,6 +426,29 @@ mod tests {
         let cache = DnsCache::new();
         cache.insert("example.com", RecordKind::A, positive(), 300);
         assert_single_a(cache.get("Example.COM.", RecordKind::A), ADDR);
+    }
+
+    /// `Duration::MAX` used to overflow and panic under the cache guard,
+    /// poisoning the mutex.
+    #[test]
+    fn get_stale_with_an_unbounded_window_does_not_overflow() {
+        let cache = DnsCache::new();
+        cache.insert_expired(
+            "stale.example",
+            RecordKind::A,
+            positive(),
+            Duration::from_secs(86_400), // the TTL cap
+            Duration::from_secs(5),
+        );
+
+        assert!(
+            cache
+                .get_stale("stale.example", RecordKind::A, Duration::MAX)
+                .is_some(),
+            "an unbounded window should serve the expired entry"
+        );
+        // Unusable after a poisoning panic.
+        assert!(cache.get("stale.example", RecordKind::A).is_none());
     }
 
     #[test]

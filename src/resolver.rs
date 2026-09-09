@@ -1717,6 +1717,36 @@ mod tests {
         );
     }
 
+    /// An unbounded serve-stale window does not take the resolver down.
+    ///
+    /// The overflow used to panic under the cache guard, poisoning the mutex,
+    /// after which every lookup for any name panicked at the cache probe.
+    #[tokio::test]
+    async fn serve_stale_with_an_unbounded_window_survives_a_failed_lookup() {
+        let expected = Ipv4Addr::new(203, 0, 113, 7);
+        let resolver = DnsResolver::builder()
+            .serve_stale(Duration::MAX)
+            .nameserver(Nameserver::new(
+                "127.0.0.1:1".parse().unwrap(),
+                DnsProtocol::Tcp,
+            ))
+            .build();
+        resolver.cache.insert_expired(
+            "stale.test",
+            RecordKind::A,
+            CachedResult::Positive(vec![Record::A(expected)]),
+            Duration::from_secs(86_400), // the TTL cap
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            resolver.lookup_ipv4("stale.test").await.unwrap(),
+            [expected]
+        );
+        // Would panic on a poisoned cache.
+        assert!(resolver.lookup_ipv4("other.test").await.is_err());
+    }
+
     /// Serve-stale answers from an expired entry when no nameserver responds.
     ///
     /// RFC 8767: a brief upstream outage returns the stale answer rather than
