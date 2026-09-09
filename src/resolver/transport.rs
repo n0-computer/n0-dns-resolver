@@ -365,8 +365,9 @@ mod tests {
     ///
     /// Lets the transport tests compare against a plain `Vec<Ipv4Addr>`.
     fn parse_a_addrs(data: &[u8]) -> (Vec<Ipv4Addr>, u32) {
+        let packet = super::super::query::parse_packet(data).unwrap();
         let (records, ttl) =
-            super::super::query::parse_records(data, crate::RecordKind::A).unwrap();
+            super::super::query::parse_records(&packet, crate::RecordKind::A).unwrap();
         let addrs = records
             .into_iter()
             .filter_map(|r| match r {
