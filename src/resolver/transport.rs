@@ -60,6 +60,16 @@ pub enum TransportError {
     #[cfg(transport_https)]
     #[error("DNS-over-HTTPS response body exceeds {MAX_HTTPS_BODY} bytes")]
     ResponseTooLarge {},
+    /// A DNS-over-HTTPS server answered with a status other than 2xx.
+    ///
+    /// Redirects are not followed, so a 3xx arrives here rather than being
+    /// replayed against the redirect target.
+    #[cfg(transport_https)]
+    #[error("DNS-over-HTTPS server returned HTTP status {status}")]
+    UnexpectedStatus {
+        /// The status code the server returned.
+        status: u16,
+    },
 }
 
 // TCP and DoT connections are pooled (see the `pool` module) and reused across
@@ -224,6 +234,17 @@ pub(super) async fn tls_query(
 ///
 /// `resolves` pins each named DoH host to a fixed address, so a hostname-based
 /// DoH URL connects to that IP instead of being resolved recursively.
+///
+/// The redirect, scheme and proxy defaults are all overridden. reqwest follows
+/// up to ten redirects by default, allows an `https` to `http` downgrade, and
+/// reads the environment proxy variables; a DoH query is a POST, so a 307 or
+/// 308 replays its body. Left at those defaults, a DoH server could have the
+/// query re-posted in cleartext to a host of its choosing: the redirect target
+/// is not in the pin map, so it would be resolved through the very system
+/// resolver this crate exists to replace, and `error_for_status` would not
+/// catch it because only the final 2xx is checked. That silently defeats the
+/// two properties DoH is configured for, confidentiality on the wire and not
+/// touching the system resolver, so none of the three is wanted here.
 #[cfg(transport_https)]
 pub(super) fn build_https_client(
     tls_config: &Arc<rustls::ClientConfig>,
@@ -232,7 +253,11 @@ pub(super) fn build_https_client(
     // reqwest wraps the argument in an `Option` and downcasts to
     // `Option<rustls::ClientConfig>`, so hand it a bare `ClientConfig` (not the
     // `Arc`), or it rejects it as an unknown backend at build time.
-    let mut builder = reqwest::Client::builder().use_preconfigured_tls((**tls_config).clone());
+    let mut builder = reqwest::Client::builder()
+        .use_preconfigured_tls((**tls_config).clone())
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .no_proxy();
     for (host, addr) in resolves {
         builder = builder.resolve(host, *addr);
     }
@@ -294,7 +319,16 @@ pub(super) async fn https_query(
         .send()
         .await?;
 
-    read_body(response.error_for_status()?).await
+    // Only a 2xx carries an answer. `error_for_status` rejects 4xx and 5xx but
+    // passes a 3xx through, and with redirects disabled a 3xx reaches us as an
+    // ordinary response whose body would otherwise be read as the DNS answer.
+    let status = response.status();
+    if !status.is_success() {
+        return Err(e!(TransportError::UnexpectedStatus {
+            status: status.as_u16()
+        }));
+    }
+    read_body(response).await
 }
 
 #[cfg(test)]
@@ -593,5 +627,44 @@ mod tests {
         assert_eq!(resp.len(), UDP_RECV_BUFFER);
         assert!(maybe_truncated);
         handle.await.unwrap();
+    }
+
+    /// The DoH client refuses cleartext, so a query cannot leave over plain HTTP.
+    ///
+    /// A DoH server that answers 307 or 308 has the POST body, which is the DNS
+    /// query, replayed against the redirect target. With reqwest's defaults
+    /// that target could be an `http` URL and the query would go out in the
+    /// clear. Redirects are off, and this pins the second half of that: the
+    /// client will not speak `http` even when handed such a URL directly.
+    ///
+    /// The listener is never expected to accept a connection; if it does, the
+    /// request reached the wire in cleartext.
+    #[cfg(transport_https)]
+    #[tokio::test]
+    async fn https_client_refuses_a_cleartext_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (connected_tx, mut connected_rx) = tokio::sync::mpsc::channel(1);
+        let handle = tokio::spawn(async move {
+            if listener.accept().await.is_ok() {
+                let _ = connected_tx.send(()).await;
+            }
+        });
+
+        let tls_config = crate::DnsResolver::default_tls_config().expect("crypto provider");
+        let client = build_https_client(&tls_config, &[]).unwrap();
+        let err = client
+            .post(format!("http://{addr}/dns-query"))
+            .body(b"query".to_vec())
+            .send()
+            .await
+            .expect_err("a cleartext URL should be refused before it is sent");
+
+        assert!(err.is_builder(), "expected a bad-scheme error, got {err:?}");
+        assert!(
+            connected_rx.try_recv().is_err(),
+            "the query reached the listener in cleartext"
+        );
+        handle.abort();
     }
 }
