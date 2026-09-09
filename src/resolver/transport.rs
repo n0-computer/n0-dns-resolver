@@ -227,6 +227,19 @@ pub(super) async fn tls_query(
     Ok(resp)
 }
 
+/// Returns the caller's TLS config with its ALPN list replaced by `http/1.1`.
+///
+/// reqwest is built without `http2`, so hyper-util panics with "http2 feature
+/// is not enabled" on a connection that negotiates `h2`. `use_preconfigured_tls`
+/// passes a config through untouched, so a caller config listing `h2` -- as an
+/// application's own will -- would panic every DoH lookup.
+#[cfg(transport_https)]
+fn https_tls_config(tls_config: &rustls::ClientConfig) -> rustls::ClientConfig {
+    let mut tls_config = tls_config.clone();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    tls_config
+}
+
 /// Builds a [`reqwest::Client`] for DNS-over-HTTPS queries.
 ///
 /// `resolves` pins each named DoH host to a fixed address, so a hostname-based
@@ -240,7 +253,7 @@ pub(super) fn build_https_client(
     // `Option<rustls::ClientConfig>`, so hand it a bare `ClientConfig` (not the
     // `Arc`), or it rejects it as an unknown backend at build time.
     let mut builder = reqwest::Client::builder()
-        .use_preconfigured_tls((**tls_config).clone())
+        .use_preconfigured_tls(https_tls_config(tls_config))
         .redirect(reqwest::redirect::Policy::none());
     for (host, addr) in resolves {
         builder = builder.resolve(host, *addr);
@@ -609,6 +622,23 @@ mod tests {
         assert_eq!(resp.len(), UDP_RECV_BUFFER);
         assert!(maybe_truncated);
         handle.await.unwrap();
+    }
+
+    /// A caller TLS config advertising `h2` does not reach the DoH client.
+    #[cfg(transport_https)]
+    #[test]
+    fn https_tls_config_advertises_only_http1() {
+        let mut caller_config =
+            (*crate::DnsResolver::default_tls_config().expect("crypto provider")).clone();
+        caller_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let config = https_tls_config(&caller_config);
+
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"http/1.1".to_vec()],
+            "h2 must not be offered by a client that cannot speak it"
+        );
     }
 
     #[cfg(all(transport_https, transport_tls, with_crypto_provider))]

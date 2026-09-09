@@ -143,6 +143,10 @@ impl Builder {
     /// Requires the `transport-tls` or `transport-https` feature. Without a
     /// config, DoT/DoH use one built from the crypto provider (`tls-ring` or
     /// `tls-aws-lc-rs`); with neither a config nor a provider, they error.
+    ///
+    /// Used as given except for `alpn_protocols`, which DNS-over-HTTPS replaces
+    /// with `http/1.1`, since its HTTP client is built without HTTP/2 and could
+    /// not speak an `h2` it negotiated. DNS-over-TLS uses the list as given.
     #[cfg(with_rustls)]
     #[must_use]
     pub fn tls_client_config(mut self, config: rustls::ClientConfig) -> Self {
