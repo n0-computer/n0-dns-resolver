@@ -1203,6 +1203,7 @@ dependencies = [
  "ipconfig",
  "iroh-base",
  "jni",
+ "libc",
  "lru",
  "n0-error",
  "n0-future",

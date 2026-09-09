@@ -22,7 +22,7 @@
 use std::ffi::c_void;
 #[cfg(target_os = "android")]
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
@@ -111,26 +111,38 @@ fn read_system_dns_jni() -> Result<Config, std::io::Error> {
                 let ip_bytes_arr = env.cast_local::<JByteArray<'_>>(ip_bytes_obj)?;
                 let ip_bytes = env.convert_byte_array(ip_bytes_arr)?;
 
-                let ip = match ip_bytes.len() {
+                let addr = match ip_bytes.len() {
                     4 => {
                         let mut arr = [0u8; 4];
                         arr.copy_from_slice(&ip_bytes);
-                        IpAddr::from(arr)
+                        SocketAddr::new(IpAddr::from(arr), DnsProtocol::Udp.port())
                     }
                     16 => {
                         let mut arr = [0u8; 16];
                         arr.copy_from_slice(&ip_bytes);
-                        IpAddr::from(arr)
+                        // `getAddress` drops the zone, without which a
+                        // link-local resolver is unreachable.
+                        // https://developer.android.com/reference/java/net/Inet6Address#getScopeId()
+                        let scope_id = env
+                            .call_method(&server, jni_str!("getScopeId"), jni_sig!("()I"), &[])
+                            .and_then(|value| value.i())
+                            .unwrap_or_else(|err| {
+                                warn!(%err, "could not read the IPv6 scope id, using none");
+                                0
+                            });
+                        SocketAddr::V6(SocketAddrV6::new(
+                            Ipv6Addr::from(arr),
+                            DnsProtocol::Udp.port(),
+                            0,
+                            scope_id as u32,
+                        ))
                     }
                     _ => {
                         warn!("Got invalid ip length: {}. Skipping.", ip_bytes.len());
                         continue;
                     }
                 };
-                nameservers.push(Nameserver::new(
-                    SocketAddr::new(ip, DnsProtocol::Udp.port()),
-                    DnsProtocol::Udp,
-                ));
+                nameservers.push(Nameserver::new(addr, DnsProtocol::Udp));
             }
 
             trace!("Got DNS servers: {:?}", nameservers);
