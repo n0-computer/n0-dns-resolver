@@ -1628,10 +1628,15 @@ mod tests {
     /// the ladder, so parsing that one name walks every hop down to the single
     /// real label at the bottom.
     ///
-    /// This is legal on the wire. `simple_dns` bounds a name by its 255-byte
-    /// length, which counts real labels and not hops, and by requiring each
-    /// pointer to point backwards, which rules out a loop but not a ladder.
-    fn pointer_ladder_response(size: usize) -> (Vec<u8>, u16) {
+    /// `hops` sets how many cells the ladder has, and `size` how large the
+    /// whole response grows.
+    ///
+    /// A ladder is legal on the wire: `simple_dns` 0.12 bounds a name by its
+    /// 255-byte length, which counts real labels and not hops, and by requiring
+    /// each pointer to point backwards, which rules out a loop but not a
+    /// ladder. A fixed version caps the hops, and then a deep ladder is
+    /// rejected instead; both outcomes are fine here, and neither is a hang.
+    fn pointer_ladder_response(hops: usize, size: usize) -> (Vec<u8>, u16) {
         let mut buf = vec![0u8; DNS_HEADER_LEN];
         buf[2] = 0x80; // QR
 
@@ -1645,7 +1650,7 @@ mod tests {
         let rdata_start = buf.len();
         buf.extend_from_slice(&[1, b'a', 0]); // the real label the ladder ends at
         let mut prev = rdata_start as u16;
-        while buf.len() < size / 2 {
+        for _ in 0..hops {
             let here = buf.len() as u16;
             buf.push(0xC0 | (prev >> 8) as u8);
             buf.push((prev & 0xFF) as u8);
@@ -1668,17 +1673,19 @@ mod tests {
         (buf, count)
     }
 
-    /// A pointer ladder parses correctly rather than being rejected or looping.
+    /// A chain of compression pointers resolves to the name at its foot.
     ///
-    /// The cost of parsing one is why a response is parsed once and the packet
-    /// passed on rather than the bytes being re-parsed by each step; this pins
-    /// that such a response is still handled, so the parse-once path is
-    /// exercised by the same input the cost concern is about.
+    /// Pointer-to-pointer is unusual but legal, and the cost of walking a long
+    /// chain of them is why a response is parsed once and the packet passed on
+    /// rather than the bytes being re-parsed by each step. The chain here is
+    /// short enough to stay under the hop cap a fixed `simple_dns` applies, so
+    /// this pins the correctness half regardless of the version in the lock
+    /// file.
     #[test]
-    fn a_pointer_ladder_response_parses() {
-        let (buf, count) = pointer_ladder_response(16 * 1024);
+    fn a_pointer_chain_resolves_to_its_foot() {
+        let (buf, count) = pointer_ladder_response(8, 4096);
 
-        let packet = parse_packet(&buf).expect("a ladder is legal on the wire");
+        let packet = parse_packet(&buf).expect("a short chain is legal on the wire");
 
         assert_eq!(packet.answers.len(), count as usize);
         // Every pointer resolves to the one real label at the foot of the ladder.
@@ -1690,24 +1697,29 @@ mod tests {
     /// Reports what one parse of a 64 KB pointer ladder costs.
     ///
     /// Ignored: it is a measurement, not an assertion, and the figure is
-    /// machine-dependent. Run with `--ignored --nocapture`. On the machine this
-    /// was written on it is about 55ms, against well under a millisecond for a
-    /// legitimate response of the same record count, and the resolver used to
-    /// pay it three times per lookup. The remaining factor is upstream:
-    /// `simple_dns` puts no bound on how many pointer hops one name may take,
-    /// the way hickory, unbound and BIND all do.
+    /// machine-dependent. Run with `--ignored --nocapture`.
+    ///
+    /// Against `simple_dns` 0.12, which puts no bound on how many pointer hops
+    /// one name may take, this is about 55ms on the machine it was written on,
+    /// against well under a millisecond for a legitimate response of the same
+    /// record count; the resolver used to pay it three times per lookup. A
+    /// version that caps the hops, as hickory, unbound and BIND do, rejects the
+    /// packet in microseconds instead, which is the outcome to hope for.
     #[test]
     #[ignore = "a measurement, not an assertion"]
     fn bench_pointer_ladder_parse() {
-        let (buf, count) = pointer_ladder_response(64 * 1024);
+        let (buf, count) = pointer_ladder_response(16 * 1024, 64 * 1024);
 
         let start = std::time::Instant::now();
         let parsed = parse_packet(&buf);
         let elapsed = start.elapsed();
 
-        assert!(parsed.is_ok());
+        let outcome = match parsed {
+            Ok(_) => "walked the whole ladder",
+            Err(_) => "rejected it (the hop cap is in place)",
+        };
         println!(
-            "{} bytes, {count} records, one parse {elapsed:?}",
+            "{} bytes, {count} records: {outcome} in {elapsed:?}",
             buf.len()
         );
     }
