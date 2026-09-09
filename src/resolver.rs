@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::{
     future::Future,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::OnceLock,
 };
@@ -183,6 +183,26 @@ fn validate_name(name: &str) -> Result<(), Error> {
         }));
     }
     Ok(())
+}
+
+/// Returns whether `name` is an IP address literal rather than a DNS name.
+fn is_ip_literal(name: &str) -> bool {
+    name.parse::<IpAddr>().is_ok()
+}
+
+/// Returns the answer for `name` when it is an IP address literal.
+///
+/// All-numeric labels are valid DNS names, so `192.0.2.1` would otherwise be
+/// queried and search-expanded, and a wildcard search zone could answer it.
+/// A literal has no records of the other address family. Returns `None` when
+/// `name` is not a literal.
+fn ip_literal_records(name: &str, kind: RecordKind) -> Option<Vec<Record>> {
+    let ip: IpAddr = name.parse().ok()?;
+    Some(match (ip, kind) {
+        (IpAddr::V4(ip), RecordKind::A) => vec![Record::A(ip)],
+        (IpAddr::V6(ip), RecordKind::Aaaa) => vec![Record::Aaaa(ip)],
+        _ => Vec::new(),
+    })
 }
 
 /// Returns whether `host` is `localhost` or a name under it.
@@ -975,10 +995,12 @@ impl DnsResolver {
         name: String,
         kind: RecordKind,
     ) -> Result<Vec<Record>, Error> {
-        // Ahead of the cache probe and search expansion: a name whose wire form
-        // differs from its string would be stored under a key that no later
-        // lookup of the same wire name can hit.
+        // Both ahead of the cache: the key is the caller's string.
         validate_name(&name)?;
+        if let Some(records) = ip_literal_records(&name, kind) {
+            trace!(%name, ?kind, "resolved from IP literal");
+            return Ok(records);
+        }
         match self.cache.get(&name, kind) {
             Some(CachedResult::Positive(records)) => {
                 trace!(%name, records = records.len(), ?kind, "cache hit");
@@ -1131,11 +1153,13 @@ impl DnsResolver {
         if is_localhost(&name) {
             return Ok(vec![Ipv4Addr::LOCALHOST]);
         }
-        // A hosts-file entry overrides DNS, so check it ahead of the cache.
-        if let Some(addrs) = self
-            .search_names(&name)
-            .iter()
-            .find_map(|name| self.state().config.hosts.lookup_ipv4(name))
+        // A hosts entry overrides DNS, so check it ahead of the cache, but must
+        // not shadow a literal.
+        if !is_ip_literal(&name)
+            && let Some(addrs) = self
+                .search_names(&name)
+                .iter()
+                .find_map(|name| self.state().config.hosts.lookup_ipv4(name))
         {
             trace!(%name, ?addrs, "resolved from hosts file");
             return Ok(addrs);
@@ -1160,11 +1184,11 @@ impl DnsResolver {
         if is_localhost(&name) {
             return Ok(vec![Ipv6Addr::LOCALHOST]);
         }
-        // A hosts-file entry overrides DNS, so check it ahead of the cache.
-        if let Some(addrs) = self
-            .search_names(&name)
-            .iter()
-            .find_map(|name| self.state().config.hosts.lookup_ipv6(name))
+        if !is_ip_literal(&name)
+            && let Some(addrs) = self
+                .search_names(&name)
+                .iter()
+                .find_map(|name| self.state().config.hosts.lookup_ipv6(name))
         {
             trace!(%name, ?addrs, "resolved from hosts file");
             return Ok(addrs);
@@ -1876,6 +1900,94 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::InvalidName { .. }), "{err:?}");
+        }
+    }
+
+    /// An IP literal answers itself and never reaches a nameserver.
+    mod ip_literals {
+        use super::*;
+        use crate::Error;
+
+        /// No nameservers, so reaching the query path gives `NoNameservers`.
+        fn resolver() -> DnsResolver {
+            let mut resolver = empty_resolver();
+            resolver.set_search(vec!["example.com".to_string()], 1);
+            resolver
+        }
+
+        #[tokio::test]
+        async fn a_literal_resolves_to_itself_without_a_query() {
+            let resolver = resolver();
+
+            assert_eq!(
+                resolver.lookup_ipv4("192.0.2.1").await.unwrap(),
+                [Ipv4Addr::new(192, 0, 2, 1)]
+            );
+            assert_eq!(
+                resolver.lookup_ipv6("2001:db8::1").await.unwrap(),
+                ["2001:db8::1".parse::<Ipv6Addr>().unwrap()]
+            );
+            assert_eq!(
+                resolver.lookup_ipv4("127.0.0.1").await.unwrap(),
+                [Ipv4Addr::LOCALHOST]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_literal_has_no_records_of_the_other_family() {
+            let resolver = resolver();
+
+            assert!(resolver.lookup_ipv6("192.0.2.1").await.unwrap().is_empty());
+            assert!(
+                resolver
+                    .lookup_ipv4("2001:db8::1")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn lookup_record_short_circuits_a_literal() {
+            let resolver = resolver();
+
+            assert_eq!(
+                resolver
+                    .lookup_record("192.0.2.1", RecordKind::A)
+                    .await
+                    .unwrap(),
+                [Record::A(Ipv4Addr::new(192, 0, 2, 1))]
+            );
+            assert!(
+                resolver
+                    .lookup_record("192.0.2.1", RecordKind::Txt)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn the_hosts_file_does_not_shadow_a_literal() {
+            let mut resolver = resolver();
+            resolver.set_hosts(Hosts::from_content("10.0.0.1 192.0.2.1\n"));
+
+            assert_eq!(
+                resolver.lookup_ipv4("192.0.2.1").await.unwrap(),
+                [Ipv4Addr::new(192, 0, 2, 1)]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_non_literal_still_goes_to_the_nameservers() {
+            let resolver = resolver();
+
+            // Out of range for an octet, so not an address.
+            let err = resolver.lookup_ipv4("192.0.2.999").await.unwrap_err();
+            assert!(matches!(err, Error::NoNameservers { .. }), "{err:?}");
+
+            let err = resolver.lookup_ipv4("192.0.2.1.").await.unwrap_err();
+            assert!(matches!(err, Error::NoNameservers { .. }), "{err:?}");
         }
     }
 
