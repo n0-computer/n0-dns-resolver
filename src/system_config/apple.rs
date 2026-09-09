@@ -7,8 +7,17 @@
 //! we read the primary resolver from the dynamic store key
 //! `State:/Network/Global/DNS`, the way the old hickory-resolver path did on
 //! Apple targets. That key holds the default resolver's `ServerAddresses` and
-//! `SearchDomains`. Scoped per-domain resolvers (VPN split-DNS) live under
-//! other keys and were not read by the old path either.
+//! `SearchDomains`.
+//!
+//! # Known limitations
+//!
+//! Supplemental (split-DNS) resolvers, published under
+//! `State:/Network/Service/<id>/DNS` with `SupplementalMatchDomains`, are not
+//! read, so a VPN-only name goes to the primary resolver and is reported
+//! NXDOMAIN. Honoring them needs per-name nameserver selection. hickory main
+//! reads only the global key too.
+//!
+//! Unlike hickory, a scoped address such as `fe80::1%en0` keeps its zone here.
 
 use std::borrow::Cow;
 
