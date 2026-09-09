@@ -1,4 +1,13 @@
 //! System DNS configuration from Windows network adapters.
+//!
+//! # Known limitations
+//!
+//! No split-DNS: every adapter that is up contributes to one flat tier, so a
+//! LAN resolver's fast NXDOMAIN can win the race for a VPN-only name. The
+//! interface metric Windows prefers by is in `ipconfig` but unread, and
+//! connection-specific suffixes (DHCP option 15) are unreachable, since
+//! `ipconfig` 0.3 exposes no `DnsSuffix`. Both need per-name nameserver
+//! selection. hickory main has the same limitations.
 
 use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
