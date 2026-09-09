@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::{
     future::Future,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::OnceLock,
 };
@@ -193,6 +193,34 @@ fn validate_name(name: &str) -> Result<(), Error> {
         }));
     }
     Ok(())
+}
+
+/// Returns whether `name` is an IP address literal rather than a DNS name.
+fn is_ip_literal(name: &str) -> bool {
+    name.parse::<IpAddr>().is_ok()
+}
+
+/// Returns the answer for `name` when it is an IP address literal.
+///
+/// An address is already the answer to an address lookup, so sending it to a
+/// nameserver is both pointless and unsafe: an all-numeric label is a valid DNS
+/// name, so `192.0.2.1` is queried, answered NXDOMAIN, and then retried as
+/// `192.0.2.1.<search>`. A search-domain operator, or a hostile network that
+/// supplied the search list over DHCP, can answer that from a wildcard zone and
+/// so redirect any caller that passes a literal through -- including
+/// `127.0.0.1`. `getaddrinfo`, hickory and Go all return a literal without
+/// touching the network.
+///
+/// The literal answers only its own family; the other family has no records,
+/// which is the same empty result a name with no `AAAA` would give. Returns
+/// `None` when `name` is not a literal, and the lookup proceeds as a name.
+fn ip_literal_records(name: &str, kind: RecordKind) -> Option<Vec<Record>> {
+    let ip: IpAddr = name.parse().ok()?;
+    Some(match (ip, kind) {
+        (IpAddr::V4(ip), RecordKind::A) => vec![Record::A(ip)],
+        (IpAddr::V6(ip), RecordKind::Aaaa) => vec![Record::Aaaa(ip)],
+        _ => Vec::new(),
+    })
 }
 
 /// Returns whether `host` is `localhost` or a name under it.
@@ -990,6 +1018,12 @@ impl DnsResolver {
         // differs from its string would be stored under a key that no later
         // lookup of the same wire name can hit.
         validate_name(&name)?;
+        // Ahead of the cache too: a literal is its own answer, so there is
+        // nothing to store and nothing to ask a nameserver.
+        if let Some(records) = ip_literal_records(&name, kind) {
+            trace!(%name, ?kind, "resolved from IP literal");
+            return Ok(records);
+        }
         match self.cache.get(&name, kind) {
             Some(CachedResult::Positive(records)) => {
                 trace!(%name, records = records.len(), ?kind, "cache hit");
@@ -1144,11 +1178,14 @@ impl DnsResolver {
         if is_localhost(&name) {
             return Ok(vec![Ipv4Addr::LOCALHOST]);
         }
-        // A hosts-file entry overrides DNS, so check it ahead of the cache.
-        if let Some(addrs) = self
-            .search_names(&name)
-            .iter()
-            .find_map(|name| self.state().config.hosts.lookup_ipv4(name))
+        // A hosts-file entry overrides DNS, so check it ahead of the cache. A
+        // literal is skipped: it answers itself in `lookup_record`, and nothing
+        // in the hosts file should be able to shadow it.
+        if !is_ip_literal(&name)
+            && let Some(addrs) = self
+                .search_names(&name)
+                .iter()
+                .find_map(|name| self.state().config.hosts.lookup_ipv4(name))
         {
             trace!(%name, ?addrs, "resolved from hosts file");
             return Ok(addrs);
@@ -1175,11 +1212,12 @@ impl DnsResolver {
         if is_localhost(&name) {
             return Ok(vec![Ipv6Addr::LOCALHOST]);
         }
-        // A hosts-file entry overrides DNS, so check it ahead of the cache.
-        if let Some(addrs) = self
-            .search_names(&name)
-            .iter()
-            .find_map(|name| self.state().config.hosts.lookup_ipv6(name))
+        // See [`Self::lookup_ipv4`]: the hosts file cannot shadow a literal.
+        if !is_ip_literal(&name)
+            && let Some(addrs) = self
+                .search_names(&name)
+                .iter()
+                .find_map(|name| self.state().config.hosts.lookup_ipv6(name))
         {
             trace!(%name, ?addrs, "resolved from hosts file");
             return Ok(addrs);
@@ -1906,6 +1944,108 @@ mod tests {
                 .await
                 .unwrap_err();
             assert!(matches!(err, Error::InvalidName { .. }), "{err:?}");
+        }
+    }
+
+    /// An IP literal answers itself and never reaches a nameserver.
+    ///
+    /// All-numeric labels are valid DNS names, so without this a literal is
+    /// queried and then search-expanded, which a wildcard search zone can
+    /// answer.
+    mod ip_literals {
+        use super::*;
+        use crate::Error;
+
+        /// A resolver with no nameservers but a search domain.
+        ///
+        /// Any lookup that reaches the query path fails with `NoNameservers`,
+        /// which is what distinguishes a short-circuit from a network attempt.
+        fn resolver() -> DnsResolver {
+            let mut resolver = empty_resolver();
+            resolver.set_search(vec!["example.com".to_string()], 1);
+            resolver
+        }
+
+        #[tokio::test]
+        async fn a_literal_resolves_to_itself_without_a_query() {
+            let resolver = resolver();
+
+            assert_eq!(
+                resolver.lookup_ipv4("192.0.2.1").await.unwrap(),
+                [Ipv4Addr::new(192, 0, 2, 1)]
+            );
+            assert_eq!(
+                resolver.lookup_ipv6("2001:db8::1").await.unwrap(),
+                ["2001:db8::1".parse::<Ipv6Addr>().unwrap()]
+            );
+            // Loopback is the case that matters most: a wildcard search zone
+            // must not be able to redirect a caller that passes 127.0.0.1.
+            assert_eq!(
+                resolver.lookup_ipv4("127.0.0.1").await.unwrap(),
+                [Ipv4Addr::LOCALHOST]
+            );
+        }
+
+        /// The other family has no records, rather than erroring or querying.
+        #[tokio::test]
+        async fn a_literal_has_no_records_of_the_other_family() {
+            let resolver = resolver();
+
+            assert!(resolver.lookup_ipv6("192.0.2.1").await.unwrap().is_empty());
+            assert!(
+                resolver
+                    .lookup_ipv4("2001:db8::1")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        /// The generic path short-circuits too, so no lookup kind leaks it.
+        #[tokio::test]
+        async fn lookup_record_short_circuits_a_literal() {
+            let resolver = resolver();
+
+            assert_eq!(
+                resolver
+                    .lookup_record("192.0.2.1", RecordKind::A)
+                    .await
+                    .unwrap(),
+                [Record::A(Ipv4Addr::new(192, 0, 2, 1))]
+            );
+            assert!(
+                resolver
+                    .lookup_record("192.0.2.1", RecordKind::Txt)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        /// A hosts entry naming a literal must not shadow the literal itself.
+        #[tokio::test]
+        async fn the_hosts_file_does_not_shadow_a_literal() {
+            let mut resolver = resolver();
+            resolver.set_hosts(Hosts::from_content("10.0.0.1 192.0.2.1\n"));
+
+            assert_eq!(
+                resolver.lookup_ipv4("192.0.2.1").await.unwrap(),
+                [Ipv4Addr::new(192, 0, 2, 1)]
+            );
+        }
+
+        /// A name that merely looks numeric is still a name.
+        #[tokio::test]
+        async fn a_non_literal_still_goes_to_the_nameservers() {
+            let resolver = resolver();
+
+            // Four labels but out of range for an octet, so not an address.
+            let err = resolver.lookup_ipv4("192.0.2.999").await.unwrap_err();
+            assert!(matches!(err, Error::NoNameservers { .. }), "{err:?}");
+
+            // A trailing dot makes it an explicit FQDN, not a literal.
+            let err = resolver.lookup_ipv4("192.0.2.1.").await.unwrap_err();
+            assert!(matches!(err, Error::NoNameservers { .. }), "{err:?}");
         }
     }
 
