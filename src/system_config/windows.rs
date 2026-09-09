@@ -1,6 +1,6 @@
 //! System DNS configuration from Windows network adapters.
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
 use super::{Config, DnsProtocol, Hosts, Nameserver};
 
@@ -32,12 +32,22 @@ pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
         }
         for dns_server in adapter.dns_servers() {
             let ip = IpAddr::from(*dns_server);
-            if !WINDOWS_BAD_SITE_LOCAL_DNS_SERVERS.contains(&ip) {
-                servers.push(Nameserver::new(
-                    SocketAddr::new(ip, DnsProtocol::Udp.port()),
-                    DnsProtocol::Udp,
-                ));
+            if WINDOWS_BAD_SITE_LOCAL_DNS_SERVERS.contains(&ip) {
+                continue;
             }
+            // A link-local resolver is only reachable on the interface it was
+            // advertised on, and `dns_servers()` hands back a bare address with
+            // no zone. The adapter it came from is the zone, so take the index
+            // from there; without it the address is ambiguous and every query
+            // to it fails, falling the lookup through to the public tier.
+            let addr =
+                match ip {
+                    IpAddr::V6(ip) if ip.is_unicast_link_local() => SocketAddr::V6(
+                        SocketAddrV6::new(ip, DnsProtocol::Udp.port(), 0, adapter.ipv6_if_index()),
+                    ),
+                    ip => SocketAddr::new(ip, DnsProtocol::Udp.port()),
+                };
+            servers.push(Nameserver::new(addr, DnsProtocol::Udp));
         }
     }
 

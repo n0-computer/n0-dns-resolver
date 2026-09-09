@@ -1,6 +1,6 @@
 //! System DNS configuration from `/etc/resolv.conf`.
 
-use std::net::{IpAddr, SocketAddr};
+use tracing::warn;
 
 use super::{Config, DnsProtocol, Hosts, Nameserver};
 
@@ -45,21 +45,14 @@ fn parse_resolv_conf(content: &str) -> Config {
         match parts.next() {
             Some("nameserver") => {
                 if let Some(addr_str) = parts.next() {
-                    // Try parsing as SocketAddr first (supports custom ports like
-                    // 8.8.8.8:5353 or [::1]:5353), then fall back to IpAddr with
-                    // the default DNS port. A scoped IPv6 address like
-                    // `fe80::1%eth0` carries a zone id the address parsers reject,
-                    // so strip it for the fallback and keep the address (the zone
-                    // needs interface binding we do not do, so it is discarded).
-                    let addr = addr_str.parse::<SocketAddr>().ok().or_else(|| {
-                        let ip_str = addr_str.split('%').next().unwrap_or(addr_str);
-                        ip_str
-                            .parse::<IpAddr>()
-                            .ok()
-                            .map(|ip| SocketAddr::new(ip, DnsProtocol::Udp.port()))
-                    });
-                    if let Some(addr) = addr {
-                        servers.push(Nameserver::new(addr, DnsProtocol::Udp));
+                    // Handles a plain address, one with a port, and a scoped
+                    // IPv6 address such as `fe80::1%eth0`, whose zone is kept:
+                    // it is what selects the interface the resolver is on, and
+                    // on an IPv6-only network that entry may be the whole DNS
+                    // configuration.
+                    match super::parse_nameserver_addr(addr_str, DnsProtocol::Udp.port()) {
+                        Some(addr) => servers.push(Nameserver::new(addr, DnsProtocol::Udp)),
+                        None => warn!(nameserver = %addr_str, "ignoring unparsable nameserver"),
                     }
                 }
             }
@@ -109,7 +102,7 @@ fn is_valid_search_domain(domain: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::net::Ipv4Addr;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 
     use super::*;
 
@@ -200,16 +193,62 @@ mod tests {
         assert_eq!(ips(&config), [ipv4(1, 1, 1, 1)]);
     }
 
+    /// A numeric zone is kept in the address, not stripped from it.
+    ///
+    /// `sin6_scope_id` is what selects the interface a link-local nameserver is
+    /// reachable on. Without it `fe80::1` is ambiguous and every query to it
+    /// fails, which on an IPv6-only network whose router advertises only an
+    /// RDNSS resolver means every lookup falls through to the public tier.
     #[test]
-    fn parse_scoped_ipv6() {
-        // The `%eth0` zone id is stripped and the address retained, matching
-        // hickory (the zone is unusable without interface binding, which we do
-        // not do).
-        let config = parse_resolv_conf("nameserver fe80::1%eth0\nnameserver 8.8.8.8\n");
+    fn parse_scoped_ipv6_keeps_a_numeric_zone() {
+        let config = parse_resolv_conf("nameserver fe80::1%2\nnameserver 8.8.8.8\n");
+
         assert_eq!(
-            ips(&config),
-            [IpAddr::V6("fe80::1".parse().unwrap()), ipv4(8, 8, 8, 8),]
+            config.nameservers[0].addr,
+            SocketAddr::V6(std::net::SocketAddrV6::new(
+                "fe80::1".parse().unwrap(),
+                53,
+                0,
+                2
+            ))
         );
+        assert_eq!(config.nameservers[1].addr.ip(), ipv4(8, 8, 8, 8));
+    }
+
+    /// A named zone resolves through `if_nametoindex`.
+    ///
+    /// `lo` is the one interface name that can be relied on to exist.
+    #[test]
+    fn parse_scoped_ipv6_resolves_an_interface_name() {
+        let config = parse_resolv_conf("nameserver fe80::1%lo\n");
+
+        let SocketAddr::V6(addr) = config.nameservers[0].addr else {
+            panic!("expected an IPv6 address");
+        };
+        assert_ne!(addr.scope_id(), 0, "the interface name did not resolve");
+    }
+
+    /// A zone naming no interface on this host is dropped, not silently unscoped.
+    ///
+    /// An unscoped link-local address cannot be reached, so keeping it would
+    /// only spend a timeout on every lookup.
+    #[test]
+    fn parse_scoped_ipv6_drops_an_unknown_interface() {
+        let config = parse_resolv_conf("nameserver fe80::1%nosuchif0\nnameserver 8.8.8.8\n");
+
+        assert_eq!(ips(&config), [ipv4(8, 8, 8, 8)]);
+    }
+
+    /// A scoped address with a port keeps both.
+    #[test]
+    fn parse_scoped_ipv6_with_a_port() {
+        let config = parse_resolv_conf("nameserver [fe80::1%2]:5353\n");
+
+        let SocketAddr::V6(addr) = config.nameservers[0].addr else {
+            panic!("expected an IPv6 address");
+        };
+        assert_eq!(addr.port(), 5353);
+        assert_eq!(addr.scope_id(), 2);
     }
 
     #[test]
