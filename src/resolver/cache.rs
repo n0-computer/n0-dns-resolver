@@ -15,6 +15,28 @@ use crate::{Record, RecordKind};
 /// Maximum number of entries in the DNS cache.
 const MAX_CACHE_ENTRIES: usize = 4096;
 
+/// Maximum memory the cached answers may hold, in bytes (8 MiB).
+///
+/// An entry count alone does not bound memory. Answers are not uniformly
+/// small: a 65535-byte response over a stream transport carries about 4,000 A
+/// records, and a TXT record of many short character strings costs far more in
+/// memory than on the wire, because each string is boxed separately. At 4,096
+/// entries of that size a malicious nameserver, or an honest recursor relaying
+/// a large RRset, could make the resolver hold gigabytes for a day, which on a
+/// phone is an out-of-memory kill.
+///
+/// Entries are evicted in least-recently-used order until the total is back
+/// under this. Ordinary DNS answers are a few hundred bytes, so this is far
+/// more than the entry count needs in practice and only binds under abuse.
+const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maximum memory a single cached answer may hold, in bytes (256 KiB).
+///
+/// An answer larger than this is not cached at all, rather than being cached
+/// and then evicting a large share of everything else. That keeps one outsized
+/// response from flushing the cache, at the cost of re-querying for it.
+const MAX_ENTRY_BYTES: usize = 256 * 1024;
+
 /// Maximum TTL for cache entries (1 day).
 ///
 /// Prevents malicious or misconfigured servers from making entries
@@ -48,6 +70,23 @@ pub(super) enum CachedResult {
     NoData,
     /// The name does not exist (NXDOMAIN).
     NxDomain,
+}
+
+impl CachedResult {
+    /// Returns roughly how much memory this result holds, in bytes.
+    fn approx_bytes(&self) -> usize {
+        match self {
+            // `Record::approx_bytes` covers each record's own slot, so only the
+            // vector's spare capacity is left to charge for.
+            CachedResult::Positive(records) => {
+                let spare = records.capacity().saturating_sub(records.len());
+                spare * size_of::<Record>()
+                    + records.iter().map(Record::approx_bytes).sum::<usize>()
+            }
+            // An absence is the discriminant alone.
+            CachedResult::NoData | CachedResult::NxDomain => 0,
+        }
+    }
 }
 
 /// Normalizes a host to its cache-key form.
@@ -107,6 +146,11 @@ struct CacheEntry {
     inserted_at: Instant,
     /// How long the entry stays fresh, clamped to [`MAX_TTL_SECS`] on insert.
     ttl: Duration,
+    /// Roughly what this entry holds, in bytes, for the cache byte budget.
+    ///
+    /// Measured once at insert rather than recomputed, so eviction can subtract
+    /// exactly what insertion added even though the estimate is approximate.
+    bytes: usize,
 }
 
 impl CacheEntry {
@@ -133,16 +177,66 @@ impl CacheEntry {
 #[derive(Debug, Clone)]
 pub(super) struct DnsCache {
     /// Shared by every clone, which is what lets a reset carry the cache over.
-    inner: Arc<Mutex<LruCache<u64, CacheEntry>>>,
+    inner: Arc<Mutex<Inner>>,
+}
+
+/// The cache contents and the running byte total over them.
+///
+/// The two are behind one lock so the total cannot drift from the entries.
+#[derive(Debug)]
+struct Inner {
+    entries: LruCache<u64, CacheEntry>,
+    /// The sum of every entry's `bytes`, kept in step with `entries`.
+    bytes: usize,
+}
+
+impl Inner {
+    /// Removes `key`, subtracting what it held from the byte total.
+    fn remove(&mut self, key: &u64) {
+        if let Some(entry) = self.entries.pop(key) {
+            self.bytes = self.bytes.saturating_sub(entry.bytes);
+        }
+    }
+
+    /// Stores `entry`, evicting in LRU order until back under the byte budget.
+    ///
+    /// The entry itself is never evicted by this: [`DnsCache::insert`] refuses
+    /// anything over [`MAX_ENTRY_BYTES`], which is well under the budget, so
+    /// the loop always terminates with the new entry still present.
+    fn put(&mut self, key: u64, entry: CacheEntry) {
+        self.bytes += entry.bytes;
+        // `push`, not `put`: `put` returns only a value it replaced under the
+        // same key, while `push` also hands back an entry dropped because the
+        // cache was at its entry limit. Missing that one would leak its bytes
+        // from the total forever.
+        if let Some((_, displaced)) = self.entries.push(key, entry) {
+            self.bytes = self.bytes.saturating_sub(displaced.bytes);
+        }
+        while self.bytes > MAX_CACHE_BYTES {
+            let Some((_, evicted)) = self.entries.pop_lru() else {
+                break;
+            };
+            self.bytes = self.bytes.saturating_sub(evicted.bytes);
+        }
+    }
+
+    /// Empties the cache.
+    fn clear(&mut self) {
+        self.entries.clear();
+        self.bytes = 0;
+    }
 }
 
 impl DnsCache {
     /// Creates an empty cache holding up to [`MAX_CACHE_ENTRIES`] entries.
     pub(super) fn new() -> Self {
         Self {
-            inner: Arc::new(Mutex::new(LruCache::new(
-                std::num::NonZeroUsize::new(MAX_CACHE_ENTRIES).expect("non-zero"),
-            ))),
+            inner: Arc::new(Mutex::new(Inner {
+                entries: LruCache::new(
+                    std::num::NonZeroUsize::new(MAX_CACHE_ENTRIES).expect("non-zero"),
+                ),
+                bytes: 0,
+            })),
         }
     }
 
@@ -155,7 +249,7 @@ impl DnsCache {
         let host = normalize(host);
         let key = cache_key(&host, kind);
         let mut inner = self.inner.lock().expect("poisoned");
-        let entry = inner.get(&key)?;
+        let entry = inner.entries.get(&key)?;
         // Reject `u64` key collisions: only serve an exact host+kind match.
         if entry.host != *host || entry.kind != kind {
             return None;
@@ -181,7 +275,7 @@ impl DnsCache {
         let host = normalize(host);
         let key = cache_key(&host, kind);
         let mut inner = self.inner.lock().expect("poisoned");
-        let entry = inner.get(&key)?;
+        let entry = inner.entries.get(&key)?;
         if entry.host != host || entry.kind != kind {
             return None;
         }
@@ -207,22 +301,34 @@ impl DnsCache {
     /// negative results (NODATA, NXDOMAIN) are cached under [`NEGATIVE_TTL_SECS`]
     /// so a burst of concurrent lookups for the same absent name collapses to
     /// one network query.
+    ///
+    /// An answer larger than [`MAX_ENTRY_BYTES`] is not cached, and inserting
+    /// evicts in least-recently-used order until the cache is back under
+    /// [`MAX_CACHE_BYTES`].
     pub(super) fn insert(&self, host: &str, kind: RecordKind, result: CachedResult, ttl: u32) {
         if ttl == 0 {
             return;
         }
         let host = normalize(host);
+        let bytes = result.approx_bytes();
+        let key = cache_key(&host, kind);
+        let mut inner = self.inner.lock().expect("poisoned");
+        if bytes > MAX_ENTRY_BYTES {
+            // Too large to cache. Drop any earlier entry for this name as well,
+            // rather than leaving a smaller, older answer to be served in
+            // preference to the one that just arrived.
+            inner.remove(&key);
+            return;
+        }
         let entry = CacheEntry {
             host: host.to_string(),
             kind,
             result,
             inserted_at: Instant::now(),
             ttl: Duration::from_secs(ttl.min(MAX_TTL_SECS) as u64),
+            bytes,
         };
-        self.inner
-            .lock()
-            .expect("poisoned")
-            .put(cache_key(&host, kind), entry);
+        inner.put(key, entry);
     }
 
     /// Clears all cache entries.
@@ -246,6 +352,7 @@ impl DnsCache {
         let entry = CacheEntry {
             host: host.to_string(),
             kind,
+            bytes: result.approx_bytes(),
             result,
             inserted_at: Instant::now() - (ttl + expired_ago),
             ttl,
@@ -261,7 +368,22 @@ impl DnsCache {
     fn stored_ttl(&self, host: &str, kind: RecordKind) -> Option<Duration> {
         let host = normalize(host);
         let mut inner = self.inner.lock().expect("poisoned");
-        inner.get(&cache_key(&host, kind)).map(|entry| entry.ttl)
+        inner
+            .entries
+            .get(&cache_key(&host, kind))
+            .map(|entry| entry.ttl)
+    }
+
+    /// Returns the number of cached entries, for tests that assert eviction.
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.inner.lock().expect("poisoned").entries.len()
+    }
+
+    /// Returns the cache's running byte total, for tests that assert the budget.
+    #[cfg(test)]
+    fn bytes(&self) -> usize {
+        self.inner.lock().expect("poisoned").bytes
     }
 }
 
@@ -275,6 +397,16 @@ mod tests {
 
     fn positive() -> CachedResult {
         CachedResult::Positive(vec![Record::A(ADDR)])
+    }
+
+    /// Builds a positive result of roughly `target` bytes.
+    ///
+    /// A records carry no heap, so the size is the record slots alone and the
+    /// count follows from the target. This is how the tests below dial an
+    /// answer to a chosen size relative to the cache bounds.
+    fn positive_of_bytes(target: usize) -> CachedResult {
+        let count = target.div_ceil(size_of::<Record>());
+        CachedResult::Positive(vec![Record::A(ADDR); count])
     }
 
     /// Asserts that `result` holds exactly one A record for `expected`.
@@ -428,5 +560,131 @@ mod tests {
             cache.get("nodata.example", RecordKind::Aaaa),
             Some(CachedResult::NoData)
         ));
+    }
+
+    /// An answer over the per-entry cap is not cached at all.
+    ///
+    /// Caching it and then evicting to get back under the total budget would
+    /// let one outsized response flush most of the cache.
+    #[test]
+    fn an_oversized_answer_is_not_cached() {
+        let cache = DnsCache::new();
+        // Over the per-entry cap but well under the total budget, so only the
+        // per-entry cap can be what rejects it.
+        let huge = positive_of_bytes(2 * MAX_ENTRY_BYTES);
+        assert!(huge.approx_bytes() > MAX_ENTRY_BYTES);
+        assert!(huge.approx_bytes() < MAX_CACHE_BYTES);
+
+        cache.insert("huge.example", RecordKind::A, huge, 300);
+
+        assert!(cache.get("huge.example", RecordKind::A).is_none());
+        assert_eq!(cache.len(), 0);
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    /// An oversized answer drops the older entry rather than leaving it served.
+    #[test]
+    fn an_oversized_answer_evicts_the_previous_entry() {
+        let cache = DnsCache::new();
+        cache.insert("host.example", RecordKind::A, positive(), 300);
+        assert!(cache.get("host.example", RecordKind::A).is_some());
+
+        cache.insert(
+            "host.example",
+            RecordKind::A,
+            positive_of_bytes(2 * MAX_ENTRY_BYTES),
+            300,
+        );
+
+        assert!(cache.get("host.example", RecordKind::A).is_none());
+        assert_eq!(cache.bytes(), 0);
+    }
+
+    /// The cache stays under its byte budget however many large answers arrive.
+    ///
+    /// The entry count alone does not bound memory: 4,096 entries of a few
+    /// hundred kilobytes each would be gigabytes held for up to a day.
+    #[test]
+    fn the_byte_budget_bounds_the_cache() {
+        let cache = DnsCache::new();
+        // Each answer is a sizeable fraction of the per-entry cap, so filling
+        // the entry limit would blow far past the total budget.
+        let per_entry = MAX_ENTRY_BYTES / 2;
+        for i in 0..MAX_CACHE_ENTRIES {
+            cache.insert(
+                &format!("host{i}.example"),
+                RecordKind::A,
+                positive_of_bytes(per_entry),
+                300,
+            );
+            assert!(
+                cache.bytes() <= MAX_CACHE_BYTES,
+                "over budget at entry {i}: {} bytes",
+                cache.bytes()
+            );
+        }
+
+        // Eviction happened, so the entry limit was never the binding one.
+        assert!(cache.len() < MAX_CACHE_ENTRIES);
+        // The most recent insert survived; the oldest did not.
+        assert!(cache.get("host0.example", RecordKind::A).is_none());
+        let last = MAX_CACHE_ENTRIES - 1;
+        assert!(
+            cache
+                .get(&format!("host{last}.example"), RecordKind::A)
+                .is_some()
+        );
+    }
+
+    /// Eviction at the entry limit is subtracted from the byte total.
+    ///
+    /// Many small entries reach the entry limit long before the byte budget, so
+    /// the eviction is done by the LRU itself. `LruCache::put` does not report
+    /// that entry, only one replaced under the same key, so counting on `put`
+    /// would leak an entry's bytes from the total on every insert past the
+    /// limit and the total would climb without bound.
+    #[test]
+    fn eviction_at_the_entry_limit_is_accounted_for() {
+        let cache = DnsCache::new();
+        let entry_bytes = positive().approx_bytes();
+
+        for i in 0..(2 * MAX_CACHE_ENTRIES) {
+            cache.insert(&format!("host{i}.example"), RecordKind::A, positive(), 300);
+        }
+
+        assert_eq!(cache.len(), MAX_CACHE_ENTRIES);
+        assert_eq!(
+            cache.bytes(),
+            MAX_CACHE_ENTRIES * entry_bytes,
+            "the byte total drifted from what the cache actually holds"
+        );
+    }
+
+    /// The running total tracks removals as well as insertions.
+    #[test]
+    fn the_byte_total_returns_to_zero() {
+        let cache = DnsCache::new();
+        for i in 0..64 {
+            cache.insert(&format!("host{i}.example"), RecordKind::A, positive(), 300);
+        }
+        assert!(cache.bytes() > 0);
+
+        cache.clear();
+
+        assert_eq!(cache.bytes(), 0);
+        assert_eq!(cache.len(), 0);
+    }
+
+    /// Replacing an entry does not leak the old one's bytes into the total.
+    #[test]
+    fn replacing_an_entry_does_not_leak_bytes() {
+        let cache = DnsCache::new();
+        cache.insert("host.example", RecordKind::A, positive_of_bytes(4096), 300);
+        let first = cache.bytes();
+
+        cache.insert("host.example", RecordKind::A, positive_of_bytes(4096), 300);
+
+        assert_eq!(cache.len(), 1);
+        assert_eq!(cache.bytes(), first, "the replaced entry was counted twice");
     }
 }
