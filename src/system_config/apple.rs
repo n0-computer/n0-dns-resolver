@@ -7,8 +7,27 @@
 //! we read the primary resolver from the dynamic store key
 //! `State:/Network/Global/DNS`, the way the old hickory-resolver path did on
 //! Apple targets. That key holds the default resolver's `ServerAddresses` and
-//! `SearchDomains`. Scoped per-domain resolvers (VPN split-DNS) live under
-//! other keys and were not read by the old path either.
+//! `SearchDomains`.
+//!
+//! # Known limitations
+//!
+//! Supplemental (split-DNS) resolvers are not read. A split-DNS VPN publishes
+//! its resolver under `State:/Network/Service/<id>/DNS` with
+//! `SupplementalMatchDomains`, and configd merges those into the list that
+//! `scutil --dns` and libresolv use, but they never appear in the global key.
+//! So a VPN-only name is sent to the primary ISP or home resolver, reported
+//! NXDOMAIN, and after escalation leaked to the public fallbacks, while `ping`
+//! on the same machine resolves it.
+//!
+//! Honoring them means routing a name under a match domain to that resolver set
+//! and no further, which needs a resolver that selects nameservers per name
+//! rather than racing one tier. hickory-resolver reads only the global key too
+//! (as of main, 2026-09-06), so this is not a regression against the resolver
+//! this replaced; it is a deliberate follow-up.
+//!
+//! Note that unlike hickory, a scoped address such as `fe80::1%en0` keeps its
+//! zone here rather than having it stripped: without it a link-local resolver
+//! cannot be reached at all.
 
 use std::borrow::Cow;
 
