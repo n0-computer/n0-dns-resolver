@@ -170,11 +170,39 @@ const TCP_JOIN_DELAY: Duration = UDP_RETRANSMIT_MIN.saturating_mul(UDP_PACED_DAT
 /// domains first. See <https://man7.org/linux/man-pages/man5/resolv.conf.5.html>.
 const DEFAULT_NDOTS: usize = 1;
 
+/// Rejects a name whose text form does not map one-to-one onto a wire name.
+///
+/// `simple_dns::Name` silently drops empty labels, so `localhost..`,
+/// `.example.com` and `""` all build wire names that differ from the string
+/// they came from. Every policy check we run before the query -- the RFC 6761
+/// `localhost` rule, the hosts-file override, the cache key -- reads the
+/// string, so a name that survives to the wire in a different shape sidesteps
+/// all of them: `localhost..` is checked as an empty last label and queried as
+/// `localhost.`, and `relay..example` misses a hosts pin for `relay.example`
+/// and is queried as it. Rejecting the mismatch here, ahead of any of those
+/// checks, keeps the caller's string, the hosts key, the cache key and the wire
+/// name in one-to-one correspondence. glibc and hickory reject the same shapes.
+///
+/// One trailing dot is the FQDN marker and is allowed; a second one is an empty
+/// label like any other.
+fn validate_name(name: &str) -> Result<(), Error> {
+    let stripped = name.strip_suffix('.').unwrap_or(name);
+    if stripped.is_empty() || stripped.split('.').any(str::is_empty) {
+        return Err(e!(Error::InvalidName {
+            name: name.to_string()
+        }));
+    }
+    Ok(())
+}
+
 /// Returns whether `host` is `localhost` or a name under it.
 ///
 /// RFC 6761 Section 6.3 reserves these to resolve to loopback without a query.
 /// DNS names are case-insensitive, so `foo.LOCALHOST` is one of them too, and
 /// must not go out to a nameserver that could answer it with any address.
+///
+/// Assumes `host` passed [`validate_name`], so the last label is only empty for
+/// the one permitted trailing dot.
 fn is_localhost(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
     host.rsplit('.')
@@ -958,6 +986,10 @@ impl DnsResolver {
         name: String,
         kind: RecordKind,
     ) -> Result<Vec<Record>, Error> {
+        // Ahead of the cache probe and search expansion: a name whose wire form
+        // differs from its string would be stored under a key that no later
+        // lookup of the same wire name can hit.
+        validate_name(&name)?;
         match self.cache.get(&name, kind) {
             Some(CachedResult::Positive(records)) => {
                 trace!(%name, records = records.len(), ?kind, "cache hit");
@@ -1104,6 +1136,10 @@ impl DnsResolver {
     /// Looks up the IPv4 (A) records for `name`.
     pub async fn lookup_ipv4(&self, name: impl Into<String>) -> Result<Vec<Ipv4Addr>, Error> {
         let name = name.into();
+        // Before the localhost rule and the hosts override, both of which read
+        // the string: a name that reaches the wire in another shape would
+        // sidestep them.
+        validate_name(&name)?;
         // RFC 6761: localhost always resolves to loopback.
         if is_localhost(&name) {
             return Ok(vec![Ipv4Addr::LOCALHOST]);
@@ -1132,6 +1168,9 @@ impl DnsResolver {
     /// Looks up the IPv6 (AAAA) records for `name`.
     pub async fn lookup_ipv6(&self, name: impl Into<String>) -> Result<Vec<Ipv6Addr>, Error> {
         let name = name.into();
+        // See [`Self::lookup_ipv4`]: validation runs ahead of both string-based
+        // policy checks.
+        validate_name(&name)?;
         // RFC 6761: localhost always resolves to loopback.
         if is_localhost(&name) {
             return Ok(vec![Ipv6Addr::LOCALHOST]);
@@ -1763,6 +1802,111 @@ mod tests {
             .lookup_ipv4("this-domain-does-not-exist.example.invalid")
             .await;
         assert!(err.is_err(), "expected NXDOMAIN, got {err:?}");
+    }
+
+    /// Names whose wire form would differ from the string are rejected.
+    ///
+    /// `simple_dns::Name` drops empty labels, so without this the string and the
+    /// wire name disagree and every string-based policy check is looking at a
+    /// name that is not the one queried.
+    mod name_validation {
+        use super::{super::validate_name, *};
+        use crate::Error;
+
+        /// The shapes `Name::new` would silently rewrite.
+        const REWRITTEN: &[&str] = &[
+            "",
+            ".",
+            "..",
+            "localhost..",
+            "foo.localhost..",
+            ".example.com",
+            "relay..example",
+            "example.com..",
+        ];
+
+        #[test]
+        fn empty_labels_are_rejected() {
+            for name in REWRITTEN {
+                assert!(
+                    matches!(validate_name(name), Err(Error::InvalidName { .. })),
+                    "{name:?} should be rejected"
+                );
+            }
+        }
+
+        #[test]
+        fn ordinary_names_and_one_trailing_dot_pass() {
+            for name in [
+                "example.com",
+                "example.com.",
+                "localhost",
+                "localhost.",
+                "a",
+            ] {
+                assert!(validate_name(name).is_ok(), "{name:?} should pass");
+            }
+        }
+
+        /// An empty label must not carry a `localhost` name onto the wire.
+        ///
+        /// `is_localhost` strips one trailing dot and reads the last label, so
+        /// `localhost..` used to leave it empty, fail the check, and be sent to
+        /// a nameserver as `localhost.` -- which could answer it with any
+        /// address. The resolver here has no nameservers, so reaching the query
+        /// path at all surfaces as `NoNameservers`.
+        #[tokio::test]
+        async fn localhost_with_an_empty_label_never_reaches_a_nameserver() {
+            let resolver = empty_resolver();
+            for name in ["localhost..", "foo.localhost.."] {
+                let err = resolver.lookup_ipv4(name).await.unwrap_err();
+                assert!(
+                    matches!(err, Error::InvalidName { .. }),
+                    "{name:?} reached the query path: {err:?}"
+                );
+            }
+        }
+
+        /// An extra dot must not sidestep an operator's hosts-file pin.
+        #[tokio::test]
+        async fn an_empty_label_does_not_bypass_the_hosts_file() {
+            let mut resolver = empty_resolver();
+            resolver.set_hosts(Hosts::from_content("10.0.1.10 relay.example\n"));
+
+            let err = resolver.lookup_ipv4("relay..example").await.unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidName { .. }),
+                "hosts pin was bypassed: {err:?}"
+            );
+        }
+
+        /// The empty name must not resolve to a search domain's address.
+        ///
+        /// `search_names("")` expands to `".example.com"`, which `Name::new`
+        /// rewrites to `example.com`, so an empty lookup used to return whatever
+        /// the search domain resolves to.
+        #[tokio::test]
+        async fn the_empty_name_is_not_expanded_to_a_search_domain() {
+            let mut resolver = empty_resolver();
+            resolver.set_search(vec!["example.com".to_string()], 1);
+
+            let err = resolver.lookup_ipv4("").await.unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidName { .. }),
+                "empty name was search-expanded: {err:?}"
+            );
+        }
+
+        /// The generic lookup path validates too, not just the typed ones.
+        #[tokio::test]
+        async fn lookup_record_validates() {
+            let resolver = empty_resolver();
+            let err = resolver
+                .lookup_record("relay..example", RecordKind::Txt)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidName { .. }), "{err:?}");
+        }
     }
 
     mod search_names {
