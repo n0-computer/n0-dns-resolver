@@ -122,6 +122,12 @@ jobs:
 
     - name: Setup Android SDK
       uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+      with:
+        # The action installs no platform and no build-tools by default, and
+        # cargo-apk needs both to package an APK: the platform jar for the
+        # `target_sdk_version` in Cargo.toml, which android-33 must track, and
+        # build-tools for aapt2, zipalign and apksigner.
+        packages: 'tools platform-tools platforms;android-33 build-tools;34.0.0'
 
     - name: Setup Android NDK
       uses: arqu/setup-ndk@4f8a02c22e2c17ff9ebba9026e599da847aa8374 # main
