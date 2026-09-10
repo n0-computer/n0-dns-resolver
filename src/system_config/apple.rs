@@ -7,14 +7,19 @@
 //! we read the primary resolver from the dynamic store key
 //! `State:/Network/Global/DNS`, the way the old hickory-resolver path did on
 //! Apple targets. That key holds the default resolver's `ServerAddresses` and
-//! `SearchDomains`. Scoped per-domain resolvers (VPN split-DNS) live under
-//! other keys and were not read by the old path either.
+//! `SearchDomains`.
+//!
+//! # Known limitations
+//!
+//! Supplemental (split-DNS) resolvers, published under
+//! `State:/Network/Service/<id>/DNS` with `SupplementalMatchDomains`, are not
+//! read, so a VPN-only name goes to the primary resolver and is reported
+//! NXDOMAIN. Honoring them needs per-name nameserver selection. hickory main
+//! reads only the global key too.
+//!
+//! Unlike hickory, a scoped address such as `fe80::1%en0` keeps its zone here.
 
-use std::{
-    borrow::Cow,
-    net::{IpAddr, SocketAddr},
-    str::FromStr,
-};
+use std::borrow::Cow;
 
 use system_configuration::{
     core_foundation::{
@@ -43,16 +48,17 @@ pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
         .and_then(|value| value.downcast_into::<CFDictionary>())
         .ok_or_else(|| std::io::Error::other("no DNS dictionary in SystemConfiguration"))?;
 
+    // A link-local resolver arrives scoped, `fe80::1%en0`, which
+    // `IpAddr::from_str` rejects outright. See `super::parse_nameserver_addr`.
     let nameservers = read_string_array(&dns_cfg, "ServerAddresses")
         .into_iter()
-        .filter_map(|s| match IpAddr::from_str(&s) {
-            Ok(ip) => Some(Nameserver::new(
-                SocketAddr::new(ip, DnsProtocol::Udp.port()),
-                DnsProtocol::Udp,
-            )),
-            Err(err) => {
-                warn!(nameserver = %s, %err, "ignoring unparsable nameserver from SystemConfiguration");
-                None
+        .filter_map(|s| {
+            match super::parse_nameserver_addr(&s, DnsProtocol::Udp.port()) {
+                Some(addr) => Some(Nameserver::new(addr, DnsProtocol::Udp)),
+                None => {
+                    warn!(nameserver = %s, "ignoring unparsable nameserver from SystemConfiguration");
+                    None
+                }
             }
         })
         .collect();

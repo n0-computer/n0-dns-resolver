@@ -1,6 +1,15 @@
 //! System DNS configuration from Windows network adapters.
+//!
+//! # Known limitations
+//!
+//! No split-DNS: every adapter that is up contributes to one flat tier, so a
+//! LAN resolver's fast NXDOMAIN can win the race for a VPN-only name. The
+//! interface metric Windows prefers by is in `ipconfig` but unread, and
+//! connection-specific suffixes (DHCP option 15) are unreachable, since
+//! `ipconfig` 0.3 exposes no `DnsSuffix`. Both need per-name nameserver
+//! selection. hickory main has the same limitations.
 
-use std::net::{IpAddr, Ipv6Addr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6};
 
 use super::{Config, DnsProtocol, Hosts, Nameserver};
 
@@ -32,12 +41,19 @@ pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
         }
         for dns_server in adapter.dns_servers() {
             let ip = IpAddr::from(*dns_server);
-            if !WINDOWS_BAD_SITE_LOCAL_DNS_SERVERS.contains(&ip) {
-                servers.push(Nameserver::new(
-                    SocketAddr::new(ip, DnsProtocol::Udp.port()),
-                    DnsProtocol::Udp,
-                ));
+            if WINDOWS_BAD_SITE_LOCAL_DNS_SERVERS.contains(&ip) {
+                continue;
             }
+            // `dns_servers()` drops the zone, so take it from the adapter; a
+            // link-local resolver is unreachable without it.
+            let addr =
+                match ip {
+                    IpAddr::V6(ip) if ip.is_unicast_link_local() => SocketAddr::V6(
+                        SocketAddrV6::new(ip, DnsProtocol::Udp.port(), 0, adapter.ipv6_if_index()),
+                    ),
+                    ip => SocketAddr::new(ip, DnsProtocol::Udp.port()),
+                };
+            servers.push(Nameserver::new(addr, DnsProtocol::Udp));
         }
     }
 

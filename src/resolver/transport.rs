@@ -60,6 +60,15 @@ pub enum TransportError {
     #[cfg(transport_https)]
     #[error("DNS-over-HTTPS response body exceeds {MAX_HTTPS_BODY} bytes")]
     ResponseTooLarge {},
+    /// A DNS-over-HTTPS server answered with a status other than 2xx.
+    ///
+    /// Redirects are not followed, so a 3xx arrives here.
+    #[cfg(transport_https)]
+    #[error("DNS-over-HTTPS server returned HTTP status {status}")]
+    UnexpectedStatus {
+        /// The status code the server returned.
+        status: u16,
+    },
 }
 
 // TCP and DoT connections are pooled (see the `pool` module) and reused across
@@ -220,10 +229,30 @@ pub(super) async fn tls_query(
     Ok(resp)
 }
 
+/// Returns the caller's TLS config with its ALPN list replaced by `http/1.1`.
+///
+/// reqwest is built without `http2`, so hyper-util panics with "http2 feature
+/// is not enabled" on a connection that negotiates `h2`. `use_preconfigured_tls`
+/// passes a config through untouched, so a caller config listing `h2` -- as an
+/// application's own will -- would panic every DoH lookup.
+#[cfg(transport_https)]
+fn https_tls_config(tls_config: &rustls::ClientConfig) -> rustls::ClientConfig {
+    let mut tls_config = tls_config.clone();
+    tls_config.alpn_protocols = vec![b"http/1.1".to_vec()];
+    tls_config
+}
+
 /// Builds a [`reqwest::Client`] for DNS-over-HTTPS queries.
 ///
 /// `resolves` pins each named DoH host to a fixed address, so a hostname-based
 /// DoH URL connects to that IP instead of being resolved recursively.
+///
+/// The redirect, scheme and proxy defaults are all overridden. A DoH query is a
+/// POST, so a 307 replays its body; left at reqwest's defaults the server could
+/// have it re-posted in cleartext to an unpinned host, resolved through the very
+/// system resolver DoH exists to avoid. The environment proxy is ignored for the
+/// same reason -- a proxy resolves the host and picks the address, which is what
+/// `resolves` is here to prevent -- and because no other transport honours it.
 #[cfg(transport_https)]
 pub(super) fn build_https_client(
     tls_config: &Arc<rustls::ClientConfig>,
@@ -232,7 +261,11 @@ pub(super) fn build_https_client(
     // reqwest wraps the argument in an `Option` and downcasts to
     // `Option<rustls::ClientConfig>`, so hand it a bare `ClientConfig` (not the
     // `Arc`), or it rejects it as an unknown backend at build time.
-    let mut builder = reqwest::Client::builder().use_preconfigured_tls((**tls_config).clone());
+    let mut builder = reqwest::Client::builder()
+        .use_preconfigured_tls(https_tls_config(tls_config))
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .no_proxy();
     for (host, addr) in resolves {
         builder = builder.resolve(host, *addr);
     }
@@ -294,7 +327,15 @@ pub(super) async fn https_query(
         .send()
         .await?;
 
-    read_body(response.error_for_status()?).await
+    // `error_for_status` passes a 3xx through, and with redirects off its body
+    // would be read as the answer.
+    let status = response.status();
+    if !status.is_success() {
+        return Err(e!(TransportError::UnexpectedStatus {
+            status: status.as_u16()
+        }));
+    }
+    read_body(response).await
 }
 
 #[cfg(test)]
@@ -314,8 +355,9 @@ mod tests {
     ///
     /// Lets the transport tests compare against a plain `Vec<Ipv4Addr>`.
     fn parse_a_addrs(data: &[u8]) -> (Vec<Ipv4Addr>, u32) {
+        let packet = super::super::query::parse_packet(data).unwrap();
         let (records, ttl) =
-            super::super::query::parse_records(data, crate::RecordKind::A).unwrap();
+            super::super::query::parse_records(&packet, crate::RecordKind::A).unwrap();
         let addrs = records
             .into_iter()
             .filter_map(|r| match r {
@@ -593,5 +635,54 @@ mod tests {
         assert_eq!(resp.len(), UDP_RECV_BUFFER);
         assert!(maybe_truncated);
         handle.await.unwrap();
+    }
+
+    /// A caller TLS config advertising `h2` does not reach the DoH client.
+    #[cfg(transport_https)]
+    #[test]
+    fn https_tls_config_advertises_only_http1() {
+        let mut caller_config =
+            (*crate::DnsResolver::default_tls_config().expect("crypto provider")).clone();
+        caller_config.alpn_protocols = vec![b"h2".to_vec(), b"http/1.1".to_vec()];
+
+        let config = https_tls_config(&caller_config);
+
+        assert_eq!(
+            config.alpn_protocols,
+            vec![b"http/1.1".to_vec()],
+            "h2 must not be offered by a client that cannot speak it"
+        );
+    }
+
+    /// The DoH client refuses cleartext, so a query cannot leave over plain HTTP.
+    ///
+    /// The listener accepting at all means the query reached the wire.
+    #[cfg(transport_https)]
+    #[tokio::test]
+    async fn https_client_refuses_a_cleartext_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (connected_tx, mut connected_rx) = tokio::sync::mpsc::channel(1);
+        let handle = tokio::spawn(async move {
+            if listener.accept().await.is_ok() {
+                let _ = connected_tx.send(()).await;
+            }
+        });
+
+        let tls_config = crate::DnsResolver::default_tls_config().expect("crypto provider");
+        let client = build_https_client(&tls_config, &[]).unwrap();
+        let err = client
+            .post(format!("http://{addr}/dns-query"))
+            .body(b"query".to_vec())
+            .send()
+            .await
+            .expect_err("a cleartext URL should be refused before it is sent");
+
+        assert!(err.is_builder(), "expected a bad-scheme error, got {err:?}");
+        assert!(
+            connected_rx.try_recv().is_err(),
+            "the query reached the listener in cleartext"
+        );
+        handle.abort();
     }
 }

@@ -5,7 +5,10 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
 };
 
-use simple_dns::rdata::{SVCB, SVCParam};
+use simple_dns::{
+    Label,
+    rdata::{SVCB, SVCParam},
+};
 
 /// A DNS record kind the resolver can look up.
 ///
@@ -73,6 +76,26 @@ pub enum Record {
     Https(HttpsRecordData),
 }
 
+impl Record {
+    /// Returns roughly how much memory this record holds, in bytes.
+    ///
+    /// The enum slot plus its heap, as an upper bound: the cache spends this
+    /// against a byte budget, and undercounting would let the bound be evaded.
+    pub(crate) fn approx_bytes(&self) -> usize {
+        let heap = match self {
+            Record::A(_) | Record::Aaaa(_) => 0,
+            Record::Txt(txt) => txt.approx_heap_bytes(),
+            Record::Ns(name) => name.len(),
+            Record::Srv(srv) => srv.target.len(),
+            Record::Mx(mx) => mx.exchange.len(),
+            Record::Caa(caa) => caa.tag.len() + caa.value.len(),
+            Record::Svcb(svcb) => svcb.approx_heap_bytes(),
+            Record::Https(https) => https.approx_heap_bytes(),
+        };
+        size_of::<Record>() + heap
+    }
+}
+
 /// Record data for an SRV record, as defined in [RFC 2782].
 ///
 /// [RFC 2782]: https://datatracker.ietf.org/doc/html/rfc2782
@@ -137,6 +160,41 @@ impl SvcbRecordData {
     /// Lower values are preferred. A priority of 0 marks AliasMode.
     pub fn priority(&self) -> u16 {
         self.0.priority
+    }
+
+    /// Returns roughly how much heap this record holds, in bytes.
+    ///
+    /// Walks the parameters, since one record can carry kilobytes of `ech` or
+    /// unknown-key bytes. `alpn` is charged at the maximum character-string
+    /// length, since `simple_dns` does not expose the real one.
+    fn approx_heap_bytes(&self) -> usize {
+        /// The most a `CharacterString` can hold (RFC 1035).
+        const MAX_CHARACTER_STRING: usize = 255;
+
+        // Each label is a `Cow` in a vector, so the per-label overhead dwarfs a
+        // short label and has to be counted: a compressed name costs two bytes
+        // on the wire and up to 127 of these in memory.
+        let target: usize = self
+            .0
+            .target
+            .as_bytes()
+            .map(|label| label.len() + size_of::<Label<'static>>())
+            .sum();
+        let params: usize = self
+            .0
+            .iter_params()
+            .map(|param| match param {
+                SVCParam::Mandatory(keys) => keys.len() * size_of::<u16>(),
+                SVCParam::Alpn(ids) => ids.len() * MAX_CHARACTER_STRING,
+                SVCParam::Ipv4Hint(ips) => ips.len() * size_of::<u32>(),
+                SVCParam::Ipv6Hint(ips) => ips.len() * size_of::<u128>(),
+                SVCParam::Ech(bytes) => bytes.len(),
+                SVCParam::Unknown(_, bytes) => bytes.len(),
+                _ => 0,
+            })
+            .map(|bytes| bytes + size_of::<SVCParam<'static>>())
+            .sum();
+        target + params
     }
 
     /// Returns the target name.
@@ -266,6 +324,11 @@ impl HttpsRecordData {
     /// The underlying SVCB-format record data, for the raw parameter accessors.
     pub fn svcb(&self) -> &SvcbRecordData {
         &self.data
+    }
+
+    /// Returns roughly how much heap this record holds, in bytes.
+    fn approx_heap_bytes(&self) -> usize {
+        self.owner.len() + self.data.approx_heap_bytes()
     }
 
     /// Returns the `SvcPriority`.
@@ -418,6 +481,15 @@ impl TxtRecordData {
         self.0.iter().map(|x| x.as_ref())
     }
 
+    /// Returns roughly how much heap this record's strings hold, in bytes.
+    ///
+    /// Each string is boxed separately, so the per-box overhead dominates for
+    /// many short strings and has to be counted.
+    fn approx_heap_bytes(&self) -> usize {
+        let strings: usize = self.0.iter().map(|string| string.len()).sum();
+        self.0.len() * size_of::<Box<[u8]>>() + strings
+    }
+
     /// Consumes the record and returns its character strings as boxed byte slices.
     ///
     /// This hands over the backing storage without copying, so a caller that
@@ -466,5 +538,31 @@ impl From<Vec<String>> for TxtRecordData {
                 .map(|s| s.into_bytes().into_boxed_slice())
                 .collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use simple_dns::Name;
+
+    use super::*;
+
+    /// A name is charged per label, not by its wire size.
+    ///
+    /// `simple_dns` keeps a name as a vector of `Cow` labels, so a target that
+    /// is two bytes on the wire, as a compression pointer, can hold 127 of
+    /// them. Undercounting it would let the cache's byte budget be evaded.
+    #[test]
+    fn a_target_name_is_charged_per_label() {
+        let labels = 100;
+        let text = "a.".repeat(labels);
+        let target = Name::new_unchecked(&text);
+        let record = Record::Svcb(SvcbRecordData::new(SVCB::new(1, target).into_owned()));
+
+        assert!(
+            record.approx_bytes() > labels * size_of::<Label<'static>>(),
+            "a {labels}-label target was charged only {} bytes",
+            record.approx_bytes()
+        );
     }
 }
