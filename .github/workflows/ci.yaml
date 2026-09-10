@@ -133,13 +133,22 @@ jobs:
       uses: arqu/setup-ndk@4f8a02c22e2c17ff9ebba9026e599da847aa8374 # main
       id: setup-ndk
       with:
-        ndk-version: r23
+        # Newer than the r23 the build-only job uses. ndk-build filters the
+        # SDK's platforms to the NDK's own NDK_MIN/MAX_PLATFORM_LEVEL, and r23
+        # stops at 31, so it discards the android-33 platform that
+        # `target_sdk_version` asks for and reports none installed at all.
+        ndk-version: r27
         add-to-path: true
 
     - name: Build the APK
       env:
         ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
       run: |
+        # The platform has to sit inside the NDK's range or cargo-apk cannot
+        # see it; print both so a mismatch is legible from the log alone.
+        grep -E 'NDK_(MIN|MAX)_PLATFORM_LEVEL' "$ANDROID_NDK_ROOT/build/core/platforms.mk"
+        ls "$ANDROID_HOME/platforms"
+
         cargo install --locked --version 0.10.0 cargo-apk
         cargo apk build --example android_system_config \
           --target x86_64-linux-android \
