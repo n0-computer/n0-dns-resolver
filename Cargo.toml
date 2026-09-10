@@ -108,6 +108,12 @@ required-features = ["transport-https", "tls-ring"]
 # The same example, packaged for Android. cargo-apk needs a `cdylib`, and an
 # example cannot be both that and a runnable binary, so this is a separate
 # target that compiles the one above as a module.
+# The Android JNI reader needs a real Context, so it is exercised by an app on
+# an emulator rather than a unit test. cargo-apk needs a `cdylib`.
+[[example]]
+name = "android_system_config"
+crate-type = ["cdylib"]
+
 [[example]]
 name = "compare_iroh_lookups_android"
 required-features = ["transport-https", "tls-ring"]

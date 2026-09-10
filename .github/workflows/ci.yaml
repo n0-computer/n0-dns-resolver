@@ -85,6 +85,80 @@ jobs:
         cargo install --locked --version 3.5.4 cargo-ndk
         cargo ndk --target $RUST_TARGET build --locked
 
+  android_emulator:
+    name: Android Emulator
+    # The JNI system-DNS reader needs a real Context, so no unit test reaches
+    # it. This runs the `android_system_config` example on an emulator instead,
+    # once as the emulator comes up and once with Private DNS in strict mode,
+    # and asserts on what the resolver logged.
+    if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
+    timeout-minutes: 45
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # One level, and it has to be 28 or above for the Private DNS setting to
+        # exist. The version guard for older devices is not covered here: the
+        # NativeActivity harness this uses does not start on API 24, so a leg
+        # there would fail for reasons of its own.
+        api-level: [34]
+    steps:
+    - name: Checkout
+      uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+      with:
+        persist-credentials: false
+
+    - name: Set up Rust
+      uses: dtolnay/rust-toolchain@6c977a6ca4077a0ceb28ffbe03f59d46e9ac8772 # v1
+      with:
+        toolchain: stable
+        target: x86_64-linux-android
+
+    - name: Setup Java
+      uses: actions/setup-java@b6effb05e454b25005698d916606bdc6ffcbf961 # v5.7.0
+      with:
+        distribution: 'temurin'
+        java-version: '17'
+
+    - name: Setup Android SDK
+      uses: android-actions/setup-android@9fc6c4e9069bf8d3d10b2204b1fb8f6ef7065407 # v3.2.2
+
+    - name: Setup Android NDK
+      uses: arqu/setup-ndk@4f8a02c22e2c17ff9ebba9026e599da847aa8374 # main
+      id: setup-ndk
+      with:
+        ndk-version: r23
+        add-to-path: true
+
+    - name: Build the APK
+      env:
+        ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+      run: |
+        cargo install --locked --version 0.10.0 cargo-apk
+        cargo apk build --example android_system_config \
+          --target x86_64-linux-android \
+          --features transport-tls,transport-https,tls-ring
+
+    # The emulator needs hardware acceleration to boot in reasonable time.
+    - name: Enable KVM
+      run: |
+        echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+          | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+        sudo udevadm control --reload-rules
+        sudo udevadm trigger --name-match=kvm
+
+    - name: Run on the emulator
+      uses: reactivecircus/android-emulator-runner@a421e43855164a8197daf9d8d40fe71c6996bb0d # v2.38.0
+      env:
+        API_LEVEL: ${{ matrix.api-level }}
+      with:
+        api-level: ${{ matrix.api-level }}
+        arch: x86_64
+        force-avd-creation: false
+        emulator-options: -no-window -gpu swiftshader_indirect -noaudio -no-boot-anim -camera-back none
+        disable-animations: true
+        script: ./.github/scripts/android-emulator-test.sh
+
   check_semver:
     runs-on: ubuntu-latest
     env:
