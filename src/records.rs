@@ -5,7 +5,10 @@ use std::{
     net::{Ipv4Addr, Ipv6Addr},
 };
 
-use simple_dns::rdata::{SVCB, SVCParam};
+use simple_dns::{
+    Label,
+    rdata::{SVCB, SVCParam},
+};
 
 /// A DNS record kind the resolver can look up.
 ///
@@ -168,7 +171,15 @@ impl SvcbRecordData {
         /// The most a `CharacterString` can hold (RFC 1035).
         const MAX_CHARACTER_STRING: usize = 255;
 
-        let target: usize = self.0.target.as_bytes().map(|label| label.len() + 1).sum();
+        // Each label is a `Cow` in a vector, so the per-label overhead dwarfs a
+        // short label and has to be counted: a compressed name costs two bytes
+        // on the wire and up to 127 of these in memory.
+        let target: usize = self
+            .0
+            .target
+            .as_bytes()
+            .map(|label| label.len() + size_of::<Label<'static>>())
+            .sum();
         let params: usize = self
             .0
             .iter_params()
@@ -527,5 +538,31 @@ impl From<Vec<String>> for TxtRecordData {
                 .map(|s| s.into_bytes().into_boxed_slice())
                 .collect(),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use simple_dns::Name;
+
+    use super::*;
+
+    /// A name is charged per label, not by its wire size.
+    ///
+    /// `simple_dns` keeps a name as a vector of `Cow` labels, so a target that
+    /// is two bytes on the wire, as a compression pointer, can hold 127 of
+    /// them. Undercounting it would let the cache's byte budget be evaded.
+    #[test]
+    fn a_target_name_is_charged_per_label() {
+        let labels = 100;
+        let text = "a.".repeat(labels);
+        let target = Name::new_unchecked(&text);
+        let record = Record::Svcb(SvcbRecordData::new(SVCB::new(1, target).into_owned()));
+
+        assert!(
+            record.approx_bytes() > labels * size_of::<Label<'static>>(),
+            "a {labels}-label target was charged only {} bytes",
+            record.approx_bytes()
+        );
     }
 }

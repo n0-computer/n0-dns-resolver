@@ -250,7 +250,9 @@ fn https_tls_config(tls_config: &rustls::ClientConfig) -> rustls::ClientConfig {
 /// The redirect, scheme and proxy defaults are all overridden. A DoH query is a
 /// POST, so a 307 replays its body; left at reqwest's defaults the server could
 /// have it re-posted in cleartext to an unpinned host, resolved through the very
-/// system resolver DoH exists to avoid.
+/// system resolver DoH exists to avoid. The environment proxy is ignored for the
+/// same reason -- a proxy resolves the host and picks the address, which is what
+/// `resolves` is here to prevent -- and because no other transport honours it.
 #[cfg(transport_https)]
 pub(super) fn build_https_client(
     tls_config: &Arc<rustls::ClientConfig>,

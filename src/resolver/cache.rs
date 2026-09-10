@@ -176,8 +176,8 @@ struct Inner {
 
 impl Inner {
     /// Removes `key`, subtracting what it held from the byte total.
-    fn remove(&mut self, key: &u64) {
-        if let Some(entry) = self.entries.pop(key) {
+    fn remove(&mut self, key: u64) {
+        if let Some(entry) = self.entries.pop(&key) {
             self.bytes = self.bytes.saturating_sub(entry.bytes);
         }
     }
@@ -292,7 +292,7 @@ impl DnsCache {
         let mut inner = self.inner.lock().expect("poisoned");
         if bytes > MAX_ENTRY_BYTES {
             // Drop any earlier entry too, rather than serve a stale smaller one.
-            inner.remove(&key);
+            inner.remove(key);
             return;
         }
         let entry = CacheEntry {

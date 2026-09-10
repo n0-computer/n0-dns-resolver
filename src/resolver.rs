@@ -204,7 +204,7 @@ fn is_configuration_error(err: &Error) -> bool {
 /// so it surfaces only as every lookup escalating to the plaintext fallback tier.
 /// Warns rather than errors, since `build` is infallible.
 #[cfg(with_rustls)]
-fn warn_on_unusable_encrypted_nameservers(builder: &Builder, have_tls_config: bool) {
+fn warn_unusable_nameservers(builder: &Builder, have_tls_config: bool) {
     for ns in builder
         .nameservers
         .iter()
@@ -473,7 +473,7 @@ impl DnsResolver {
             .map(|config| Arc::new(config.clone()))
             .or_else(Self::default_tls_config);
         #[cfg(with_rustls)]
-        warn_on_unusable_encrypted_nameservers(&builder, tls_config.is_some());
+        warn_unusable_nameservers(&builder, tls_config.is_some());
         Self {
             #[cfg(with_rustls)]
             tls_config,
@@ -1118,10 +1118,12 @@ impl DnsResolver {
             trace!(%name, ?kind, "resolving");
             let read_answer = |packet: &Packet<'_>| {
                 let parsed = query::parse_records(packet, kind).map_err(Error::from);
-                // RFC 2308, only meaningful for a negative answer.
+                // RFC 2308, only meaningful for a NODATA answer. An NXDOMAIN
+                // never reaches here: `check_response` returns it as an error
+                // before the packet is handed over, so it is cached at the
+                // fixed default TTL rather than the SOA's.
                 let soa = match &parsed {
                     Ok((records, _)) if records.is_empty() => query::negative_ttl(packet),
-                    Err(Error::NxDomain { .. }) => query::negative_ttl(packet),
                     _ => None,
                 };
                 (parsed, soa)

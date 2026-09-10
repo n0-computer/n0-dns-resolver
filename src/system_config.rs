@@ -30,26 +30,20 @@ pub(crate) fn parse_nameserver_addr(text: &str, default_port: u16) -> Option<std
     if let Ok(addr) = text.parse::<SocketAddr>() {
         return Some(addr);
     }
-    // `[addr%zone]:port` with a named zone.
-    if let Some(rest) = text.strip_prefix('[')
-        && let Some((inner, port)) = rest.rsplit_once("]:")
-    {
-        let port = port.parse().ok()?;
-        return parse_nameserver_addr(inner, port);
+    // Strip an `[addr%zone]:port` wrapper, leaving `addr` or `addr%zone`.
+    let (addr, port) = match text.strip_prefix('[').and_then(|r| r.rsplit_once("]:")) {
+        Some((inner, port)) => (inner, port.parse().ok()?),
+        None => (text, default_port),
+    };
+    if let Ok(ip) = addr.parse::<IpAddr>() {
+        return Some(SocketAddr::new(ip, port));
     }
-    // A bare address, or IPv4 with a port.
-    if let Ok(ip) = text.parse::<IpAddr>() {
-        return Some(SocketAddr::new(ip, default_port));
-    }
-    // `addr%zone`.
-    let (ip, zone) = text.split_once('%')?;
-    let ip = ip.parse().ok()?;
-    let scope_id = parse_zone_id(zone)?;
+    let (ip, zone) = addr.split_once('%')?;
     Some(SocketAddr::V6(SocketAddrV6::new(
-        ip,
-        default_port,
+        ip.parse().ok()?,
+        port,
         0,
-        scope_id,
+        parse_zone_id(zone)?,
     )))
 }
 
