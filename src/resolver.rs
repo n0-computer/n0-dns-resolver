@@ -4,15 +4,13 @@
 //! submodules hold the pieces: the cache, the connection pool, the per-server
 //! RTT map, packet construction and parsing, and the transports.
 
-#[cfg(with_rustls)]
-use std::sync::Arc;
 #[cfg(transport_https)]
 use std::sync::Mutex;
 use std::{
     future::Future,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use n0_error::e;
@@ -104,6 +102,14 @@ const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Keeps a long nameserver list from turning every lookup into an N-way fan-out.
 const MAX_CONCURRENT_QUERIES: usize = 3;
+
+/// Maximum number of UDP sockets one resolver holds at once.
+///
+/// A query holds its socket until it is answered or times out, so against a
+/// slow nameserver the sockets held grow with the lookups in flight. Each one
+/// holds an ephemeral port, and a host that runs out of those stalls. Past this
+/// bound a query waits for a socket, and the wait counts against its timeout.
+const MAX_UDP_SOCKETS: usize = 64;
 
 /// Delay before starting the next nameserver attempt.
 ///
@@ -230,6 +236,11 @@ pub struct DnsResolver {
     /// system DNS read blocks on some platforms, and a network change calls
     /// reset, so it waits for the first lookup rather than running eagerly.
     state: OnceLock<ResolverState>,
+    /// Bounds the UDP sockets held at once to [`MAX_UDP_SOCKETS`].
+    ///
+    /// Shared with the resolver [`Self::reset`] produces, so a rebuild does not
+    /// double the bound while queries on the old one finish.
+    udp_sockets: Arc<tokio::sync::Semaphore>,
     /// UDP sockets bound so far, for the tests to count.
     #[cfg(test)]
     udp_sockets_bound: std::sync::atomic::AtomicUsize,
@@ -355,7 +366,11 @@ impl DnsResolver {
 
     /// Builds a resolver from `builder`, used by [`Builder::build`].
     pub(crate) fn from_builder(builder: Builder) -> Self {
-        Self::new_deferred(builder, DnsCache::new())
+        Self::new_deferred(
+            builder,
+            DnsCache::new(),
+            Arc::new(tokio::sync::Semaphore::new(MAX_UDP_SOCKETS)),
+        )
     }
 
     /// Builds a resolver that reads the system DNS configuration lazily.
@@ -363,9 +378,14 @@ impl DnsResolver {
     /// Only cheap, IO-free state is set up here; the nameserver list, search
     /// list, RTT map, and hosts file are built on first use by [`Self::state`].
     /// [`Self::reset`] reuses this to rebuild after a network change while
-    /// carrying the cache across, so lookups keep hitting cached records while
-    /// the new nameservers settle (see issue #4037), without any eager IO.
-    fn new_deferred(builder: Builder, cache: DnsCache) -> Self {
+    /// carrying the cache and the UDP socket bound across, so lookups keep
+    /// hitting cached records while the new nameservers settle (see issue
+    /// #4037), without any eager IO.
+    fn new_deferred(
+        builder: Builder,
+        cache: DnsCache,
+        udp_sockets: Arc<tokio::sync::Semaphore>,
+    ) -> Self {
         // Use the caller's TLS client config, or fall back to one built from the
         // compiled-in crypto provider. When neither is present, DoT/DoH fail with
         // `MissingTlsConfig` rather than reaching for a reqwest/rustls default.
@@ -384,6 +404,7 @@ impl DnsResolver {
             cache,
             builder,
             state: OnceLock::new(),
+            udp_sockets,
             #[cfg(test)]
             udp_sockets_bound: Default::default(),
         }
@@ -674,6 +695,11 @@ impl DnsResolver {
         query_bytes: &[u8],
         retransmit: Duration,
     ) -> Result<(Vec<u8>, Option<Duration>), Error> {
+        let _held = self
+            .udp_sockets
+            .acquire()
+            .await
+            .expect("the UDP socket semaphore is never closed");
         let socket = transport::bind_udp(addr).await?;
         #[cfg(test)]
         self.udp_sockets_bound
@@ -1355,9 +1381,14 @@ impl DnsResolver {
     /// Does no IO: the new resolver re-reads the system DNS configuration lazily
     /// on its first lookup. Carries the cache across so a network change does not
     /// start DNS cold, which would strand reconnects while the new nameservers
-    /// settle (#4037).
+    /// settle (#4037). Carries the UDP socket bound across too, so the old and
+    /// the new resolver hold no more sockets between them than one would.
     pub fn reset(&self) -> Self {
-        Self::new_deferred(self.builder.clone(), self.cache.clone())
+        Self::new_deferred(
+            self.builder.clone(),
+            self.cache.clone(),
+            self.udp_sockets.clone(),
+        )
     }
 }
 
@@ -1368,6 +1399,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
+    use n0_future::{FuturesUnordered, StreamExt};
     use simple_dns::{
         CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, ResourceRecord, TYPE,
         rdata::{A, RData},
@@ -1376,7 +1408,8 @@ mod tests {
     use tracing::info;
 
     use super::{
-        CachedResult, DnsResolver, Hosts, TCP_JOIN_DELAY, UDP_PACED_DATAGRAMS, UDP_RETRANSMIT_MIN,
+        CachedResult, DnsResolver, Hosts, MAX_UDP_SOCKETS, TCP_JOIN_DELAY, UDP_PACED_DATAGRAMS,
+        UDP_RETRANSMIT_MIN,
     };
     use crate::{DnsProtocol, FallbackMode, Nameserver, Record, RecordKind, public_resolvers};
 
@@ -1717,6 +1750,53 @@ mod tests {
         assert!(
             seen.iter().all(|&port| port == seen[0]),
             "datagrams left from ports {seen:?}"
+        );
+    }
+
+    /// A resolver holds a bounded number of UDP sockets however many lookups run.
+    ///
+    /// Each lookup against a silent nameserver keeps its socket until it times
+    /// out, so without a bound the sockets held grow with the lookups.
+    #[tokio::test]
+    async fn concurrent_lookups_hold_a_bounded_number_of_sockets() {
+        const LOOKUPS: usize = 200;
+        let (addr, mut ports, server) = silent_udp_nameserver().await;
+        let resolver = with_proto(addr, DnsProtocol::Udp);
+        let lookups: FuturesUnordered<_> = (0..LOOKUPS)
+            .map(|i| resolver.lookup_ipv4(format!("host{i}.example.com")))
+            .collect();
+
+        let mut distinct = std::collections::HashSet::new();
+        let collect = async {
+            while distinct.len() < MAX_UDP_SOCKETS {
+                distinct.insert(ports.recv().await.unwrap());
+            }
+            // A socket comes free only when its lookup times out, seconds from
+            // now, so no new port may show up in the meantime.
+            let _ = tokio::time::timeout(UDP_RETRANSMIT_MIN, async {
+                while let Some(port) = ports.recv().await {
+                    distinct.insert(port);
+                }
+            })
+            .await;
+        };
+        tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                () = collect => {}
+                done = lookups.collect::<Vec<_>>() => {
+                    panic!("{} lookups ended against a silent nameserver", done.len())
+                }
+            }
+        })
+        .await
+        .expect("the first datagrams go out within a second");
+        server.abort();
+
+        assert_eq!(
+            distinct.len(),
+            MAX_UDP_SOCKETS,
+            "{LOOKUPS} lookups held {} sockets",
+            distinct.len()
         );
     }
 
