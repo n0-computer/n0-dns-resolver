@@ -230,6 +230,9 @@ pub struct DnsResolver {
     /// system DNS read blocks on some platforms, and a network change calls
     /// reset, so it waits for the first lookup rather than running eagerly.
     state: OnceLock<ResolverState>,
+    /// UDP sockets bound so far, for the tests to count.
+    #[cfg(test)]
+    udp_sockets_bound: std::sync::atomic::AtomicUsize,
 }
 
 /// What a resolver derives from its builder and the system configuration.
@@ -381,6 +384,8 @@ impl DnsResolver {
             cache,
             builder,
             state: OnceLock::new(),
+            #[cfg(test)]
+            udp_sockets_bound: Default::default(),
         }
     }
 
@@ -638,22 +643,30 @@ impl DnsResolver {
 
     /// Queries a nameserver over UDP, overlapping retransmits and then TCP.
     ///
-    /// Sends up to [`UDP_DATAGRAMS`] datagrams, each from its own socket and all
-    /// left outstanding, so one that never arrives costs an interval rather than
-    /// a timeout. After [`TCP_JOIN_DELAY`] unanswered a TCP query joins them,
+    /// Sends up to [`UDP_DATAGRAMS`] datagrams from one socket, all left
+    /// outstanding, so one that never arrives costs an interval rather than a
+    /// timeout. After [`TCP_JOIN_DELAY`] unanswered a TCP query joins them,
     /// which is how a lookup survives a network that drops outbound UDP/53 but
     /// permits TCP/53. Whichever answers first wins, and a truncated response
     /// brings TCP in early since the full answer only fits there. Duplicates are
-    /// safe: every datagram carries the same transaction id from a fresh source
-    /// port, and the caller validates the id, the QR bit, and the question.
+    /// safe. Every datagram carries the same transaction id from the same
+    /// source port, and the caller validates the id, the QR bit, and the
+    /// question.
+    ///
+    /// One socket for every datagram keeps the ports a lookup holds at one per
+    /// nameserver. A socket per datagram multiplied them by the retransmit
+    /// count, and many lookups against a slow nameserver then ran the host out
+    /// of ephemeral ports.
     ///
     /// Returns the response, and how long the datagram that carried it was in
-    /// flight, timed from its own send. `None` when TCP answered instead. That
-    /// sample paces the next lookup, so it must not contain the intervals this
-    /// one waited: a sample that did would stretch the next interval, which
-    /// would stretch the next sample.
+    /// flight. That sample paces the next lookup, so it must not contain the
+    /// intervals this one waited. A sample that did would stretch the next
+    /// interval, which would stretch the next sample. Once a second datagram is
+    /// out there is no telling which one an answer belongs to, so the sample is
+    /// only taken while one datagram is out, as Karn's algorithm does for TCP.
+    /// It is `None` otherwise, and when TCP answered.
     ///
-    /// Has no internal deadline; the caller bounds it with
+    /// Has no internal deadline. The caller bounds it with
     /// [`UDP_NAMESERVER_TIMEOUT`].
     async fn udp_query(
         &self,
@@ -661,9 +674,12 @@ impl DnsResolver {
         query_bytes: &[u8],
         retransmit: Duration,
     ) -> Result<(Vec<u8>, Option<Duration>), Error> {
-        // Outstanding datagrams, each carrying the instant it went out. Dropping
-        // the set on return closes their sockets.
-        let mut datagrams = FuturesUnordered::new();
+        let socket = transport::bind_udp(addr).await?;
+        #[cfg(test)]
+        self.udp_sockets_bound
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let recv = MaybeFuture::None;
+        tokio::pin!(recv);
         // Cancelling the TCP query is safe: the pool hands out a connection by
         // removing it and only takes it back on success, so a dropped query
         // closes its connection rather than returning a half-read one.
@@ -679,14 +695,17 @@ impl DnsResolver {
         // wakeup from the TCP side must not spend one early.
         let mut send_due = true;
         let mut last_err = None;
+        // Datagrams sent and not refused.
+        let mut outstanding = 0usize;
+        // Datagrams sent, and when the first of them went out.
+        let mut sent = 0usize;
+        let mut first_sent = Instant::now();
 
         loop {
-            if send_due && sends_left > 0 {
+            while send_due && sends_left > 0 {
+                send_due = false;
                 let nth = UDP_DATAGRAMS - sends_left;
                 trace!(%addr, datagram = nth, ?interval, "sending UDP query");
-                let sent = Instant::now();
-                datagrams
-                    .push(async move { (sent, transport::udp_query(addr, query_bytes).await) });
                 sends_left -= 1;
                 if sends_left > 0 {
                     if UDP_DATAGRAMS - sends_left >= UDP_PACED_DATAGRAMS {
@@ -698,20 +717,42 @@ impl DnsResolver {
                     // the last failure.
                     next_send.as_mut().set_none();
                 }
+                let now = Instant::now();
+                match socket.send_to(query_bytes, addr).await {
+                    Ok(_) => {
+                        if sent == 0 {
+                            first_sent = now;
+                        }
+                        sent += 1;
+                        outstanding += 1;
+                        if recv.is_none() {
+                            recv.as_mut().set_future(transport::recv_udp_answer(
+                                &socket,
+                                addr,
+                                query_bytes,
+                            ));
+                        }
+                    }
+                    Err(err) => {
+                        trace!(%addr, %err, "UDP send failed");
+                        last_err = Some(Error::from(TransportError::from(err)));
+                        // Nothing went out to wait for, so replace it now.
+                        send_due = true;
+                    }
+                }
             }
-            send_due = false;
 
             // Nothing outstanding and nothing left to send, so the rest of the
             // delay cannot produce an answer. This is a server that refuses UDP
             // rather than dropping it, or an interface with no route to it.
-            if datagrams.is_empty() && sends_left == 0 && tcp_due.is_some() {
+            if outstanding == 0 && sends_left == 0 && tcp_due.is_some() {
                 tcp_due.as_mut().set_future(time::sleep(Duration::ZERO));
             }
 
             tokio::select! {
                 biased;
                 // A datagram came back.
-                Some((sent, res)) = datagrams.next(), if !datagrams.is_empty() => match res {
+                res = &mut recv, if recv.is_some() => match res {
                     Ok((resp, maybe_truncated)) if maybe_truncated || query::is_truncated(&resp) => {
                         debug!(%addr, "UDP response truncated, fetching the answer over TCP");
                         // The answer does not fit in a datagram: stop sending
@@ -722,11 +763,23 @@ impl DnsResolver {
                             tcp_due.as_mut().set_future(time::sleep(Duration::ZERO));
                         }
                     }
-                    Ok((resp, _)) => return Ok((resp, Some(sent.elapsed()))),
+                    Ok((resp, _)) => {
+                        let datagram_rtt = (sent == 1).then(|| first_sent.elapsed());
+                        return Ok((resp, datagram_rtt));
+                    }
                     Err(err) => {
-                        trace!(%addr, %err, "UDP query failed");
+                        // A refusal, which Windows reports on the socket. It
+                        // answers one datagram, so replace that one now.
+                        trace!(%addr, %err, "UDP query refused");
                         last_err = Some(Error::from(err));
-                        // Nothing left in flight to wait for, so replace it now.
+                        outstanding = outstanding.saturating_sub(1);
+                        if outstanding > 0 {
+                            recv.as_mut().set_future(transport::recv_udp_answer(
+                                &socket,
+                                addr,
+                                query_bytes,
+                            ));
+                        }
                         send_due = true;
                     }
                 },
@@ -1607,6 +1660,80 @@ mod tests {
         assert!(
             elapsed < TCP_JOIN_DELAY,
             "gave up after {elapsed:?}, expected well inside the {TCP_JOIN_DELAY:?} TCP join delay"
+        );
+    }
+
+    /// Spawns a nameserver that never answers and reports each datagram's source port.
+    ///
+    /// A lookup against it keeps retransmitting for as long as the test lets it.
+    async fn silent_udp_nameserver() -> (
+        SocketAddr,
+        tokio::sync::mpsc::UnboundedReceiver<u16>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let (ports, rx) = tokio::sync::mpsc::unbounded_channel();
+        let handle = tokio::spawn(async move {
+            let mut buf = vec![0u8; 4096];
+            while let Ok((_, peer)) = server.recv_from(&mut buf).await {
+                if ports.send(peer.port()).is_err() {
+                    return;
+                }
+            }
+        });
+        (addr, rx, handle)
+    }
+
+    /// Every datagram a query sends to one nameserver leaves from one socket.
+    ///
+    /// A socket per datagram multiplies the ports a lookup holds by the
+    /// retransmit count. Lookups against a slow nameserver then run the host
+    /// out of ephemeral ports, which on macOS stalls networking system wide.
+    #[tokio::test]
+    async fn retransmits_share_one_socket() {
+        let (addr, mut ports, server) = silent_udp_nameserver().await;
+        let resolver = with_proto(addr, DnsProtocol::Udp);
+
+        let paced_run = async {
+            let mut seen = Vec::new();
+            while seen.len() < UDP_PACED_DATAGRAMS {
+                seen.push(ports.recv().await.unwrap());
+            }
+            seen
+        };
+        let seen = tokio::time::timeout(Duration::from_secs(5), async {
+            tokio::select! {
+                seen = paced_run => seen,
+                res = resolver.lookup_ipv4("example.com") => {
+                    panic!("lookup ended before the paced run went out: {res:?}")
+                }
+            }
+        })
+        .await
+        .expect("the paced run goes out within a second");
+        server.abort();
+
+        assert!(
+            seen.iter().all(|&port| port == seen[0]),
+            "datagrams left from ports {seen:?}"
+        );
+    }
+
+    /// A datagram that cannot be sent is not retried from a fresh socket.
+    ///
+    /// The failure is local, so another socket fails the same way and only
+    /// adds to the ports held. Port 0 is no valid destination, so every send
+    /// fails at once.
+    #[tokio::test]
+    async fn a_failed_send_binds_no_further_sockets() {
+        let resolver = with_proto("127.0.0.1:0".parse().unwrap(), DnsProtocol::Udp);
+        assert!(resolver.lookup_ipv4("example.com").await.is_err());
+        assert_eq!(
+            resolver
+                .udp_sockets_bound
+                .load(std::sync::atomic::Ordering::Relaxed),
+            1
         );
     }
 

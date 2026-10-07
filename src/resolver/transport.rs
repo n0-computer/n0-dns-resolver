@@ -66,8 +66,8 @@ pub enum TransportError {
 // queries, so a DoT handshake is paid once and amortized over repeated
 // lookups to the same nameserver.
 //
-// UDP sockets are intentionally not reused (a new random source port per query
-// helps prevent cache poisoning).
+// A UDP socket is never reused across queries. A new random source port per
+// query helps prevent cache poisoning.
 
 /// UDP receive buffer size.
 ///
@@ -77,30 +77,34 @@ pub enum TransportError {
 /// treated as possibly truncated and also retried over TCP.
 const UDP_RECV_BUFFER: usize = 4096;
 
-/// Sends a DNS query over UDP and reads the response.
+/// Binds the socket a query to the nameserver at `addr` goes out on.
 ///
-/// Each query uses a fresh socket with a random ephemeral source port to
-/// prevent cache poisoning. The socket keeps listening until a datagram arrives
-/// from the nameserver that answers the query (see [`query::answers_query`]);
-/// anything else that reaches the port is logged and ignored, so a spoofed or
-/// stray datagram cannot end the query ahead of the real answer. The caller
-/// bounds the wait with its timeout.
-///
-/// The returned flag is set when the datagram filled the receive buffer and may
-/// be truncated, so the caller can retry over TCP.
-pub(super) async fn udp_query(
-    addr: SocketAddr,
-    query: &[u8],
-) -> Result<(Vec<u8>, bool), TransportError> {
+/// The OS picks a random ephemeral port, so each query gets a fresh source
+/// port. Every retransmit of that query reuses the socket, which leaves one
+/// port per query open for the answer rather than one per datagram.
+pub(super) async fn bind_udp(addr: SocketAddr) -> Result<tokio::net::UdpSocket, TransportError> {
     let unspecified: std::net::IpAddr = if addr.is_ipv6() {
         std::net::Ipv6Addr::UNSPECIFIED.into()
     } else {
         std::net::Ipv4Addr::UNSPECIFIED.into()
     };
-    let bind_addr = SocketAddr::new(unspecified, 0);
-    let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
-    socket.send_to(query, addr).await?;
+    Ok(tokio::net::UdpSocket::bind(SocketAddr::new(unspecified, 0)).await?)
+}
 
+/// Reads datagrams on `socket` until one answers `query`.
+///
+/// Only a datagram from the nameserver at `addr` that answers the query (see
+/// [`query::answers_query`]) is returned. Anything else that reaches the port
+/// is logged and ignored, so a spoofed or stray datagram cannot end the query
+/// ahead of the real answer. The caller bounds the wait with its timeout.
+///
+/// The returned flag is set when the datagram filled the receive buffer and may
+/// be truncated, so the caller can retry over TCP.
+pub(super) async fn recv_udp_answer(
+    socket: &tokio::net::UdpSocket,
+    addr: SocketAddr,
+    query: &[u8],
+) -> Result<(Vec<u8>, bool), TransportError> {
     let mut buf = vec![0u8; UDP_RECV_BUFFER];
     loop {
         let (len, src) = socket.recv_from(&mut buf).await?;
@@ -396,6 +400,13 @@ mod tests {
 
     fn build_query() -> (u16, Vec<u8>) {
         super::super::query::build_query("example.com", TYPE::A).unwrap()
+    }
+
+    /// Sends `query` to `addr` from a fresh socket and reads the answer back.
+    async fn udp_query(addr: SocketAddr, query: &[u8]) -> Result<(Vec<u8>, bool), TransportError> {
+        let socket = bind_udp(addr).await?;
+        socket.send_to(query, addr).await?;
+        recv_udp_answer(&socket, addr, query).await
     }
 
     #[tokio::test]
