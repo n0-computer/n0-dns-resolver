@@ -7,6 +7,11 @@
 //! ndk-glue or android-activity (both do this before `main`) or by an explicit
 //! [`install_android_jni_context`] call.
 //!
+//! `getDnsServers()` returns plaintext servers even when Private DNS is in
+//! strict mode, where Android's own resolver refuses cleartext, so
+//! `getPrivateDnsServerName()` is read alongside it and those addresses are
+//! queried over DoT under that name instead.
+//!
 //! Without an initialized [`ndk_context`] the JNI lookup panics. Debug builds
 //! wrap the call in `std::panic::catch_unwind` so unit tests on Android (where
 //! no Java Virtual Machine (JVM) is in scope) fall back to the resolver's
@@ -22,14 +27,16 @@
 use std::ffi::c_void;
 #[cfg(target_os = "android")]
 use std::{
-    net::{IpAddr, SocketAddr},
+    net::{IpAddr, Ipv6Addr, SocketAddr, SocketAddrV6},
     panic::{AssertUnwindSafe, catch_unwind},
 };
 
+#[cfg(all(target_os = "android", transport_tls))]
+use jni::objects::JObjectArray;
 #[cfg(target_os = "android")]
 use jni::{
-    jni_sig, jni_str,
-    objects::{IntoAuto as _, JByteArray, JList, JObject, JValue},
+    Env, jni_sig, jni_str,
+    objects::{IntoAuto as _, JByteArray, JList, JObject, JString, JValue},
 };
 #[cfg(target_os = "android")]
 use tracing::{trace, warn};
@@ -46,6 +53,133 @@ pub(super) fn read_system_dns() -> Result<Config, std::io::Error> {
             "ndk_context not initialized; call install_android_jni_context",
         )),
     }
+}
+
+/// Converts a `java.net.InetAddress` to a socket address on `port`.
+///
+/// Returns `None` for an address of neither length, which cannot happen for a
+/// real `InetAddress`.
+#[cfg(target_os = "android")]
+fn socket_addr(
+    env: &mut Env<'_>,
+    address: &JObject<'_>,
+    port: u16,
+) -> jni::errors::Result<Option<SocketAddr>> {
+    // https://developer.android.com/reference/java/net/InetAddress#getAddress()
+    let bytes = env
+        .call_method(address, jni_str!("getAddress"), jni_sig!("()[B"), &[])?
+        .l()?;
+    let bytes = env.cast_local::<JByteArray<'_>>(bytes)?;
+    let bytes = env.convert_byte_array(bytes)?;
+
+    Ok(match bytes.len() {
+        4 => {
+            let mut octets = [0u8; 4];
+            octets.copy_from_slice(&bytes);
+            Some(SocketAddr::new(IpAddr::from(octets), port))
+        }
+        16 => {
+            let mut octets = [0u8; 16];
+            octets.copy_from_slice(&bytes);
+            // `getAddress` drops the zone, without which a link-local resolver
+            // is unreachable. Sixteen bytes means an `Inet6Address`, which is
+            // the only subclass with this method.
+            // https://developer.android.com/reference/java/net/Inet6Address#getScopeId()
+            let scope_id = env
+                .call_method(address, jni_str!("getScopeId"), jni_sig!("()I"), &[])?
+                .i()?;
+            Some(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(octets),
+                port,
+                0,
+                scope_id as u32,
+            )))
+        }
+        len => {
+            warn!(len, "ignoring InetAddress of unexpected length");
+            None
+        }
+    })
+}
+
+/// Returns the strict-mode Private DNS hostname, if one is set.
+///
+/// `getPrivateDnsServerName` is API 28, above this crate's minimum of 24, so
+/// the version is checked rather than letting the call fail: a missing method
+/// raises a Java exception, which would abort the whole read and lose the
+/// system nameservers on every device below 28.
+///
+/// https://developer.android.com/reference/android/net/LinkProperties#getPrivateDnsServerName()
+#[cfg(target_os = "android")]
+fn private_dns_name(
+    env: &mut Env<'_>,
+    link_properties: &JObject<'_>,
+) -> jni::errors::Result<Option<String>> {
+    const PRIVATE_DNS_API: i32 = 28;
+
+    let sdk_int = env
+        .get_static_field(
+            jni_str!("android/os/Build$VERSION"),
+            jni_str!("SDK_INT"),
+            jni_sig!("I"),
+        )?
+        .i()?;
+    if sdk_int < PRIVATE_DNS_API {
+        return Ok(None);
+    }
+
+    let name = env
+        .call_method(
+            link_properties,
+            jni_str!("getPrivateDnsServerName"),
+            jni_sig!("()Ljava/lang/String;"),
+            &[],
+        )?
+        .l()?;
+    if name.is_null() {
+        return Ok(None);
+    }
+    Ok(Some(
+        env.cast_local::<JString<'_>>(name)?.try_to_string(env)?,
+    ))
+}
+
+/// Resolves the Private DNS hostname and returns it as DoT nameservers.
+///
+/// The endpoint is a hostname whose addresses are not the link's DHCP servers,
+/// so it has to be resolved. `Network.getAllByName` resolves on this network,
+/// which in strict mode the OS does over DoT, so no bootstrap query leaks.
+///
+/// https://developer.android.com/reference/android/net/Network#getAllByName(java.lang.String)
+#[cfg(all(target_os = "android", transport_tls))]
+fn private_dns_nameservers(
+    env: &mut Env<'_>,
+    network: &JObject<'_>,
+    name: &str,
+) -> jni::errors::Result<Vec<Nameserver>> {
+    let host = env.new_string(name)?;
+    let addresses = env
+        .call_method(
+            network,
+            jni_str!("getAllByName"),
+            jni_sig!("(Ljava/lang/String;)[Ljava/net/InetAddress;"),
+            &[JValue::Object(&host)],
+        )?
+        .l()?;
+    let addresses = env.cast_local::<JObjectArray<'_>>(addresses)?;
+
+    let mut nameservers = Vec::new();
+    for i in 0..addresses.len(env)? {
+        let address = addresses.get_element(env, i)?.auto();
+        if let Some(addr) = socket_addr(env, &address, DnsProtocol::Tls.port())? {
+            nameservers.push(Nameserver::with_server_name(
+                addr,
+                DnsProtocol::Tls,
+                name.to_string(),
+            ));
+        }
+    }
+    Ok(nameservers)
 }
 
 /// Reads the active network's DNS servers through JNI.
@@ -102,35 +236,26 @@ fn read_system_dns_jni() -> Result<Config, std::io::Error> {
 
             let mut nameservers = Vec::<Nameserver>::new();
             while let Some(server) = dns_servers.next(env)? {
-                let server = server.auto();
+                if let Some(addr) = socket_addr(env, &server.auto(), DnsProtocol::Udp.port())? {
+                    nameservers.push(Nameserver::new(addr, DnsProtocol::Udp));
+                }
+            }
 
-                // https://developer.android.com/reference/java/net/InetAddress#getAddress()
-                let ip_bytes_obj = env
-                    .call_method(&server, jni_str!("getAddress"), jni_sig!("()[B"), &[])?
-                    .l()?;
-                let ip_bytes_arr = env.cast_local::<JByteArray<'_>>(ip_bytes_obj)?;
-                let ip_bytes = env.convert_byte_array(ip_bytes_arr)?;
-
-                let ip = match ip_bytes.len() {
-                    4 => {
-                        let mut arr = [0u8; 4];
-                        arr.copy_from_slice(&ip_bytes);
-                        IpAddr::from(arr)
-                    }
-                    16 => {
-                        let mut arr = [0u8; 16];
-                        arr.copy_from_slice(&ip_bytes);
-                        IpAddr::from(arr)
-                    }
-                    _ => {
-                        warn!("Got invalid ip length: {}. Skipping.", ip_bytes.len());
-                        continue;
-                    }
-                };
-                nameservers.push(Nameserver::new(
-                    SocketAddr::new(ip, DnsProtocol::Udp.port()),
-                    DnsProtocol::Udp,
-                ));
+            // In strict mode the servers above are the link's plaintext DHCP or
+            // RA servers, which Android's own resolver refuses to use. The DoT
+            // endpoint is a hostname, and it is not one of them.
+            if let Some(name) = private_dns_name(env, &link_properties)? {
+                trace!(%name, "Private DNS is in strict mode");
+                #[cfg(transport_tls)]
+                {
+                    nameservers = private_dns_nameservers(env, &network, &name)?;
+                }
+                #[cfg(not(transport_tls))]
+                warn!(
+                    %name,
+                    "Private DNS is in strict mode but this build has no DNS-over-TLS \
+                     support, so queries stay in plaintext; enable the transport-tls feature",
+                );
             }
 
             trace!("Got DNS servers: {:?}", nameservers);

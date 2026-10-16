@@ -143,6 +143,10 @@ impl Builder {
     /// Requires the `transport-tls` or `transport-https` feature. Without a
     /// config, DoT/DoH use one built from the crypto provider (`tls-ring` or
     /// `tls-aws-lc-rs`); with neither a config nor a provider, they error.
+    ///
+    /// Used as given except for `alpn_protocols`, which DNS-over-HTTPS replaces
+    /// with `http/1.1`, since its HTTP client is built without HTTP/2 and could
+    /// not speak an `h2` it negotiated. DNS-over-TLS uses the list as given.
     #[cfg(with_rustls)]
     #[must_use]
     pub fn tls_client_config(mut self, config: rustls::ClientConfig) -> Self {
@@ -157,6 +161,9 @@ impl Builder {
     /// upstream outage does not break resolution. This is serve-stale, RFC
     /// 8767. Only positive answers are served stale; an authoritative NXDOMAIN
     /// is never overridden. Off by default.
+    ///
+    /// `max_age` runs from the answer's expiry, not from when it was stored,
+    /// and is not clamped: [`Duration::MAX`] means for as long as it is cached.
     #[must_use]
     pub fn serve_stale(mut self, max_age: Duration) -> Self {
         self.serve_stale = Some(max_age);
@@ -219,6 +226,13 @@ pub enum FallbackMode {
     /// This is the default. The fallback stays a lower-priority second tier
     /// rather than joining the initial race, so a working primary nameserver
     /// always answers first.
+    ///
+    /// "Failed" is any way of not producing an answer: a timeout, a transport
+    /// error, a SERVFAIL, REFUSED or FORMERR, or a configuration fault such as a
+    /// DoT server name that does not match its certificate. So a name a
+    /// corporate resolver refuses by policy is asked of the fallback tier
+    /// instead. Callers needing every query encrypted should make that tier
+    /// encrypted too; [`public_resolvers`] defaults to plaintext UDP.
     #[default]
     Deferred,
 }

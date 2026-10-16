@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::{
     future::Future,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::OnceLock,
 };
@@ -20,8 +20,8 @@ use n0_future::{
     FuturesUnordered, MaybeFuture, StreamExt,
     time::{self, Duration, Instant},
 };
-use simple_dns::TYPE;
-use tracing::{debug, trace};
+use simple_dns::{Packet, TYPE};
+use tracing::{debug, trace, warn};
 
 #[cfg(test)]
 use crate::system_config::Hosts;
@@ -170,11 +170,108 @@ const TCP_JOIN_DELAY: Duration = UDP_RETRANSMIT_MIN.saturating_mul(UDP_PACED_DAT
 /// domains first. See <https://man7.org/linux/man-pages/man5/resolv.conf.5.html>.
 const DEFAULT_NDOTS: usize = 1;
 
+/// Rejects a name whose text form does not map one-to-one onto a wire name.
+///
+/// `simple_dns::Name` drops empty labels, so `localhost..` would reach the wire
+/// as `localhost.` while the localhost rule, hosts override and cache key all
+/// read the string. One trailing dot is the FQDN marker and is kept.
+fn validate_name(name: &str) -> Result<(), Error> {
+    let stripped = name.strip_suffix('.').unwrap_or(name);
+    if stripped.is_empty() || stripped.split('.').any(str::is_empty) {
+        return Err(e!(Error::InvalidName {
+            name: name.to_string()
+        }));
+    }
+    Ok(())
+}
+
+/// Returns whether `err` will repeat on every lookup rather than being transient.
+fn is_configuration_error(err: &Error) -> bool {
+    match err {
+        Error::MissingTlsConfig { .. } => true,
+        #[cfg(transport_tls)]
+        Error::Transport {
+            source: TransportError::InvalidServerName { .. },
+            ..
+        } => true,
+        _ => false,
+    }
+}
+
+/// Warns about DoT and DoH nameservers that cannot succeed as configured.
+///
+/// Such a failure is indistinguishable from a timeout to [`DnsResolver::send_query`],
+/// so it surfaces only as every lookup escalating to the plaintext fallback tier.
+/// Warns rather than errors, since `build` is infallible.
+#[cfg(with_rustls)]
+fn warn_unusable_nameservers(builder: &Builder, have_tls_config: bool) {
+    for ns in builder
+        .nameservers
+        .iter()
+        .chain(&builder.fallback_nameservers)
+    {
+        if let Some(fault) = encrypted_nameserver_fault(ns, have_tls_config) {
+            warn!(
+                addr = %ns.addr,
+                protocol = ?ns.protocol,
+                server_name = ?ns.server_name,
+                "{fault}: this nameserver cannot be queried, and its lookups will fall back \
+                 to the plaintext nameservers",
+            );
+        }
+    }
+}
+
+/// Returns why `ns` can never be queried as configured. Only DoT and DoH can.
+#[cfg(with_rustls)]
+fn encrypted_nameserver_fault(ns: &Nameserver, have_tls_config: bool) -> Option<&'static str> {
+    let encrypted = match ns.protocol {
+        #[cfg(transport_tls)]
+        DnsProtocol::Tls => true,
+        #[cfg(transport_https)]
+        DnsProtocol::Https => true,
+        _ => false,
+    };
+    if !encrypted {
+        return None;
+    }
+    if !have_tls_config {
+        return Some("no TLS client config and no compiled-in crypto provider");
+    }
+    if let Some(name) = ns.server_name.as_deref()
+        && rustls::pki_types::ServerName::try_from(name).is_err()
+    {
+        return Some("the TLS server name is not a valid DNS name");
+    }
+    None
+}
+
+/// Returns whether `name` is an IP address literal rather than a DNS name.
+fn is_ip_literal(name: &str) -> bool {
+    name.parse::<IpAddr>().is_ok()
+}
+
+/// Returns the answer for `name` when it is an IP address literal.
+///
+/// All-numeric labels are valid DNS names, so `192.0.2.1` would otherwise be
+/// queried and search-expanded, which a wildcard search zone can answer. The
+/// literal answers only its own family; `None` means it is not a literal.
+fn ip_literal_records(name: &str, kind: RecordKind) -> Option<Vec<Record>> {
+    let ip: IpAddr = name.parse().ok()?;
+    Some(match (ip, kind) {
+        (IpAddr::V4(ip), RecordKind::A) => vec![Record::A(ip)],
+        (IpAddr::V6(ip), RecordKind::Aaaa) => vec![Record::Aaaa(ip)],
+        _ => Vec::new(),
+    })
+}
+
 /// Returns whether `host` is `localhost` or a name under it.
 ///
 /// RFC 6761 Section 6.3 reserves these to resolve to loopback without a query.
 /// DNS names are case-insensitive, so `foo.LOCALHOST` is one of them too, and
 /// must not go out to a nameserver that could answer it with any address.
+///
+/// Assumes `host` passed [`validate_name`].
 fn is_localhost(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
     host.rsplit('.')
@@ -334,6 +431,9 @@ impl DnsResolver {
     /// equivalent to
     /// `DnsResolver::builder().use_system_config().default_fallback_nameservers().build()`.
     ///
+    /// The public resolvers are queried over plaintext UDP, and a SERVFAIL or
+    /// REFUSED counts as not answering. See [`FallbackMode::Deferred`].
+    ///
     /// Every other configuration goes through [`Self::builder`].
     pub fn system_with_fallback() -> Self {
         Self::builder()
@@ -372,6 +472,8 @@ impl DnsResolver {
             .as_ref()
             .map(|config| Arc::new(config.clone()))
             .or_else(Self::default_tls_config);
+        #[cfg(with_rustls)]
+        warn_unusable_nameservers(&builder, tls_config.is_some());
         Self {
             #[cfg(with_rustls)]
             tls_config,
@@ -800,7 +902,16 @@ impl DnsResolver {
                 if state.primary_count == state.config.nameservers.len() {
                     return Err(primary_err);
                 }
-                debug!(err = %primary_err, "primary nameservers failed, escalating to fallback");
+                // A configuration fault repeats on every lookup, so an
+                // encrypted-only setup is silently answering from plaintext.
+                if is_configuration_error(&primary_err) {
+                    warn!(
+                        err = %primary_err,
+                        "primary nameservers are misconfigured, escalating to fallback",
+                    );
+                } else {
+                    debug!(err = %primary_err, "primary nameservers failed, escalating to fallback");
+                }
                 let fallback: Vec<usize> =
                     (state.primary_count..state.config.nameservers.len()).collect();
                 self.race(&fallback, query_bytes).await
@@ -901,15 +1012,21 @@ impl DnsResolver {
         }
     }
 
-    /// Sends a query, following CNAME chains across responses.
+    /// Sends a query, following CNAME chains across responses, and reads the answer.
     ///
     /// A nameserver that answers with a CNAME but no records of the requested
     /// type has left the chain unresolved, so the target is queried in turn.
-    async fn send_query_following_cnames(
+    ///
+    /// `read_answer` gets the validated packet of the response that ends the
+    /// chain, rather than this returning bytes, so a response is parsed once.
+    /// Parsing is not cheap: `simple_dns` 0.12 does not bound compression
+    /// pointer hops, so a 64 KB ladder costs ~55ms.
+    async fn send_query_following_cnames<T>(
         &self,
         host: String,
         qtype: TYPE,
-    ) -> Result<Vec<u8>, Error> {
+        read_answer: impl Fn(&Packet<'_>) -> T,
+    ) -> Result<T, Error> {
         let mut current_host = host;
         for _ in 0..MAX_CNAME_DEPTH {
             let name = simple_dns::Name::new(&current_host).map_err(|_| {
@@ -928,7 +1045,7 @@ impl DnsResolver {
 
             // The response holds the answer, or has no CNAME to follow.
             let Some(target) = query::unresolved_cname_target(&packet, &name, qtype) else {
-                return Ok(response);
+                return Ok(read_answer(&packet));
             };
             debug!(from = %current_host, to = %target, "following CNAME");
             current_host = target;
@@ -958,6 +1075,12 @@ impl DnsResolver {
         name: String,
         kind: RecordKind,
     ) -> Result<Vec<Record>, Error> {
+        // Both ahead of the cache: the key is the caller's string.
+        validate_name(&name)?;
+        if let Some(records) = ip_literal_records(&name, kind) {
+            trace!(%name, ?kind, "resolved from IP literal");
+            return Ok(records);
+        }
         match self.cache.get(&name, kind) {
             Some(CachedResult::Positive(records)) => {
                 trace!(%name, records = records.len(), ?kind, "cache hit");
@@ -993,22 +1116,23 @@ impl DnsResolver {
         let total = names.len();
         for (i, name) in names.into_iter().enumerate() {
             trace!(%name, ?kind, "resolving");
+            let read_answer = |packet: &Packet<'_>| {
+                let parsed = query::parse_records(packet, kind).map_err(Error::from);
+                // RFC 2308, only meaningful for a NODATA answer. An NXDOMAIN
+                // never reaches here: `check_response` returns it as an error
+                // before the packet is handed over, so it is cached at the
+                // fixed default TTL rather than the SOA's.
+                let soa = match &parsed {
+                    Ok((records, _)) if records.is_empty() => query::negative_ttl(packet),
+                    _ => None,
+                };
+                (parsed, soa)
+            };
             let (res, soa_negative_ttl) = match self
-                .send_query_following_cnames(name.clone(), kind.dns_type())
+                .send_query_following_cnames(name.clone(), kind.dns_type(), read_answer)
                 .await
             {
-                Ok(response) => {
-                    let parsed = query::parse_records(&response, kind).map_err(Error::from);
-                    // Derive the RFC 2308 negative TTL from the authority SOA while
-                    // the response bytes are still in scope; only meaningful for a
-                    // negative answer (empty or NXDOMAIN).
-                    let soa = match &parsed {
-                        Ok((records, _)) if records.is_empty() => query::negative_ttl(&response),
-                        Err(Error::NxDomain { .. }) => query::negative_ttl(&response),
-                        _ => None,
-                    };
-                    (parsed, soa)
-                }
+                Ok(answer) => answer,
                 Err(e) => (Err(e), None),
             };
             match res {
@@ -1104,15 +1228,19 @@ impl DnsResolver {
     /// Looks up the IPv4 (A) records for `name`.
     pub async fn lookup_ipv4(&self, name: impl Into<String>) -> Result<Vec<Ipv4Addr>, Error> {
         let name = name.into();
+        // Ahead of the localhost rule and hosts override, which read the string.
+        validate_name(&name)?;
         // RFC 6761: localhost always resolves to loopback.
         if is_localhost(&name) {
             return Ok(vec![Ipv4Addr::LOCALHOST]);
         }
-        // A hosts-file entry overrides DNS, so check it ahead of the cache.
-        if let Some(addrs) = self
-            .search_names(&name)
-            .iter()
-            .find_map(|name| self.state().config.hosts.lookup_ipv4(name))
+        // A hosts entry overrides DNS, so check it ahead of the cache, but must
+        // not shadow a literal.
+        if !is_ip_literal(&name)
+            && let Some(addrs) = self
+                .search_names(&name)
+                .iter()
+                .find_map(|name| self.state().config.hosts.lookup_ipv4(name))
         {
             trace!(%name, ?addrs, "resolved from hosts file");
             return Ok(addrs);
@@ -1132,15 +1260,16 @@ impl DnsResolver {
     /// Looks up the IPv6 (AAAA) records for `name`.
     pub async fn lookup_ipv6(&self, name: impl Into<String>) -> Result<Vec<Ipv6Addr>, Error> {
         let name = name.into();
+        validate_name(&name)?;
         // RFC 6761: localhost always resolves to loopback.
         if is_localhost(&name) {
             return Ok(vec![Ipv6Addr::LOCALHOST]);
         }
-        // A hosts-file entry overrides DNS, so check it ahead of the cache.
-        if let Some(addrs) = self
-            .search_names(&name)
-            .iter()
-            .find_map(|name| self.state().config.hosts.lookup_ipv6(name))
+        if !is_ip_literal(&name)
+            && let Some(addrs) = self
+                .search_names(&name)
+                .iter()
+                .find_map(|name| self.state().config.hosts.lookup_ipv6(name))
         {
             trace!(%name, ?addrs, "resolved from hosts file");
             return Ok(addrs);
@@ -1663,6 +1792,36 @@ mod tests {
         );
     }
 
+    /// An unbounded serve-stale window does not take the resolver down.
+    ///
+    /// The overflow used to panic under the cache guard, poisoning the mutex,
+    /// after which every lookup for any name panicked at the cache probe.
+    #[tokio::test]
+    async fn serve_stale_with_an_unbounded_window_survives_a_failed_lookup() {
+        let expected = Ipv4Addr::new(203, 0, 113, 7);
+        let resolver = DnsResolver::builder()
+            .serve_stale(Duration::MAX)
+            .nameserver(Nameserver::new(
+                "127.0.0.1:1".parse().unwrap(),
+                DnsProtocol::Tcp,
+            ))
+            .build();
+        resolver.cache.insert_expired(
+            "stale.test",
+            RecordKind::A,
+            CachedResult::Positive(vec![Record::A(expected)]),
+            Duration::from_secs(86_400), // the TTL cap
+            Duration::from_secs(5),
+        );
+
+        assert_eq!(
+            resolver.lookup_ipv4("stale.test").await.unwrap(),
+            [expected]
+        );
+        // Would panic on a poisoned cache.
+        assert!(resolver.lookup_ipv4("other.test").await.is_err());
+    }
+
     /// Serve-stale answers from an expired entry when no nameserver responds.
     ///
     /// RFC 8767: a brief upstream outage returns the stale answer rather than
@@ -1763,6 +1922,264 @@ mod tests {
             .lookup_ipv4("this-domain-does-not-exist.example.invalid")
             .await;
         assert!(err.is_err(), "expected NXDOMAIN, got {err:?}");
+    }
+
+    mod name_validation {
+        use super::{super::validate_name, *};
+        use crate::Error;
+
+        /// The shapes `Name::new` would rewrite.
+        const REWRITTEN: &[&str] = &[
+            "",
+            ".",
+            "..",
+            "localhost..",
+            "foo.localhost..",
+            ".example.com",
+            "relay..example",
+            "example.com..",
+        ];
+
+        #[test]
+        fn empty_labels_are_rejected() {
+            for name in REWRITTEN {
+                assert!(
+                    matches!(validate_name(name), Err(Error::InvalidName { .. })),
+                    "{name:?} should be rejected"
+                );
+            }
+        }
+
+        #[test]
+        fn ordinary_names_and_one_trailing_dot_pass() {
+            for name in [
+                "example.com",
+                "example.com.",
+                "localhost",
+                "localhost.",
+                "a",
+            ] {
+                assert!(validate_name(name).is_ok(), "{name:?} should pass");
+            }
+        }
+
+        /// `localhost..` used to fail the check and reach a nameserver as
+        /// `localhost.`, which could answer it with any address.
+        #[tokio::test]
+        async fn localhost_with_an_empty_label_never_reaches_a_nameserver() {
+            let resolver = empty_resolver();
+            for name in ["localhost..", "foo.localhost.."] {
+                let err = resolver.lookup_ipv4(name).await.unwrap_err();
+                assert!(
+                    matches!(err, Error::InvalidName { .. }),
+                    "{name:?} reached the query path: {err:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn an_empty_label_does_not_bypass_the_hosts_file() {
+            let mut resolver = empty_resolver();
+            resolver.set_hosts(Hosts::from_content("10.0.1.10 relay.example\n"));
+
+            let err = resolver.lookup_ipv4("relay..example").await.unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidName { .. }),
+                "hosts pin was bypassed: {err:?}"
+            );
+        }
+
+        /// `search_names("")` expands to `".example.com"`, which `Name::new`
+        /// used to rewrite to `example.com`.
+        #[tokio::test]
+        async fn the_empty_name_is_not_expanded_to_a_search_domain() {
+            let mut resolver = empty_resolver();
+            resolver.set_search(vec!["example.com".to_string()], 1);
+
+            let err = resolver.lookup_ipv4("").await.unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidName { .. }),
+                "empty name was search-expanded: {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn lookup_record_validates() {
+            let resolver = empty_resolver();
+            let err = resolver
+                .lookup_record("relay..example", RecordKind::Txt)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidName { .. }), "{err:?}");
+        }
+    }
+
+    /// A configuration fault is told apart from a transient failure.
+    mod configuration_errors {
+        use n0_error::e;
+
+        #[cfg(transport_tls)]
+        use super::super::TransportError;
+        use super::super::is_configuration_error;
+        #[cfg(with_rustls)]
+        use super::{DnsProtocol, Nameserver};
+        use crate::Error;
+
+        /// Whichever encrypted transport this build has.
+        #[cfg(transport_tls)]
+        const ENCRYPTED_PROTOCOL: DnsProtocol = DnsProtocol::Tls;
+        #[cfg(all(transport_https, not(transport_tls)))]
+        const ENCRYPTED_PROTOCOL: DnsProtocol = DnsProtocol::Https;
+
+        #[test]
+        fn a_missing_tls_config_is_a_configuration_error() {
+            assert!(is_configuration_error(&e!(Error::MissingTlsConfig)));
+        }
+
+        #[cfg(transport_tls)]
+        #[test]
+        fn an_invalid_server_name_is_a_configuration_error() {
+            let err = e!(Error::Transport {
+                source: e!(TransportError::InvalidServerName {
+                    name: "not a name".to_string(),
+                }),
+            });
+            assert!(is_configuration_error(&err));
+        }
+
+        #[cfg(with_rustls)]
+        #[test]
+        fn an_encrypted_nameserver_without_a_tls_config_is_a_fault() {
+            use super::super::encrypted_nameserver_fault;
+
+            let ns = Nameserver::new("192.0.2.1:853".parse().unwrap(), ENCRYPTED_PROTOCOL);
+            assert!(encrypted_nameserver_fault(&ns, false).is_some());
+            assert!(encrypted_nameserver_fault(&ns, true).is_none());
+
+            let plain = Nameserver::new("192.0.2.1:53".parse().unwrap(), DnsProtocol::Udp);
+            assert!(encrypted_nameserver_fault(&plain, false).is_none());
+        }
+
+        #[cfg(with_rustls)]
+        #[test]
+        fn an_unparsable_server_name_is_a_fault() {
+            use super::super::encrypted_nameserver_fault;
+
+            let bad = Nameserver::with_server_name(
+                "192.0.2.1:853".parse().unwrap(),
+                ENCRYPTED_PROTOCOL,
+                "not a valid name",
+            );
+            assert!(encrypted_nameserver_fault(&bad, true).is_some());
+
+            let good = Nameserver::with_server_name(
+                "192.0.2.1:853".parse().unwrap(),
+                ENCRYPTED_PROTOCOL,
+                "dns.example",
+            );
+            assert!(encrypted_nameserver_fault(&good, true).is_none());
+        }
+
+        #[test]
+        fn transient_failures_are_not_configuration_errors() {
+            for err in [
+                e!(Error::Timeout),
+                e!(Error::NoResponse),
+                e!(Error::InvalidResponse),
+                e!(Error::ServerError {
+                    code: crate::ResponseCode::ServerFailure,
+                }),
+            ] {
+                assert!(!is_configuration_error(&err), "{err:?}");
+            }
+        }
+    }
+
+    mod ip_literals {
+        use super::*;
+        use crate::Error;
+
+        /// No nameservers, so reaching the query path gives `NoNameservers`.
+        fn resolver() -> DnsResolver {
+            let mut resolver = empty_resolver();
+            resolver.set_search(vec!["example.com".to_string()], 1);
+            resolver
+        }
+
+        #[tokio::test]
+        async fn a_literal_resolves_to_itself_without_a_query() {
+            let resolver = resolver();
+
+            assert_eq!(
+                resolver.lookup_ipv4("192.0.2.1").await.unwrap(),
+                [Ipv4Addr::new(192, 0, 2, 1)]
+            );
+            assert_eq!(
+                resolver.lookup_ipv6("2001:db8::1").await.unwrap(),
+                ["2001:db8::1".parse::<Ipv6Addr>().unwrap()]
+            );
+            assert_eq!(
+                resolver.lookup_ipv4("127.0.0.1").await.unwrap(),
+                [Ipv4Addr::LOCALHOST]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_literal_has_no_records_of_the_other_family() {
+            let resolver = resolver();
+
+            assert!(resolver.lookup_ipv6("192.0.2.1").await.unwrap().is_empty());
+            assert!(
+                resolver
+                    .lookup_ipv4("2001:db8::1")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn lookup_record_short_circuits_a_literal() {
+            let resolver = resolver();
+
+            assert_eq!(
+                resolver
+                    .lookup_record("192.0.2.1", RecordKind::A)
+                    .await
+                    .unwrap(),
+                [Record::A(Ipv4Addr::new(192, 0, 2, 1))]
+            );
+            assert!(
+                resolver
+                    .lookup_record("192.0.2.1", RecordKind::Txt)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn the_hosts_file_does_not_shadow_a_literal() {
+            let mut resolver = resolver();
+            resolver.set_hosts(Hosts::from_content("10.0.0.1 192.0.2.1\n"));
+
+            assert_eq!(
+                resolver.lookup_ipv4("192.0.2.1").await.unwrap(),
+                [Ipv4Addr::new(192, 0, 2, 1)]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_non_literal_still_goes_to_the_nameservers() {
+            let resolver = resolver();
+
+            // Out of range for an octet, so not an address.
+            let err = resolver.lookup_ipv4("192.0.2.999").await.unwrap_err();
+            assert!(matches!(err, Error::NoNameservers { .. }), "{err:?}");
+
+            let err = resolver.lookup_ipv4("192.0.2.1.").await.unwrap_err();
+            assert!(matches!(err, Error::NoNameservers { .. }), "{err:?}");
+        }
     }
 
     mod search_names {
