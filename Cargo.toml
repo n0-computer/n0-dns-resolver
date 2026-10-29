@@ -23,7 +23,7 @@ unused-async = "warn"
 
 [dependencies]
 derive_more = { version = "2.0.1", features = ["display"] }
-lru = "0.18.0"
+lru = "0.19.0"
 n0-error = "1.0.0"
 n0-future = "0.3"
 rand = "0.10"
