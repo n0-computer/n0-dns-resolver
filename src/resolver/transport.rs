@@ -5,7 +5,10 @@ use std::sync::Arc;
 use std::{io, net::SocketAddr};
 
 use n0_error::{e, stack_error};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::UdpSocket,
+};
 use tracing::debug;
 
 use super::{pool::ConnPool, query};
@@ -77,10 +80,9 @@ pub enum TransportError {
 /// treated as possibly truncated and also retried over TCP.
 const UDP_RECV_BUFFER: usize = 4096;
 
-/// Sends a DNS query over UDP and reads the response.
+/// One UDP socket for a nameserver attempt and all of its retransmissions.
 ///
-/// Each query uses a fresh socket with a random ephemeral source port to
-/// prevent cache poisoning. The socket keeps listening until a datagram arrives
+/// A new attempt binds a new ephemeral port. The socket keeps listening until a datagram arrives
 /// from the nameserver that answers the query (see [`query::answers_query`]);
 /// anything else that reaches the port is logged and ignored, so a spoofed or
 /// stray datagram cannot end the query ahead of the real answer. The caller
@@ -88,38 +90,58 @@ const UDP_RECV_BUFFER: usize = 4096;
 ///
 /// The returned flag is set when the datagram filled the receive buffer and may
 /// be truncated, so the caller can retry over TCP.
-pub(super) async fn udp_query(
-    addr: SocketAddr,
-    query: &[u8],
-) -> Result<(Vec<u8>, bool), TransportError> {
-    let unspecified: std::net::IpAddr = if addr.is_ipv6() {
-        std::net::Ipv6Addr::UNSPECIFIED.into()
-    } else {
-        std::net::Ipv4Addr::UNSPECIFIED.into()
-    };
-    let bind_addr = SocketAddr::new(unspecified, 0);
-    let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
-    socket.send_to(query, addr).await?;
+pub(super) struct UdpQuery {
+    socket: UdpSocket,
+}
 
-    let mut buf = vec![0u8; UDP_RECV_BUFFER];
-    loop {
-        let (len, src) = socket.recv_from(&mut buf).await?;
-        if src != addr {
-            debug!(%addr, %src, "ignoring UDP datagram from an unexpected source");
-            continue;
-        }
-        if !query::answers_query(&buf[..len], query) {
-            debug!(%addr, len, "ignoring UDP datagram that does not answer the query");
-            continue;
-        }
-        // A datagram that fills the whole buffer may have been truncated at the
-        // socket by a sender that ignored our advertised EDNS payload size. The
-        // DNS TC bit only covers server-side truncation, so flag this separately
-        // and let the caller retry over TCP rather than parse a partial message.
-        let maybe_truncated = len == buf.len();
-        buf.truncate(len);
-        return Ok((buf, maybe_truncated));
+impl UdpQuery {
+    pub(super) async fn new(addr: SocketAddr) -> Result<Self, TransportError> {
+        let unspecified: std::net::IpAddr = if addr.is_ipv6() {
+            std::net::Ipv6Addr::UNSPECIFIED.into()
+        } else {
+            std::net::Ipv4Addr::UNSPECIFIED.into()
+        };
+        let socket = UdpSocket::bind(SocketAddr::new(unspecified, 0)).await?;
+        Ok(Self { socket })
     }
+
+    pub(super) async fn send(&self, addr: SocketAddr, query: &[u8]) -> Result<(), TransportError> {
+        self.socket.send_to(query, addr).await?;
+        Ok(())
+    }
+
+    pub(super) async fn recv(
+        &self,
+        addr: SocketAddr,
+        query: &[u8],
+    ) -> Result<(Vec<u8>, bool), TransportError> {
+        let mut buf = vec![0u8; UDP_RECV_BUFFER];
+        loop {
+            let (len, src) = self.socket.recv_from(&mut buf).await?;
+            if src != addr {
+                debug!(%addr, %src, "ignoring UDP datagram from an unexpected source");
+                continue;
+            }
+            if !query::answers_query(&buf[..len], query) {
+                debug!(%addr, len, "ignoring UDP datagram that does not answer the query");
+                continue;
+            }
+            // A datagram that fills the whole buffer may have been truncated at the
+            // socket by a sender that ignored our advertised EDNS payload size. The
+            // DNS TC bit only covers server-side truncation, so flag this separately
+            // and let the caller retry over TCP rather than parse a partial message.
+            let maybe_truncated = len == buf.len();
+            buf.truncate(len);
+            return Ok((buf, maybe_truncated));
+        }
+    }
+}
+
+#[cfg(test)]
+async fn udp_query(addr: SocketAddr, query: &[u8]) -> Result<(Vec<u8>, bool), TransportError> {
+    let socket = UdpQuery::new(addr).await?;
+    socket.send(addr, query).await?;
+    socket.recv(addr, query).await
 }
 
 /// Sends a length-prefixed DNS query on an established stream and reads the reply.

@@ -4,15 +4,13 @@
 //! submodules hold the pieces: the cache, the connection pool, the per-server
 //! RTT map, packet construction and parsing, and the transports.
 
-#[cfg(with_rustls)]
-use std::sync::Arc;
 #[cfg(transport_https)]
 use std::sync::Mutex;
 use std::{
     future::Future,
     net::{Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use n0_error::e;
@@ -21,6 +19,7 @@ use n0_future::{
     time::{self, Duration, Instant},
 };
 use simple_dns::TYPE;
+use tokio::sync::Semaphore;
 use tracing::{debug, trace};
 
 #[cfg(test)]
@@ -105,6 +104,9 @@ const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 /// Keeps a long nameserver list from turning every lookup into an N-way fan-out.
 const MAX_CONCURRENT_QUERIES: usize = 3;
 
+/// Maximum number of UDP sockets this resolver can open at once.
+const MAX_CONCURRENT_UDP_ATTEMPTS: usize = 64;
+
 /// Delay before starting the next nameserver attempt.
 ///
 /// Gives faster servers a head start without blasting the whole list at once,
@@ -118,8 +120,8 @@ const QUERY_ATTEMPT_DELAY: Duration = Duration::from_millis(100);
 /// before, so the last lands around five seconds in. Stopping after the paced
 /// run left UDP silent for most of [`UDP_NAMESERVER_TIMEOUT`], resting on a TCP
 /// query that on a lossy link is the weaker of the two. The later datagrams cost
-/// nothing when they are not needed, since an answer over either transport drops
-/// the whole set.
+/// nothing when they are not needed, since an answer over either transport ends
+/// the attempt.
 const UDP_DATAGRAMS: usize = 6;
 
 /// Number of UDP datagrams sent before the interval starts doubling.
@@ -214,6 +216,8 @@ pub struct DnsResolver {
     https_client: Mutex<Option<reqwest::Client>>,
     /// Pooled TCP/DoT connections, reused across queries.
     conn_pool: ConnPool,
+    /// Bounds UDP sockets across all concurrent lookups on this resolver.
+    udp_slots: Arc<Semaphore>,
     /// Cached positive and negative answers.
     ///
     /// Shared with the resolver [`Self::reset`] produces, so a network change
@@ -352,7 +356,11 @@ impl DnsResolver {
 
     /// Builds a resolver from `builder`, used by [`Builder::build`].
     pub(crate) fn from_builder(builder: Builder) -> Self {
-        Self::new_deferred(builder, DnsCache::new())
+        Self::new_deferred(
+            builder,
+            DnsCache::new(),
+            Arc::new(Semaphore::new(MAX_CONCURRENT_UDP_ATTEMPTS)),
+        )
     }
 
     /// Builds a resolver that reads the system DNS configuration lazily.
@@ -362,7 +370,7 @@ impl DnsResolver {
     /// [`Self::reset`] reuses this to rebuild after a network change while
     /// carrying the cache across, so lookups keep hitting cached records while
     /// the new nameservers settle (see issue #4037), without any eager IO.
-    fn new_deferred(builder: Builder, cache: DnsCache) -> Self {
+    fn new_deferred(builder: Builder, cache: DnsCache, udp_slots: Arc<Semaphore>) -> Self {
         // Use the caller's TLS client config, or fall back to one built from the
         // compiled-in crypto provider. When neither is present, DoT/DoH fail with
         // `MissingTlsConfig` rather than reaching for a reqwest/rustls default.
@@ -378,6 +386,7 @@ impl DnsResolver {
             #[cfg(transport_https)]
             https_client: Mutex::new(None),
             conn_pool: ConnPool::new(),
+            udp_slots,
             cache,
             builder,
             state: OnceLock::new(),
@@ -591,10 +600,11 @@ impl DnsResolver {
         // Only UDP has a datagram round trip to report; the rest send one query.
         let resp = match ns.protocol {
             DnsProtocol::Udp => {
-                return time::timeout(
-                    UDP_NAMESERVER_TIMEOUT,
-                    self.udp_query(addr, query_bytes, retransmit),
-                )
+                return time::timeout(UDP_NAMESERVER_TIMEOUT, async {
+                    // Waiting for a socket counts against the attempt deadline.
+                    let _slot = self.udp_slots.acquire().await.expect("UDP budget is open");
+                    self.udp_query(addr, query_bytes, retransmit).await
+                })
                 .await
                 .map_err(|_| e!(Error::Timeout))?;
             }
@@ -638,20 +648,18 @@ impl DnsResolver {
 
     /// Queries a nameserver over UDP, overlapping retransmits and then TCP.
     ///
-    /// Sends up to [`UDP_DATAGRAMS`] datagrams, each from its own socket and all
-    /// left outstanding, so one that never arrives costs an interval rather than
-    /// a timeout. After [`TCP_JOIN_DELAY`] unanswered a TCP query joins them,
+    /// Sends up to [`UDP_DATAGRAMS`] datagrams from one socket. The receive loop
+    /// stays active across retransmissions, so a lost datagram costs an interval
+    /// rather than a timeout. After [`TCP_JOIN_DELAY`] unanswered TCP joins them,
     /// which is how a lookup survives a network that drops outbound UDP/53 but
     /// permits TCP/53. Whichever answers first wins, and a truncated response
     /// brings TCP in early since the full answer only fits there. Duplicates are
-    /// safe: every datagram carries the same transaction id from a fresh source
-    /// port, and the caller validates the id, the QR bit, and the question.
+    /// safe: every datagram carries the same transaction id from this attempt's
+    /// source port, and the caller validates the id, the QR bit, and the question.
     ///
-    /// Returns the response, and how long the datagram that carried it was in
-    /// flight, timed from its own send. `None` when TCP answered instead. That
-    /// sample paces the next lookup, so it must not contain the intervals this
-    /// one waited: a sample that did would stretch the next interval, which
-    /// would stretch the next sample.
+    /// Returns a UDP RTT only when the first datagram answers before a
+    /// retransmission. Once retransmitted, the matching reply cannot be
+    /// attributed to a particular send, so `None` avoids a misleading sample.
     ///
     /// Has no internal deadline; the caller bounds it with
     /// [`UDP_NAMESERVER_TIMEOUT`].
@@ -661,9 +669,10 @@ impl DnsResolver {
         query_bytes: &[u8],
         retransmit: Duration,
     ) -> Result<(Vec<u8>, Option<Duration>), Error> {
-        // Outstanding datagrams, each carrying the instant it went out. Dropping
-        // the set on return closes their sockets.
-        let mut datagrams = FuturesUnordered::new();
+        let udp = transport::UdpQuery::new(addr).await.map_err(Error::from)?;
+        // A retransmitted reply cannot be matched to a particular send.
+        let mut first_sent = None;
+        let mut waiting_for_reply = false;
         // Cancelling the TCP query is safe: the pool hands out a connection by
         // removing it and only takes it back on success, so a dropped query
         // closes its connection rather than returning a half-read one.
@@ -684,9 +693,22 @@ impl DnsResolver {
             if send_due && sends_left > 0 {
                 let nth = UDP_DATAGRAMS - sends_left;
                 trace!(%addr, datagram = nth, ?interval, "sending UDP query");
-                let sent = Instant::now();
-                datagrams
-                    .push(async move { (sent, transport::udp_query(addr, query_bytes).await) });
+                if sends_left == UDP_DATAGRAMS {
+                    first_sent = Some(Instant::now());
+                } else {
+                    first_sent = None;
+                }
+                match udp.send(addr, query_bytes).await {
+                    Ok(()) => waiting_for_reply = true,
+                    Err(err) => {
+                        trace!(%addr, %err, "UDP send failed");
+                        last_err = Some(Error::from(err));
+                        if !waiting_for_reply {
+                            // A socket that cannot send should not spend the TCP join delay.
+                            sends_left = 1;
+                        }
+                    }
+                }
                 sends_left -= 1;
                 if sends_left > 0 {
                     if UDP_DATAGRAMS - sends_left >= UDP_PACED_DATAGRAMS {
@@ -704,14 +726,14 @@ impl DnsResolver {
             // Nothing outstanding and nothing left to send, so the rest of the
             // delay cannot produce an answer. This is a server that refuses UDP
             // rather than dropping it, or an interface with no route to it.
-            if datagrams.is_empty() && sends_left == 0 && tcp_due.is_some() {
+            if !waiting_for_reply && sends_left == 0 && tcp_due.is_some() {
                 tcp_due.as_mut().set_future(time::sleep(Duration::ZERO));
             }
 
             tokio::select! {
                 biased;
                 // A datagram came back.
-                Some((sent, res)) = datagrams.next(), if !datagrams.is_empty() => match res {
+                res = udp.recv(addr, query_bytes), if waiting_for_reply => match res {
                     Ok((resp, maybe_truncated)) if maybe_truncated || query::is_truncated(&resp) => {
                         debug!(%addr, "UDP response truncated, fetching the answer over TCP");
                         // The answer does not fit in a datagram: stop sending
@@ -722,11 +744,11 @@ impl DnsResolver {
                             tcp_due.as_mut().set_future(time::sleep(Duration::ZERO));
                         }
                     }
-                    Ok((resp, _)) => return Ok((resp, Some(sent.elapsed()))),
+                    Ok((resp, _)) => return Ok((resp, first_sent.map(|sent| sent.elapsed()))),
                     Err(err) => {
                         trace!(%addr, %err, "UDP query failed");
                         last_err = Some(Error::from(err));
-                        // Nothing left in flight to wait for, so replace it now.
+                        waiting_for_reply = false;
                         send_due = true;
                     }
                 },
@@ -742,8 +764,7 @@ impl DnsResolver {
                 () = &mut next_send, if next_send.is_some() => send_due = true,
                 // Time to bring TCP in.
                 () = &mut tcp_due, if tcp_due.is_some() => {
-                    // The datagrams may be in flight rather than lost, so they
-                    // keep their sockets and TCP races them.
+                    // UDP may still be in flight, so TCP races its receive loop.
                     debug!(%addr, "UDP unanswered, joining with TCP");
                     tcp.as_mut().set_future(transport::tcp_query(
                         &self.conn_pool,
@@ -1304,7 +1325,11 @@ impl DnsResolver {
     /// start DNS cold, which would strand reconnects while the new nameservers
     /// settle (#4037).
     pub fn reset(&self) -> Self {
-        Self::new_deferred(self.builder.clone(), self.cache.clone())
+        Self::new_deferred(
+            self.builder.clone(),
+            self.cache.clone(),
+            self.udp_slots.clone(),
+        )
     }
 }
 
@@ -1387,8 +1412,7 @@ mod tests {
 
     /// Spawns a nameserver that swallows `losses` datagrams and answers the next.
     ///
-    /// Asserts along the way that every datagram of a run reuses the first one's
-    /// transaction id, which is what makes duplicates safe.
+    /// Asserts that retransmissions reuse the transaction id and source port.
     async fn udp_nameserver_losing(
         mut losses: usize,
         answer: Ipv4Addr,
@@ -1398,6 +1422,7 @@ mod tests {
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
             let mut first_id = None;
+            let mut first_peer = None;
             loop {
                 let (len, peer) = server.recv_from(&mut buf).await.unwrap();
                 let id = Packet::parse(&buf[..len]).unwrap().id();
@@ -1405,6 +1430,11 @@ mod tests {
                     id,
                     *first_id.get_or_insert(id),
                     "a retransmit reuses the transaction id"
+                );
+                assert_eq!(
+                    peer,
+                    *first_peer.get_or_insert(peer),
+                    "a retransmit reuses the source port"
                 );
                 if losses == 0 {
                     server.send_to(&a_reply(id, answer), peer).await.unwrap();
@@ -1525,6 +1555,57 @@ mod tests {
             "recovery took {elapsed:?}, expected about {UDP_RETRANSMIT_MIN:?}"
         );
         handle.await.unwrap();
+    }
+
+    /// Concurrent lookups share a UDP socket budget rather than each opening
+    /// their own full set of nameserver attempts.
+    #[tokio::test]
+    async fn udp_attempt_waits_for_a_socket_slot() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let mut resolver = with_proto(addr, DnsProtocol::Udp);
+        resolver.udp_slots = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+        let resolver = std::sync::Arc::new(resolver);
+        let first = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.lookup_ipv4("example.com").await })
+        };
+        let mut buf = [0u8; 4096];
+        let (len, first_peer) =
+            tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+                .await
+                .expect("first lookup did not send UDP")
+                .unwrap();
+        let first_id = Packet::parse(&buf[..len]).unwrap().id();
+
+        let second = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.lookup_ipv4("example.com").await })
+        };
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), server.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "second lookup sent UDP while the only slot was occupied"
+        );
+
+        let answer = Ipv4Addr::new(198, 51, 100, 42);
+        server
+            .send_to(&a_reply(first_id, answer), first_peer)
+            .await
+            .unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), [answer]);
+        let (len, second_peer) =
+            tokio::time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+                .await
+                .expect("second lookup did not send UDP after the slot was released")
+                .unwrap();
+        let second_id = Packet::parse(&buf[..len]).unwrap().id();
+        server
+            .send_to(&a_reply(second_id, answer), second_peer)
+            .await
+            .unwrap();
+        assert_eq!(second.await.unwrap().unwrap(), [answer]);
     }
 
     /// A prompt UDP answer cancels the scheduled TCP fallback before it dials.
