@@ -594,4 +594,62 @@ mod tests {
         assert!(maybe_truncated);
         handle.await.unwrap();
     }
+
+    #[cfg(all(transport_https, transport_tls, with_crypto_provider))]
+    #[tokio::test]
+    #[ignore = "ANT-2026-JFJZMRZH"]
+    async fn https_query_does_not_follow_a_redirect() {
+        let bystander = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bystander_addr = bystander.local_addr().unwrap();
+        let doh = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let doh_addr = doh.local_addr().unwrap();
+
+        let key = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
+        let cert = key.cert.der().clone();
+        let provider = crate::DnsResolver::default_tls_config()
+            .unwrap()
+            .crypto_provider()
+            .clone();
+        let server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_no_client_auth()
+            .with_single_cert(
+                vec![cert.clone()],
+                rustls::pki_types::PrivatePkcs8KeyDer::from(key.signing_key.serialize_der()).into(),
+            )
+            .unwrap();
+        let mut roots = rustls::RootCertStore::empty();
+        roots.add(cert).unwrap();
+        let client_config = rustls::ClientConfig::builder_with_provider(provider)
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth();
+        let client = build_https_client(&Arc::new(client_config), &[]).unwrap();
+
+        let (_, query) = build_query();
+        let expected = query.clone();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        let server = tokio::spawn(async move {
+            let (stream, _) = doh.accept().await.unwrap();
+            let mut stream = acceptor.accept(stream).await.unwrap();
+            let mut request = Vec::new();
+            while !request.ends_with(&expected) {
+                assert_ne!(stream.read_buf(&mut request).await.unwrap(), 0);
+            }
+            let response = format!(
+                "HTTP/1.1 307 Temporary Redirect\r\nlocation: https://{bystander_addr}/admin\r\ncontent-length: 0\r\n\r\n"
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            stream.shutdown().await.unwrap();
+        });
+
+        let did_follow_redirect = tokio::select! {
+            _ = https_query(doh_addr, None, &query, &client) => false,
+            _ = bystander.accept() => true,
+        };
+        assert!(!did_follow_redirect);
+        server.await.unwrap();
+    }
 }
