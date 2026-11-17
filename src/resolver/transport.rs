@@ -47,6 +47,13 @@ pub enum TransportError {
         #[error(from)]
         source: reqwest::Error,
     },
+    /// A DNS-over-HTTPS server answered with a status other than 2xx.
+    #[cfg(transport_https)]
+    #[error("DNS-over-HTTPS server returned HTTP status {status}")]
+    UnexpectedStatus {
+        /// The status code the server returned.
+        status: u16,
+    },
     /// The DNS-over-HTTPS client could not be constructed.
     #[cfg(transport_https)]
     #[error("failed to build HTTPS client")]
@@ -232,7 +239,9 @@ pub(super) fn build_https_client(
     // reqwest wraps the argument in an `Option` and downcasts to
     // `Option<rustls::ClientConfig>`, so hand it a bare `ClientConfig` (not the
     // `Arc`), or it rejects it as an unknown backend at build time.
-    let mut builder = reqwest::Client::builder().use_preconfigured_tls((**tls_config).clone());
+    let mut builder = reqwest::Client::builder()
+        .use_preconfigured_tls((**tls_config).clone())
+        .redirect(reqwest::redirect::Policy::none());
     for (host, addr) in resolves {
         builder = builder.resolve(host, *addr);
     }
@@ -294,7 +303,13 @@ pub(super) async fn https_query(
         .send()
         .await?;
 
-    read_body(response.error_for_status()?).await
+    let response = response.error_for_status()?;
+
+    if !response.status().is_success() {
+        let status = response.status().as_u16();
+        return Err(e!(TransportError::UnexpectedStatus { status }));
+    }
+    read_body(response).await
 }
 
 #[cfg(test)]
@@ -597,7 +612,6 @@ mod tests {
 
     #[cfg(all(transport_https, transport_tls, with_crypto_provider))]
     #[tokio::test]
-    #[ignore = "ANT-2026-JFJZMRZH"]
     async fn https_query_does_not_follow_a_redirect() {
         let bystander = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let bystander_addr = bystander.local_addr().unwrap();
