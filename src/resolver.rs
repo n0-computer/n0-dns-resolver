@@ -22,7 +22,7 @@ use n0_future::{
     time::{self, Duration, Instant},
 };
 use simple_dns::{Packet, TYPE};
-use tracing::{debug, trace};
+use tracing::{debug, trace, warn};
 
 #[cfg(test)]
 use crate::system_config::Hosts;
@@ -791,17 +791,17 @@ impl DnsResolver {
 
     /// Queries a nameserver over UDP, overlapping retransmits and then TCP.
     ///
-    /// Sends up to [`UDP_DATAGRAMS`] datagrams from one socket. The receive loop
-    /// stays active across retransmissions, so a lost datagram costs an interval
-    /// rather than a timeout. After [`TCP_JOIN_DELAY`] unanswered TCP joins them,
+    /// Sends up to [`UDP_DATAGRAMS`] datagrams from one socket, all left
+    /// outstanding, so one that never arrives costs an interval rather than a
+    /// timeout. After [`TCP_JOIN_DELAY`] unanswered a TCP query joins them,
     /// which is how a lookup survives a network that drops outbound UDP/53 but
     /// permits TCP/53. Whichever answers first wins, and a truncated response
     /// brings TCP in early since the full answer only fits there. Duplicates are
     /// safe: every datagram carries its own transaction id from this attempt's
     /// source port (see [`transport::UdpQuery`]), and the caller validates the
-    /// id, the QR bit, and the question. A socket that cannot be bound sends the
-    /// query over TCP at once, so running out of descriptors can still be
-    /// answered on a pooled connection.
+    /// id, the QR bit, and the question. If no socket can be bound, the query goes
+    /// over TCP at once, so a resolver out of file descriptors can still answer on
+    /// a pooled connection.
     ///
     /// Returns the response, and how long the datagram that carried it was in
     /// flight, timed from its own send. `None` when TCP answered instead. That
@@ -820,7 +820,7 @@ impl DnsResolver {
         let mut udp = match transport::UdpQuery::bind(addr, query_bytes).await {
             Ok(udp) => udp,
             Err(err) => {
-                debug!(%addr, %err, "UDP bind failed, querying over TCP");
+                warn!(%addr, %err, "UDP bind failed, querying over TCP");
                 let resp = transport::tcp_query(&self.conn_pool, addr, query_bytes).await?;
                 return Ok((resp, None));
             }
@@ -851,13 +851,11 @@ impl DnsResolver {
                     Err(err) => {
                         trace!(%addr, %err, "UDP send failed");
                         last_err = Some(Error::from(err));
-                        if !waiting_for_reply {
-                            // A socket that cannot send should not spend the TCP join delay.
-                            sends_left = 1;
-                        }
                     }
                 }
-                sends_left -= 1;
+                // With nothing in flight, a socket that cannot send gives up on
+                // UDP rather than spend the TCP join delay.
+                sends_left = if waiting_for_reply { sends_left - 1 } else { 0 };
                 if sends_left > 0 {
                     if UDP_DATAGRAMS - sends_left >= UDP_PACED_DATAGRAMS {
                         interval *= 2;
@@ -912,7 +910,8 @@ impl DnsResolver {
                 () = &mut next_send, if next_send.is_some() => send_due = true,
                 // Time to bring TCP in.
                 () = &mut tcp_due, if tcp_due.is_some() => {
-                    // UDP may still be in flight, so TCP races its receive loop.
+                    // The datagrams may be in flight rather than lost, so TCP
+                    // races them.
                     debug!(%addr, "UDP unanswered, joining with TCP");
                     tcp.as_mut().set_future(transport::tcp_query(
                         &self.conn_pool,
@@ -1501,7 +1500,6 @@ impl DnsResolver {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
-        sync::Arc,
         time::{Duration, Instant},
     };
 
@@ -1741,28 +1739,23 @@ mod tests {
         handle.await.unwrap();
     }
 
-    /// A reply to the first datagram, arriving after a retransmit, is timed from
-    /// the first datagram's send.
+    /// A late reply to the first datagram is timed from that datagram's send.
     ///
-    /// Without that, a server slower than the retransmit interval never yields
-    /// a sample, and its interval stays at the floor for good.
+    /// The reply arrives after a retransmit went out. Without the timing, a
+    /// server slower than the retransmit interval never yields a sample, and its
+    /// interval stays at the floor for good.
     #[tokio::test]
     async fn late_reply_is_timed_from_its_own_send() {
         let delay = UDP_RETRANSMIT_MIN + Duration::from_millis(150);
         let answer = Ipv4Addr::new(198, 51, 100, 7);
-        let server = Arc::new(tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap());
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
         let addr = server.local_addr().unwrap();
         let handle = tokio::spawn(async move {
             let mut buf = vec![0u8; 4096];
-            loop {
-                let (len, peer) = server.recv_from(&mut buf).await.unwrap();
-                let id = Packet::parse(&buf[..len]).unwrap().id();
-                let server = server.clone();
-                tokio::spawn(async move {
-                    tokio::time::sleep(delay).await;
-                    server.send_to(&a_reply(id, answer), peer).await.ok();
-                });
-            }
+            let (len, peer) = server.recv_from(&mut buf).await.unwrap();
+            let id = Packet::parse(&buf[..len]).unwrap().id();
+            tokio::time::sleep(delay).await;
+            server.send_to(&a_reply(id, answer), peer).await.unwrap();
         });
 
         let resolver = with_proto(addr, DnsProtocol::Udp);
@@ -1771,7 +1764,7 @@ mod tests {
             .udp_query(addr, &query, UDP_RETRANSMIT_MIN)
             .await
             .unwrap();
-        handle.abort();
+        handle.await.unwrap();
 
         let rtt = rtt.expect("the answering datagram has a round trip");
         assert!(
