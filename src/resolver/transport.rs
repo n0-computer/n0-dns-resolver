@@ -47,13 +47,6 @@ pub enum TransportError {
         #[error(from)]
         source: reqwest::Error,
     },
-    /// A DNS-over-HTTPS server answered with a status other than 2xx.
-    #[cfg(transport_https)]
-    #[error("DNS-over-HTTPS server returned HTTP status {status}")]
-    UnexpectedStatus {
-        /// The status code the server returned.
-        status: u16,
-    },
     /// The DNS-over-HTTPS client could not be constructed.
     #[cfg(transport_https)]
     #[error("failed to build HTTPS client")]
@@ -67,6 +60,13 @@ pub enum TransportError {
     #[cfg(transport_https)]
     #[error("DNS-over-HTTPS response body exceeds {MAX_HTTPS_BODY} bytes")]
     ResponseTooLarge {},
+    /// A DNS-over-HTTPS server answered with a status other than 2xx.
+    #[cfg(transport_https)]
+    #[error("DNS-over-HTTPS server returned HTTP status {status}")]
+    UnexpectedStatus {
+        /// The status code the server returned.
+        status: u16,
+    },
 }
 
 // TCP and DoT connections are pooled (see the `pool` module) and reused across
