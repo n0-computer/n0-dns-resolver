@@ -244,6 +244,10 @@ fn https_tls_config(tls_config: &rustls::ClientConfig) -> rustls::ClientConfig {
 ///
 /// `resolves` pins each named DoH host to a fixed address, so a hostname-based
 /// DoH URL connects to that IP instead of being resolved recursively.
+///
+/// Only `https` is spoken, and the environment proxy is ignored: a proxy
+/// resolves the host and picks the address, which is what `resolves` is here to
+/// prevent, and no other transport honours it.
 #[cfg(transport_https)]
 pub(super) fn build_https_client(
     tls_config: &Arc<rustls::ClientConfig>,
@@ -254,7 +258,9 @@ pub(super) fn build_https_client(
     // `Arc`), or it rejects it as an unknown backend at build time.
     let mut builder = reqwest::Client::builder()
         .use_preconfigured_tls(https_tls_config(tls_config))
-        .redirect(reqwest::redirect::Policy::none());
+        .redirect(reqwest::redirect::Policy::none())
+        .https_only(true)
+        .no_proxy();
     for (host, addr) in resolves {
         builder = builder.resolve(host, *addr);
     }
@@ -639,6 +645,38 @@ mod tests {
             vec![b"http/1.1".to_vec()],
             "h2 must not be offered by a client that cannot speak it"
         );
+    }
+
+    /// The DoH client refuses cleartext, so a query cannot leave over plain HTTP.
+    ///
+    /// The listener accepting at all means the query reached the wire.
+    #[cfg(transport_https)]
+    #[tokio::test]
+    async fn https_client_refuses_a_cleartext_url() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (connected_tx, mut connected_rx) = tokio::sync::mpsc::channel(1);
+        let handle = tokio::spawn(async move {
+            if listener.accept().await.is_ok() {
+                let _ = connected_tx.send(()).await;
+            }
+        });
+
+        let tls_config = crate::DnsResolver::default_tls_config().expect("crypto provider");
+        let client = build_https_client(&tls_config, &[]).unwrap();
+        let err = client
+            .post(format!("http://{addr}/dns-query"))
+            .body(b"query".to_vec())
+            .send()
+            .await
+            .expect_err("a cleartext URL should be refused before it is sent");
+
+        assert!(err.is_builder(), "expected a bad-scheme error, got {err:?}");
+        assert!(
+            connected_rx.try_recv().is_err(),
+            "the query reached the listener in cleartext"
+        );
+        handle.abort();
     }
 
     #[cfg(all(transport_https, transport_tls, with_crypto_provider))]
