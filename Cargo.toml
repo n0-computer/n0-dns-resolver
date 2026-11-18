@@ -66,6 +66,7 @@ http = "1"
 iroh-base = { version = "1.0.3", default-features = false, features = ["key"] }
 tokio = { version = "1", features = ["macros", "rt"] }
 tracing-subscriber = "0.3.23"
+rcgen = "0.14"
 
 [package.metadata.docs.rs]
 all-features = true
