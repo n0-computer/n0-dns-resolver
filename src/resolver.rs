@@ -21,7 +21,7 @@ use n0_future::{
     time::{self, Duration, Instant},
 };
 use simple_dns::TYPE;
-use tracing::{debug, trace, warn};
+use tracing::{debug, trace};
 
 #[cfg(test)]
 use crate::system_config::Hosts;
@@ -667,7 +667,7 @@ impl DnsResolver {
         let mut udp = match transport::UdpQuery::bind(addr, query_bytes).await {
             Ok(udp) => udp,
             Err(err) => {
-                warn!(%addr, %err, "UDP bind failed, querying over TCP");
+                debug!(%addr, %err, "UDP bind failed, querying over TCP");
                 let resp = transport::tcp_query(&self.conn_pool, addr, query_bytes).await?;
                 return Ok((resp, None));
             }
