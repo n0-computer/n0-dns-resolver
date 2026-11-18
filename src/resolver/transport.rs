@@ -96,6 +96,7 @@ const UDP_RECV_BUFFER: usize = 4096;
 /// reaches the port is logged and ignored, so a spoofed or stray datagram
 /// cannot end the query ahead of the real answer. The caller bounds the wait
 /// with its timeout.
+#[derive(Debug)]
 pub(super) struct UdpQuery {
     socket: UdpSocket,
     /// The nameserver queried.
@@ -109,11 +110,11 @@ pub(super) struct UdpQuery {
 }
 
 /// A datagram that answers one of the sends of a [`UdpQuery`].
+#[derive(Debug)]
 pub(super) struct UdpReply {
     /// The response, with its transaction id restored to the query's.
     pub(super) response: Vec<u8>,
-    /// Set when the datagram filled the receive buffer and may be truncated,
-    /// so the caller can retry over TCP.
+    /// Whether the datagram filled the receive buffer and may be truncated.
     pub(super) maybe_truncated: bool,
     /// Time since the datagram this one answers was sent.
     pub(super) rtt: Duration,
@@ -210,14 +211,6 @@ impl UdpQuery {
 /// Reads the transaction id from the first two bytes of a DNS message.
 fn transaction_id(message: &[u8]) -> Option<u16> {
     message.first_chunk().map(|&id| u16::from_be_bytes(id))
-}
-
-#[cfg(test)]
-async fn udp_query(addr: SocketAddr, query: &[u8]) -> Result<(Vec<u8>, bool), TransportError> {
-    let mut udp = UdpQuery::bind(addr, query).await?;
-    udp.send().await?;
-    let reply = udp.recv().await?;
-    Ok((reply.response, reply.maybe_truncated))
 }
 
 /// Sends a length-prefixed DNS query on an established stream and reads the reply.
@@ -415,6 +408,14 @@ mod tests {
 
     use super::*;
     use crate::Record;
+
+    /// Sends `query` in a single datagram and waits for the answer.
+    async fn udp_query(addr: SocketAddr, query: &[u8]) -> Result<(Vec<u8>, bool), TransportError> {
+        let mut udp = UdpQuery::bind(addr, query).await?;
+        udp.send().await?;
+        let reply = udp.recv().await?;
+        Ok((reply.response, reply.maybe_truncated))
+    }
 
     /// Parses a response down to its A record addresses and TTL.
     ///
