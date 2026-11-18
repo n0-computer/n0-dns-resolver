@@ -1,6 +1,6 @@
 [package]
 name = "n0-dns-resolver"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 readme = "README.md"
 description = "A small async DNS stub resolver built on simple-dns, used by iroh."

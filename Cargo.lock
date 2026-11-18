@@ -1194,7 +1194,7 @@ dependencies = [
 
 [[package]]
 name = "n0-dns-resolver"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "android-activity",
  "derive_more",
