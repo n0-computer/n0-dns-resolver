@@ -73,13 +73,6 @@ pub enum TransportError {
     },
 }
 
-// TCP and DoT connections are pooled (see the `pool` module) and reused across
-// queries, so a DoT handshake is paid once and amortized over repeated
-// lookups to the same nameserver.
-//
-// UDP sockets are not reused across nameserver attempts: each attempt binds a
-// new random source port, which helps prevent cache poisoning.
-
 /// UDP receive buffer size.
 ///
 /// Well above the advertised EDNS(0) payload of 1232 bytes, so a compliant
@@ -90,11 +83,13 @@ const UDP_RECV_BUFFER: usize = 4096;
 
 /// One UDP socket for a nameserver attempt and all of its retransmissions.
 ///
-/// A new attempt binds a new ephemeral port. Each datagram carries its own
-/// transaction id: the first keeps the query's, and every retransmission draws
-/// a fresh random one. A reply can then be matched to the send it answers and
-/// timed from it, as it could when each datagram had its own socket, and an
-/// off-path attacker still faces one valid id and port pair per datagram.
+/// Each attempt binds a new random source port, which helps prevent cache
+/// poisoning, so sockets are never reused across attempts. Each datagram
+/// carries its own transaction id: the first keeps the query's, and every
+/// retransmission draws a fresh random one. A reply can then be matched to the
+/// send it answers and timed from it, as it could when each datagram had its
+/// own socket, and an off-path attacker still faces one valid id and port pair
+/// per datagram.
 ///
 /// The socket keeps listening until a datagram arrives from the nameserver that
 /// answers one of the sends (see [`query::answers_query`]); anything else that
