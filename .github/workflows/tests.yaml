@@ -64,12 +64,12 @@ jobs:
         ref: ${{ inputs.git-ref }}
 
     - name: Install ${{ matrix.rust }} rust
-      uses: dtolnay/rust-toolchain@e2a55d2ffb04f378e9626c28d38b36d230d1e12f # v1
+      uses: dtolnay/rust-toolchain@df2a88e9fe4098bad09cb42c3dec7187f15861fc # v1
       with:
         toolchain: ${{ matrix.rust }}
 
     - name: Install cargo-nextest
-      uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2.87.26
+      uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
       with:
         tool: nextest@${{ env.NEXTEST_VERSION }}
 
@@ -199,7 +199,7 @@ jobs:
       uses: ilammy/setup-nasm@72793074d3c8cdda771dba85f6deafe00623038b # v1.5.2
 
     - name: Install cmake
-      uses: lukka/get-cmake@a89e43e22a96abafcd7a62db652a65ecd33052c9 # v4.4.4
+      uses: lukka/get-cmake@f86dd60acae0d132056913e248bdabf0e0580b7a # v4.4.5
 
     - name: Select features
       run: |
