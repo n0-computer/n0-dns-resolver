@@ -65,19 +65,187 @@ const MIN_RECORD_LEN: usize = 1 + 2 + 2 + 4 + 2;
 /// first record. The counts are checked against the smallest wire form of a
 /// question and a record first, so a message can only make the parser reserve
 /// what its own length could hold.
+///
+/// Compression lets many short pointers expand to one long name each, so a
+/// message that would decode to more than [`MAX_DECODED_NAME_STEPS`] labels
+/// and pointers is rejected before it is parsed.
 pub(super) fn parse_packet(data: &[u8]) -> Result<Packet<'_>, QueryError> {
-    if data.len() < DNS_HEADER_LEN {
-        return Err(e!(QueryError::Malformed));
-    }
-    let questions = usize::from(header_buffer::questions_unchecked(data));
-    let records = usize::from(header_buffer::answers_unchecked(data))
-        + usize::from(header_buffer::name_servers_unchecked(data))
-        + usize::from(header_buffer::additional_records_unchecked(data));
-    let min_len = DNS_HEADER_LEN + questions * MIN_QUESTION_LEN + records * MIN_RECORD_LEN;
-    if data.len() < min_len {
+    // TODO: remove this pre-scan once simple-dns limits name decoding itself.
+    if decoded_name_steps(data, MAX_DECODED_NAME_STEPS).is_none() {
         return Err(e!(QueryError::Malformed));
     }
     Packet::parse(data).map_err(|_| e!(QueryError::Malformed))
+}
+
+/// Most labels and compression pointers a message may make the parser decode.
+///
+/// This is a resolver resource limit. Even a valid response can exceed it.
+/// For example, 4,000 A records pointing to a four-label question name take
+/// 20,004 steps. With an eight-label name the same answer takes 36,008.
+const MAX_DECODED_NAME_STEPS: usize = 32_768;
+
+/// Most bytes in a name as `simple_dns` counts them, exclusive.
+///
+/// Each label adds its length plus one, and `simple_dns` rejects a name once
+/// the sum reaches this.
+const MAX_NAME_WIRE_LEN: usize = 255;
+
+/// Longest label `simple_dns` accepts.
+const MAX_LABEL_LEN: usize = 63;
+
+/// Counts the labels and compression pointers `Packet::parse` decodes from `data`.
+///
+/// Walks the message without allocating, including the names inside rdata.
+/// Returns `None` if the count exceeds `limit` or the message is malformed.
+fn decoded_name_steps(data: &[u8], limit: usize) -> Option<usize> {
+    let header = data.get(..DNS_HEADER_LEN)?;
+    let questions = usize::from(header_buffer::questions_unchecked(header));
+    let records = usize::from(header_buffer::answers_unchecked(header))
+        + usize::from(header_buffer::name_servers_unchecked(header))
+        + usize::from(header_buffer::additional_records_unchecked(header));
+    if data.len() < DNS_HEADER_LEN + questions * MIN_QUESTION_LEN + records * MIN_RECORD_LEN {
+        return None;
+    }
+    let mut remaining = limit;
+    let mut pos = DNS_HEADER_LEN;
+    for _ in 0..questions {
+        pos = name_steps(data, pos, &mut remaining)?;
+        // QTYPE and QCLASS.
+        pos += 4;
+        if pos > data.len() {
+            return None;
+        }
+    }
+    for _ in 0..records {
+        pos = name_steps(data, pos, &mut remaining)?;
+        // TYPE, CLASS, TTL, and RDLENGTH.
+        let fixed = data.get(pos..pos + 10)?;
+        let rtype = TYPE::from(u16::from_be_bytes([fixed[0], fixed[1]]));
+        let rdlength = usize::from(u16::from_be_bytes([fixed[8], fixed[9]]));
+        let start = pos + 10;
+        pos = start + rdlength;
+        // `simple_dns` reads rdata from a buffer that ends with it, but its
+        // compression pointers may still reach back into the whole message.
+        let rdata = data.get(..pos)?;
+        if rdlength > 0 {
+            rdata_name_steps(rdata, start, rtype, &mut remaining)?;
+        }
+    }
+    Some(limit - remaining)
+}
+
+/// Counts the steps of the names in one record's rdata.
+///
+/// `data` ends where the rdata ends. The arms must cover every type that
+/// `simple_dns` 0.13 decodes a name in, or that type's names bypass the limit.
+fn rdata_name_steps(data: &[u8], start: usize, rtype: TYPE, remaining: &mut usize) -> Option<()> {
+    match rtype {
+        TYPE::CNAME
+        | TYPE::NS
+        | TYPE::PTR
+        | TYPE::MB
+        | TYPE::MD
+        | TYPE::MF
+        | TYPE::MG
+        | TYPE::MR
+        | TYPE::NSAP_PTR
+        | TYPE::NSEC => {
+            name_steps(data, start, remaining)?;
+        }
+        TYPE::MINFO | TYPE::RP | TYPE::SOA => {
+            let next = name_steps(data, start, remaining)?;
+            name_steps(data, next, remaining)?;
+        }
+        // A preference, subtype, or priority before the name.
+        TYPE::MX | TYPE::AFSDB | TYPE::RouteThrough | TYPE::KX | TYPE::SVCB | TYPE::HTTPS => {
+            name_steps(data, start + 2, remaining)?;
+        }
+        // Priority, weight, and port before the target.
+        TYPE::SRV => {
+            name_steps(data, start + 6, remaining)?;
+        }
+        // Type covered, algorithm, labels, original TTL, expiration,
+        // inception, and key tag before the signer's name.
+        TYPE::RRSIG => {
+            name_steps(data, start + 18, remaining)?;
+        }
+        // Order and preference, then three character-strings before the
+        // replacement name.
+        TYPE::NAPTR => {
+            let mut pos = start + 4;
+            for _ in 0..3 {
+                pos += 1 + usize::from(*data.get(pos)?);
+            }
+            name_steps(data, pos, remaining)?;
+        }
+        // Precedence, gateway type, and algorithm. Gateway type 3 is a name.
+        TYPE::IPSECKEY => {
+            if *data.get(start + 1)? == 3 {
+                name_steps(data, start + 3, remaining)?;
+            }
+        }
+        // These payloads are opaque or contain no names in simple_dns 0.13.
+        TYPE::Unknown(_)
+        | TYPE::NULL
+        | TYPE::A
+        | TYPE::AAAA
+        | TYPE::HINFO
+        | TYPE::TXT
+        | TYPE::WKS
+        | TYPE::ISDN
+        | TYPE::NSAP
+        | TYPE::LOC
+        | TYPE::OPT
+        | TYPE::CAA
+        | TYPE::EUI48
+        | TYPE::EUI64
+        | TYPE::CERT
+        | TYPE::ZONEMD
+        | TYPE::DNSKEY
+        | TYPE::DS
+        | TYPE::DHCID => {}
+        // TYPE is non-exhaustive. Review new typed decoders before admitting
+        // their payloads through the work limit.
+        _ => return None,
+    }
+    Some(())
+}
+
+/// Counts the steps of the name at `pos` and returns the position after it.
+///
+/// Each label and each pointer takes one step from `remaining`. Applies the
+/// checks `simple_dns` applies: a pointer must point backwards, and label and
+/// name lengths are capped. Returns `None` if `remaining` runs out or the name
+/// is malformed.
+fn name_steps(data: &[u8], mut pos: usize, remaining: &mut usize) -> Option<usize> {
+    // Where the name ends in the message, set at the first pointer.
+    let mut end = None;
+    let mut name_len = 0;
+    loop {
+        let len = *data.get(pos)?;
+        if len == 0 {
+            return Some(end.unwrap_or(pos + 1));
+        }
+        *remaining = remaining.checked_sub(1)?;
+        if len & 0xC0 == 0xC0 {
+            let target = usize::from(u16::from_be_bytes([len & 0x3F, *data.get(pos + 1)?]));
+            if target >= pos {
+                return None;
+            }
+            end.get_or_insert(pos + 2);
+            pos = target;
+            continue;
+        }
+        let len = usize::from(len);
+        name_len += 1 + len;
+        if name_len >= MAX_NAME_WIRE_LEN || len > MAX_LABEL_LEN {
+            return None;
+        }
+        pos += 1 + len;
+        if pos > data.len() {
+            return None;
+        }
+    }
 }
 
 /// EDNS(0) advertised UDP payload size.
@@ -514,7 +682,7 @@ mod tests {
 
     use simple_dns::{
         CLASS, CharacterString, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, ResourceRecord,
-        rdata::{A, CAA, CNAME, MX, RData, SRV, TXT},
+        rdata::{A, CAA, CNAME, MINFO, MX, RData, SOA, SRV, TXT},
     };
 
     use super::*;
@@ -1176,6 +1344,120 @@ mod tests {
         ));
     }
 
+    /// A pointer ladder is rejected before parsing, though it holds one label.
+    #[test]
+    fn parse_packet_rejects_a_pointer_ladder() {
+        let (message, _) = pointer_ladder_response(16 * 1024, 64 * 1024);
+        assert!(matches!(
+            parse_packet(&message),
+            Err(QueryError::Malformed { .. })
+        ));
+    }
+
+    /// A message of thousands of compressed long names is rejected before parsing.
+    #[test]
+    fn parse_packet_rejects_thousands_of_compressed_long_names() {
+        let labels = "a.".repeat(120);
+        let name = Name::new_unchecked(&labels);
+        let mut response = Packet::new_reply(1);
+        response.questions.push(Question::new(
+            name.clone(),
+            QTYPE::TYPE(TYPE::MINFO),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        for _ in 0..4000 {
+            response.answers.push(ResourceRecord::new(
+                name.clone(),
+                CLASS::IN,
+                0,
+                RData::MINFO(MINFO {
+                    rmailbox: name.clone(),
+                    emailbox: name.clone(),
+                }),
+            ));
+        }
+        let message = response.build_bytes_vec_compressed().unwrap();
+        assert!(message.len() <= usize::from(u16::MAX));
+
+        let parsed = parse_packet(&message);
+        assert!(
+            matches!(parsed, Err(QueryError::Malformed { .. })),
+            "a {}-byte message parsed into {} records of 120-label names",
+            message.len(),
+            parsed.map_or(0, |packet| packet.answers.len())
+        );
+    }
+
+    /// A full-size answer of A records with compressed owner names still parses.
+    #[test]
+    fn parse_packet_accepts_a_large_compressed_a_answer() {
+        let name = Name::new_unchecked("relay.eu.iroh.example");
+        let mut response = Packet::new_reply(1);
+        response.questions.push(Question::new(
+            name.clone(),
+            QTYPE::TYPE(TYPE::A),
+            QCLASS::CLASS(CLASS::IN),
+            false,
+        ));
+        for address in 0..4000 {
+            response.answers.push(ResourceRecord::new(
+                name.clone(),
+                CLASS::IN,
+                60,
+                RData::A(A { address }),
+            ));
+        }
+        let message = response.build_bytes_vec_compressed().unwrap();
+        assert!(message.len() <= usize::from(u16::MAX));
+
+        let packet = parse_packet(&message).unwrap();
+        assert_eq!(packet.answers.len(), 4000);
+    }
+
+    /// Names inside SOA rdata are counted, not only owner names.
+    #[test]
+    fn decoded_name_steps_counts_names_in_rdata() {
+        let name = Name::new_unchecked("a.b.c.example");
+        let mut response = Packet::new_reply(1);
+        response.answers.push(ResourceRecord::new(
+            Name::new_unchecked("example"),
+            CLASS::IN,
+            60,
+            RData::SOA(SOA {
+                mname: name.clone(),
+                rname: name,
+                serial: 1,
+                refresh: 1,
+                retry: 1,
+                expire: 1,
+                minimum: 1,
+            }),
+        ));
+        let message = response.build_bytes_vec().unwrap();
+
+        // One label for the owner, and four each for mname and rname.
+        assert_eq!(decoded_name_steps(&message, usize::MAX), Some(9));
+        assert_eq!(decoded_name_steps(&message, 8), None);
+    }
+
+    /// A pointer loop or a name cut short ends the walk without a panic.
+    #[test]
+    fn decoded_name_steps_rejects_loops_and_truncation() {
+        let mut header = vec![0u8; DNS_HEADER_LEN];
+        // One question.
+        header[5] = 1;
+
+        let mut looped = header.clone();
+        // A pointer to itself.
+        looped.extend_from_slice(&[0xC0, DNS_HEADER_LEN as u8, 0, 1, 0, 1]);
+        assert_eq!(decoded_name_steps(&looped, usize::MAX), None);
+
+        let mut truncated = header;
+        truncated.extend_from_slice(&[5, b'a', b'b']);
+        assert_eq!(decoded_name_steps(&truncated, usize::MAX), None);
+    }
+
     /// The header-peek helpers must not panic on a short buffer.
     ///
     /// They run on raw, unvalidated bytes before the response is checked.
@@ -1682,7 +1964,7 @@ mod tests {
 
         let outcome = match parsed {
             Ok(_) => "walked the whole ladder",
-            Err(_) => "rejected it (the hop cap is in place)",
+            Err(_) => "rejected it",
         };
         println!(
             "{} bytes, {count} records: {outcome} in {elapsed:?}",
