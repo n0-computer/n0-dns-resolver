@@ -2319,6 +2319,63 @@ mod tests {
         assert!(survived, "cache entry should survive reset, got {cached:?}");
     }
 
+    /// Many large answers stay within the cache's byte limit.
+    #[tokio::test]
+    async fn cache_holds_large_answers_within_its_byte_limit() {
+        const ANSWERS: usize = 256;
+        const RECORDS_PER_ANSWER: u32 = 2000;
+        const MAX_HELD_BYTES: usize = 16 << 20;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    while let Ok(len) = stream.read_u16().await {
+                        let mut query = vec![0u8; usize::from(len)];
+                        stream.read_exact(&mut query).await.unwrap();
+                        let query = Packet::parse(&query).unwrap();
+                        let mut reply = Packet::new_reply(query.id());
+                        reply.questions = query.questions.clone();
+                        for address in 0..RECORDS_PER_ANSWER {
+                            reply.answers.push(ResourceRecord::new(
+                                query.questions[0].qname.clone(),
+                                CLASS::IN,
+                                300,
+                                RData::A(A { address }),
+                            ));
+                        }
+                        let bytes = reply.build_bytes_vec_compressed().unwrap();
+                        stream
+                            .write_all(&(bytes.len() as u16).to_be_bytes())
+                            .await
+                            .unwrap();
+                        stream.write_all(&bytes).await.unwrap();
+                    }
+                });
+            }
+        });
+        let resolver = with_proto(addr, DnsProtocol::Tcp);
+
+        let hosts: Vec<String> = (0..ANSWERS).map(|i| format!("host{i}.example")).collect();
+        for host in &hosts {
+            resolver.lookup_ipv4(host).await.unwrap();
+        }
+
+        let held: usize = hosts
+            .iter()
+            .map(|host| match resolver.cache.get(host, RecordKind::A) {
+                Some(CachedResult::Positive(records)) => records.len() * size_of::<Record>(),
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            held <= MAX_HELD_BYTES,
+            "the cache holds {held} bytes of records after {ANSWERS} large answers"
+        );
+    }
+
     /// Ordering nameservers does not panic while other lookups update their estimates.
     #[test]
     fn order_indices_does_not_panic_while_estimates_change() {
