@@ -806,11 +806,17 @@ impl DnsResolver {
     }
 
     /// Returns the given nameserver indices ordered fastest-first by smoothed RTT.
+    ///
+    /// Reads each estimate once before sorting. Concurrent lookups change the
+    /// estimates, and the standard sort can panic on an inconsistent comparator.
     fn order_indices(&self, indices: &[usize]) -> Vec<usize> {
         let rtt_map = &self.state().rtt_map;
-        let mut order = indices.to_vec();
-        order.sort_by(|&a, &b| rtt_map.get_decayed(a).total_cmp(&rtt_map.get_decayed(b)));
-        order
+        let mut keyed: Vec<_> = indices
+            .iter()
+            .map(|&idx| (rtt_map.get_decayed(idx), idx))
+            .collect();
+        keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
+        keyed.into_iter().map(|(_, idx)| idx).collect()
     }
 
     /// Sends a query, trying the primary nameservers before the fallback tier.
@@ -2311,5 +2317,36 @@ mod tests {
                 if matches!(records.as_slice(), [Record::A(addr)] if *addr == Ipv4Addr::LOCALHOST)
         );
         assert!(survived, "cache entry should survive reset, got {cached:?}");
+    }
+
+    /// Ordering nameservers does not panic while other lookups update their estimates.
+    #[test]
+    fn order_indices_does_not_panic_while_estimates_change() {
+        const NAMESERVERS: usize = 63;
+        let resolver = DnsResolver::builder()
+            .nameservers((1..=NAMESERVERS as u8).map(|host| {
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, host)), 53);
+                Nameserver::new(addr, DnsProtocol::Udp)
+            }))
+            .build();
+        let indices: Vec<usize> = (0..NAMESERVERS).collect();
+        let rtt_map = &resolver.state().rtt_map;
+
+        std::thread::scope(|scope| {
+            let sorter = scope.spawn(|| {
+                for _ in 0..2000 {
+                    let mut order = resolver.order_indices(&indices);
+                    order.sort_unstable();
+                    assert_eq!(order, indices);
+                }
+            });
+            while !sorter.is_finished() {
+                for idx in 0..NAMESERVERS {
+                    rtt_map.record_failure(idx);
+                    rtt_map.record_success((idx * 7) % NAMESERVERS, Duration::ZERO, None);
+                }
+            }
+            sorter.join().unwrap();
+        });
     }
 }
