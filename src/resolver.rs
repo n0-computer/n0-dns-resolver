@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use std::{
     future::Future,
-    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+    net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
     sync::OnceLock,
 };
@@ -20,7 +20,7 @@ use n0_future::{
     FuturesUnordered, MaybeFuture, StreamExt,
     time::{self, Duration, Instant},
 };
-use simple_dns::TYPE;
+use simple_dns::{Packet, TYPE};
 use tracing::{debug, trace};
 
 #[cfg(test)]
@@ -170,11 +170,48 @@ const TCP_JOIN_DELAY: Duration = UDP_RETRANSMIT_MIN.saturating_mul(UDP_PACED_DAT
 /// domains first. See <https://man7.org/linux/man-pages/man5/resolv.conf.5.html>.
 const DEFAULT_NDOTS: usize = 1;
 
+/// Rejects a name whose text form does not map one-to-one onto a wire name.
+///
+/// `simple_dns::Name` drops empty labels, so `localhost..` would reach the wire
+/// as `localhost.` while the localhost rule, hosts override and cache key all
+/// read the string. One trailing dot is the FQDN marker and is kept.
+fn validate_name(name: &str) -> Result<(), Error> {
+    let stripped = name.strip_suffix('.').unwrap_or(name);
+    if stripped.is_empty() || stripped.split('.').any(str::is_empty) {
+        return Err(e!(Error::InvalidName {
+            name: name.to_string()
+        }));
+    }
+    Ok(())
+}
+
+/// Returns whether `name` is an IP address literal rather than a DNS name.
+fn is_ip_literal(name: &str) -> bool {
+    name.parse::<IpAddr>().is_ok()
+}
+
+/// Returns the answer for `name` when it is an IP address literal.
+///
+/// All-numeric labels are valid DNS names, so `192.0.2.1` would otherwise be
+/// queried and search-expanded, and a wildcard search zone could answer it.
+/// A literal has no records of the other address family. Returns `None` when
+/// `name` is not a literal.
+fn ip_literal_records(name: &str, kind: RecordKind) -> Option<Vec<Record>> {
+    let ip: IpAddr = name.parse().ok()?;
+    Some(match (ip, kind) {
+        (IpAddr::V4(ip), RecordKind::A) => vec![Record::A(ip)],
+        (IpAddr::V6(ip), RecordKind::Aaaa) => vec![Record::Aaaa(ip)],
+        _ => Vec::new(),
+    })
+}
+
 /// Returns whether `host` is `localhost` or a name under it.
 ///
 /// RFC 6761 Section 6.3 reserves these to resolve to loopback without a query.
 /// DNS names are case-insensitive, so `foo.LOCALHOST` is one of them too, and
 /// must not go out to a nameserver that could answer it with any address.
+///
+/// Assumes `host` passed [`validate_name`].
 fn is_localhost(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
     host.rsplit('.')
@@ -769,11 +806,17 @@ impl DnsResolver {
     }
 
     /// Returns the given nameserver indices ordered fastest-first by smoothed RTT.
+    ///
+    /// Reads each estimate once before sorting. Concurrent lookups change the
+    /// estimates, and the standard sort can panic on an inconsistent comparator.
     fn order_indices(&self, indices: &[usize]) -> Vec<usize> {
         let rtt_map = &self.state().rtt_map;
-        let mut order = indices.to_vec();
-        order.sort_by(|&a, &b| rtt_map.get_decayed(a).total_cmp(&rtt_map.get_decayed(b)));
-        order
+        let mut keyed: Vec<_> = indices
+            .iter()
+            .map(|&idx| (rtt_map.get_decayed(idx), idx))
+            .collect();
+        keyed.sort_by(|a, b| a.0.total_cmp(&b.0));
+        keyed.into_iter().map(|(_, idx)| idx).collect()
     }
 
     /// Sends a query, trying the primary nameservers before the fallback tier.
@@ -901,15 +944,19 @@ impl DnsResolver {
         }
     }
 
-    /// Sends a query, following CNAME chains across responses.
+    /// Sends a query, following CNAME chains across responses, and reads the answer.
     ///
     /// A nameserver that answers with a CNAME but no records of the requested
     /// type has left the chain unresolved, so the target is queried in turn.
-    async fn send_query_following_cnames(
+    ///
+    /// `read_answer` gets the validated packet that ends the chain, so each
+    /// response is parsed once.
+    async fn send_query_following_cnames<T>(
         &self,
         host: String,
         qtype: TYPE,
-    ) -> Result<Vec<u8>, Error> {
+        read_answer: impl Fn(&Packet<'_>) -> T,
+    ) -> Result<T, Error> {
         let mut current_host = host;
         for _ in 0..MAX_CNAME_DEPTH {
             let name = simple_dns::Name::new(&current_host).map_err(|_| {
@@ -928,7 +975,7 @@ impl DnsResolver {
 
             // The response holds the answer, or has no CNAME to follow.
             let Some(target) = query::unresolved_cname_target(&packet, &name, qtype) else {
-                return Ok(response);
+                return Ok(read_answer(&packet));
             };
             debug!(from = %current_host, to = %target, "following CNAME");
             current_host = target;
@@ -958,6 +1005,12 @@ impl DnsResolver {
         name: String,
         kind: RecordKind,
     ) -> Result<Vec<Record>, Error> {
+        // Both ahead of the cache: the key is the caller's string.
+        validate_name(&name)?;
+        if let Some(records) = ip_literal_records(&name, kind) {
+            trace!(%name, ?kind, "resolved from IP literal");
+            return Ok(records);
+        }
         match self.cache.get(&name, kind) {
             Some(CachedResult::Positive(records)) => {
                 trace!(%name, records = records.len(), ?kind, "cache hit");
@@ -993,22 +1046,21 @@ impl DnsResolver {
         let total = names.len();
         for (i, name) in names.into_iter().enumerate() {
             trace!(%name, ?kind, "resolving");
+            let read_answer = |packet: &Packet<'_>| {
+                let parsed = query::parse_records(packet, kind).map_err(Error::from);
+                // RFC 2308 TTL of a NODATA answer. An NXDOMAIN comes back from
+                // `check_response` as an error and gets the default TTL.
+                let soa = match &parsed {
+                    Ok((records, _)) if records.is_empty() => query::negative_ttl(packet),
+                    _ => None,
+                };
+                (parsed, soa)
+            };
             let (res, soa_negative_ttl) = match self
-                .send_query_following_cnames(name.clone(), kind.dns_type())
+                .send_query_following_cnames(name.clone(), kind.dns_type(), read_answer)
                 .await
             {
-                Ok(response) => {
-                    let parsed = query::parse_records(&response, kind).map_err(Error::from);
-                    // Derive the RFC 2308 negative TTL from the authority SOA while
-                    // the response bytes are still in scope; only meaningful for a
-                    // negative answer (empty or NXDOMAIN).
-                    let soa = match &parsed {
-                        Ok((records, _)) if records.is_empty() => query::negative_ttl(&response),
-                        Err(Error::NxDomain { .. }) => query::negative_ttl(&response),
-                        _ => None,
-                    };
-                    (parsed, soa)
-                }
+                Ok(answer) => answer,
                 Err(e) => (Err(e), None),
             };
             match res {
@@ -1104,15 +1156,19 @@ impl DnsResolver {
     /// Looks up the IPv4 (A) records for `name`.
     pub async fn lookup_ipv4(&self, name: impl Into<String>) -> Result<Vec<Ipv4Addr>, Error> {
         let name = name.into();
+        // Ahead of the localhost rule and hosts override, which read the string.
+        validate_name(&name)?;
         // RFC 6761: localhost always resolves to loopback.
         if is_localhost(&name) {
             return Ok(vec![Ipv4Addr::LOCALHOST]);
         }
-        // A hosts-file entry overrides DNS, so check it ahead of the cache.
-        if let Some(addrs) = self
-            .search_names(&name)
-            .iter()
-            .find_map(|name| self.state().config.hosts.lookup_ipv4(name))
+        // A hosts entry overrides DNS, so check it ahead of the cache, but must
+        // not shadow a literal.
+        if !is_ip_literal(&name)
+            && let Some(addrs) = self
+                .search_names(&name)
+                .iter()
+                .find_map(|name| self.state().config.hosts.lookup_ipv4(name))
         {
             trace!(%name, ?addrs, "resolved from hosts file");
             return Ok(addrs);
@@ -1132,15 +1188,16 @@ impl DnsResolver {
     /// Looks up the IPv6 (AAAA) records for `name`.
     pub async fn lookup_ipv6(&self, name: impl Into<String>) -> Result<Vec<Ipv6Addr>, Error> {
         let name = name.into();
+        validate_name(&name)?;
         // RFC 6761: localhost always resolves to loopback.
         if is_localhost(&name) {
             return Ok(vec![Ipv6Addr::LOCALHOST]);
         }
-        // A hosts-file entry overrides DNS, so check it ahead of the cache.
-        if let Some(addrs) = self
-            .search_names(&name)
-            .iter()
-            .find_map(|name| self.state().config.hosts.lookup_ipv6(name))
+        if !is_ip_literal(&name)
+            && let Some(addrs) = self
+                .search_names(&name)
+                .iter()
+                .find_map(|name| self.state().config.hosts.lookup_ipv6(name))
         {
             trace!(%name, ?addrs, "resolved from hosts file");
             return Ok(addrs);
@@ -1765,6 +1822,184 @@ mod tests {
         assert!(err.is_err(), "expected NXDOMAIN, got {err:?}");
     }
 
+    mod name_validation {
+        use super::{super::validate_name, *};
+        use crate::Error;
+
+        /// The shapes `Name::new` would rewrite.
+        const REWRITTEN: &[&str] = &[
+            "",
+            ".",
+            "..",
+            "localhost..",
+            "foo.localhost..",
+            ".example.com",
+            "relay..example",
+            "example.com..",
+        ];
+
+        #[test]
+        fn empty_labels_are_rejected() {
+            for name in REWRITTEN {
+                assert!(
+                    matches!(validate_name(name), Err(Error::InvalidName { .. })),
+                    "{name:?} should be rejected"
+                );
+            }
+        }
+
+        #[test]
+        fn ordinary_names_and_one_trailing_dot_pass() {
+            for name in [
+                "example.com",
+                "example.com.",
+                "localhost",
+                "localhost.",
+                "a",
+            ] {
+                assert!(validate_name(name).is_ok(), "{name:?} should pass");
+            }
+        }
+
+        /// `localhost..` used to fail the check and reach a nameserver as
+        /// `localhost.`, which could answer it with any address.
+        #[tokio::test]
+        async fn localhost_with_an_empty_label_never_reaches_a_nameserver() {
+            let resolver = empty_resolver();
+            for name in ["localhost..", "foo.localhost.."] {
+                let err = resolver.lookup_ipv4(name).await.unwrap_err();
+                assert!(
+                    matches!(err, Error::InvalidName { .. }),
+                    "{name:?} reached the query path: {err:?}"
+                );
+            }
+        }
+
+        #[tokio::test]
+        async fn an_empty_label_does_not_bypass_the_hosts_file() {
+            let mut resolver = empty_resolver();
+            resolver.set_hosts(Hosts::from_content("10.0.1.10 relay.example\n"));
+
+            let err = resolver.lookup_ipv4("relay..example").await.unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidName { .. }),
+                "hosts pin was bypassed: {err:?}"
+            );
+        }
+
+        /// `search_names("")` expands to `".example.com"`, which `Name::new`
+        /// used to rewrite to `example.com`.
+        #[tokio::test]
+        async fn the_empty_name_is_not_expanded_to_a_search_domain() {
+            let mut resolver = empty_resolver();
+            resolver.set_search(vec!["example.com".to_string()], 1);
+
+            let err = resolver.lookup_ipv4("").await.unwrap_err();
+            assert!(
+                matches!(err, Error::InvalidName { .. }),
+                "empty name was search-expanded: {err:?}"
+            );
+        }
+
+        #[tokio::test]
+        async fn lookup_record_validates() {
+            let resolver = empty_resolver();
+            let err = resolver
+                .lookup_record("relay..example", RecordKind::Txt)
+                .await
+                .unwrap_err();
+            assert!(matches!(err, Error::InvalidName { .. }), "{err:?}");
+        }
+    }
+
+    /// An IP literal answers itself and never reaches a nameserver.
+    mod ip_literals {
+        use super::*;
+        use crate::Error;
+
+        /// No nameservers, so reaching the query path gives `NoNameservers`.
+        fn resolver() -> DnsResolver {
+            let mut resolver = empty_resolver();
+            resolver.set_search(vec!["example.com".to_string()], 1);
+            resolver
+        }
+
+        #[tokio::test]
+        async fn a_literal_resolves_to_itself_without_a_query() {
+            let resolver = resolver();
+
+            assert_eq!(
+                resolver.lookup_ipv4("192.0.2.1").await.unwrap(),
+                [Ipv4Addr::new(192, 0, 2, 1)]
+            );
+            assert_eq!(
+                resolver.lookup_ipv6("2001:db8::1").await.unwrap(),
+                ["2001:db8::1".parse::<Ipv6Addr>().unwrap()]
+            );
+            assert_eq!(
+                resolver.lookup_ipv4("127.0.0.1").await.unwrap(),
+                [Ipv4Addr::LOCALHOST]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_literal_has_no_records_of_the_other_family() {
+            let resolver = resolver();
+
+            assert!(resolver.lookup_ipv6("192.0.2.1").await.unwrap().is_empty());
+            assert!(
+                resolver
+                    .lookup_ipv4("2001:db8::1")
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn lookup_record_short_circuits_a_literal() {
+            let resolver = resolver();
+
+            assert_eq!(
+                resolver
+                    .lookup_record("192.0.2.1", RecordKind::A)
+                    .await
+                    .unwrap(),
+                [Record::A(Ipv4Addr::new(192, 0, 2, 1))]
+            );
+            assert!(
+                resolver
+                    .lookup_record("192.0.2.1", RecordKind::Txt)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
+        }
+
+        #[tokio::test]
+        async fn the_hosts_file_does_not_shadow_a_literal() {
+            let mut resolver = resolver();
+            resolver.set_hosts(Hosts::from_content("10.0.0.1 192.0.2.1\n"));
+
+            assert_eq!(
+                resolver.lookup_ipv4("192.0.2.1").await.unwrap(),
+                [Ipv4Addr::new(192, 0, 2, 1)]
+            );
+        }
+
+        #[tokio::test]
+        async fn a_non_literal_still_goes_to_the_nameservers() {
+            let resolver = resolver();
+
+            // Out of range for an octet, so not an address.
+            let err = resolver.lookup_ipv4("192.0.2.999").await.unwrap_err();
+            assert!(matches!(err, Error::NoNameservers { .. }), "{err:?}");
+
+            let err = resolver.lookup_ipv4("192.0.2.1.").await.unwrap_err();
+            assert!(matches!(err, Error::NoNameservers { .. }), "{err:?}");
+        }
+    }
+
     mod search_names {
         use super::*;
 
@@ -2082,5 +2317,93 @@ mod tests {
                 if matches!(records.as_slice(), [Record::A(addr)] if *addr == Ipv4Addr::LOCALHOST)
         );
         assert!(survived, "cache entry should survive reset, got {cached:?}");
+    }
+
+    /// Many large answers stay within the cache's byte limit.
+    #[tokio::test]
+    async fn cache_holds_large_answers_within_its_byte_limit() {
+        const ANSWERS: usize = 256;
+        const RECORDS_PER_ANSWER: u32 = 2000;
+        const MAX_HELD_BYTES: usize = 16 << 20;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                tokio::spawn(async move {
+                    while let Ok(len) = stream.read_u16().await {
+                        let mut query = vec![0u8; usize::from(len)];
+                        stream.read_exact(&mut query).await.unwrap();
+                        let query = Packet::parse(&query).unwrap();
+                        let mut reply = Packet::new_reply(query.id());
+                        reply.questions = query.questions.clone();
+                        for address in 0..RECORDS_PER_ANSWER {
+                            reply.answers.push(ResourceRecord::new(
+                                query.questions[0].qname.clone(),
+                                CLASS::IN,
+                                300,
+                                RData::A(A { address }),
+                            ));
+                        }
+                        let bytes = reply.build_bytes_vec_compressed().unwrap();
+                        stream
+                            .write_all(&(bytes.len() as u16).to_be_bytes())
+                            .await
+                            .unwrap();
+                        stream.write_all(&bytes).await.unwrap();
+                    }
+                });
+            }
+        });
+        let resolver = with_proto(addr, DnsProtocol::Tcp);
+
+        let hosts: Vec<String> = (0..ANSWERS).map(|i| format!("host{i}.example")).collect();
+        for host in &hosts {
+            resolver.lookup_ipv4(host).await.unwrap();
+        }
+
+        let held: usize = hosts
+            .iter()
+            .map(|host| match resolver.cache.get(host, RecordKind::A) {
+                Some(CachedResult::Positive(records)) => records.len() * size_of::<Record>(),
+                _ => 0,
+            })
+            .sum();
+        assert!(
+            held <= MAX_HELD_BYTES,
+            "the cache holds {held} bytes of records after {ANSWERS} large answers"
+        );
+    }
+
+    /// Ordering nameservers does not panic while other lookups update their estimates.
+    #[test]
+    fn order_indices_does_not_panic_while_estimates_change() {
+        const NAMESERVERS: usize = 63;
+        let resolver = DnsResolver::builder()
+            .nameservers((1..=NAMESERVERS as u8).map(|host| {
+                let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, host)), 53);
+                Nameserver::new(addr, DnsProtocol::Udp)
+            }))
+            .build();
+        let indices: Vec<usize> = (0..NAMESERVERS).collect();
+        let rtt_map = &resolver.state().rtt_map;
+
+        std::thread::scope(|scope| {
+            let sorter = scope.spawn(|| {
+                for _ in 0..2000 {
+                    let mut order = resolver.order_indices(&indices);
+                    order.sort_unstable();
+                    assert_eq!(order, indices);
+                }
+            });
+            while !sorter.is_finished() {
+                for idx in 0..NAMESERVERS {
+                    rtt_map.record_failure(idx);
+                    rtt_map.record_success((idx * 7) % NAMESERVERS, Duration::ZERO, None);
+                }
+            }
+            sorter.join().unwrap();
+        });
     }
 }
