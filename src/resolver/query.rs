@@ -1935,12 +1935,11 @@ mod tests {
         (buf, count)
     }
 
-    /// A chain of compression pointers resolves to the name at its foot.
-    ///
-    /// The chain is short enough to stay under a hop cap, if `simple_dns` adds one.
+    /// Each pointer hop counts toward the limit when decoding a chained owner name.
     #[test]
-    fn a_pointer_chain_resolves_to_its_foot() {
-        let (buf, count) = pointer_ladder_response(8, 4096);
+    fn a_pointer_chain_resolves_and_charges_every_hop() {
+        let hops = 8;
+        let (buf, count) = pointer_ladder_response(hops, 4096);
 
         let packet = parse_packet(&buf).expect("a short chain is legal on the wire");
 
@@ -1948,6 +1947,12 @@ mod tests {
         for rr in packet.answers.iter().skip(1) {
             assert_eq!(rr.name.to_string(), "a");
         }
+
+        // The first owner is root. Each later owner has one pointer to the
+        // ladder, one pointer per hop, and one label at the foot.
+        let steps = (usize::from(count) - 1) * (1 + hops + 1);
+        assert_eq!(decoded_name_steps(&buf, steps), Some(steps));
+        assert_eq!(decoded_name_steps(&buf, steps - 1), None);
     }
 
     /// Reports what one parse of a 64 KB pointer ladder costs.
