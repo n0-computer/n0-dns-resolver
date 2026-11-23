@@ -375,6 +375,10 @@ impl ResolverState {
 
 impl DnsResolver {
     /// Looks up records of `kind` for `name`.
+    ///
+    /// A `localhost` name gets loopback for A and AAAA and no records otherwise,
+    /// without a query (RFC 6761). Only [`Self::lookup_ipv4`] and
+    /// [`Self::lookup_ipv6`] read the hosts file.
     pub fn lookup_record(
         &self,
         name: impl Into<String>,
@@ -1016,9 +1020,8 @@ impl DnsResolver {
     /// typed methods ([`Self::lookup_ipv4`], [`Self::lookup_ipv6`],
     /// [`Self::lookup_txt`]) are thin wrappers over it.
     ///
-    /// Unlike the typed methods, this does not apply the RFC 6761 `localhost`
-    /// rule or the hosts-file override; those are specific to A and AAAA lookups
-    /// and live in [`Self::lookup_ipv4`] and [`Self::lookup_ipv6`].
+    /// The hosts-file override is specific to A and AAAA lookups and lives in
+    /// [`Self::lookup_ipv4`] and [`Self::lookup_ipv6`].
     ///
     /// # Errors
     ///
@@ -1029,8 +1032,16 @@ impl DnsResolver {
         name: String,
         kind: RecordKind,
     ) -> Result<Vec<Record>, Error> {
-        // Both ahead of the cache: the key is the caller's string.
+        // All ahead of the cache: the key is the caller's string.
         validate_name(&name)?;
+        // RFC 6761: localhost resolves to loopback, and has no other records.
+        if is_localhost(&name) {
+            return Ok(match kind {
+                RecordKind::A => vec![Record::A(Ipv4Addr::LOCALHOST)],
+                RecordKind::Aaaa => vec![Record::Aaaa(Ipv6Addr::LOCALHOST)],
+                _ => Vec::new(),
+            });
+        }
         if let Some(records) = ip_literal_records(&name, kind) {
             trace!(%name, ?kind, "resolved from IP literal");
             return Ok(records);
@@ -1913,6 +1924,33 @@ mod tests {
                     "{name:?} reached the query path: {err:?}"
                 );
             }
+        }
+
+        #[tokio::test]
+        async fn lookup_record_answers_localhost_without_a_query() {
+            let resolver = empty_resolver();
+
+            assert_eq!(
+                resolver
+                    .lookup_record("foo.localhost", RecordKind::A)
+                    .await
+                    .unwrap(),
+                [Record::A(Ipv4Addr::LOCALHOST)]
+            );
+            assert_eq!(
+                resolver
+                    .lookup_record("LOCALHOST.", RecordKind::Aaaa)
+                    .await
+                    .unwrap(),
+                [Record::Aaaa(Ipv6Addr::LOCALHOST)]
+            );
+            assert!(
+                resolver
+                    .lookup_record("localhost", RecordKind::Txt)
+                    .await
+                    .unwrap()
+                    .is_empty()
+            );
         }
 
         #[tokio::test]
