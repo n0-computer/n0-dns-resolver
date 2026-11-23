@@ -139,11 +139,11 @@ pub(super) fn is_format_error(data: &[u8]) -> bool {
 /// response only once. The question of our query is never compressed, and a
 /// valid response cannot compress its first name, so the bytes line up.
 ///
-/// The one response accepted without a question is a FORMERR. A middlebox that
-/// could not parse the query, usually over its EDNS(0) OPT record, may answer
-/// with a bare header, and all a FORMERR does is have the caller retry the
-/// same server without EDNS. A spoofed one costs a round trip and nothing
-/// else.
+/// A FORMERR, SERVFAIL, REFUSED or truncated response is accepted on its
+/// header alone. A middlebox that rejects the query, usually over its EDNS(0)
+/// OPT record, may answer with a bare header. These only make the caller retry
+/// without EDNS, try the next nameserver, or switch to TCP, so a spoofed one at
+/// most ends the attempt at this nameserver.
 pub(super) fn answers_query(response: &[u8], query: &[u8]) -> bool {
     let (Ok(id), Ok(questions)) = (
         header_buffer::id(response),
@@ -156,7 +156,7 @@ pub(super) fn answers_query(response: &[u8], query: &[u8]) -> bool {
     {
         return false;
     }
-    if questions == 0 && is_format_error(response) {
+    if retryable_failure_rcode(response).is_some() || is_truncated(response) {
         return true;
     }
     header_buffer::questions(query).ok() == Some(questions)
@@ -1093,9 +1093,19 @@ mod tests {
         let mut empty = Packet::new_reply(id);
         assert!(!answers_query(&empty.build_bytes_vec().unwrap(), &query));
 
-        // Except a FORMERR, which a middlebox may send as a bare header.
+        // Except a FORMERR, SERVFAIL, REFUSED or TC response, which a middlebox
+        // may send as a bare header, with or without the query's counts.
         *empty.rcode_mut() = RCODE::FormatError;
         assert!(answers_query(&empty.build_bytes_vec().unwrap(), &query));
+        for (byte, bits) in [(3, 1), (3, 2), (3, 5), (2, 0x02)] {
+            let mut header = query[..12].to_vec();
+            header[2] |= 0x80;
+            header[byte] |= bits;
+            assert!(answers_query(&header, &query), "byte {byte} bits {bits}");
+        }
+        let mut bare = query[..12].to_vec();
+        bare[2] |= 0x80;
+        assert!(!answers_query(&bare, &query));
 
         // Shorter than a header.
         assert!(!answers_query(&good[..8], &query));
