@@ -175,9 +175,14 @@ const DEFAULT_NDOTS: usize = 1;
 /// `simple_dns::Name` drops empty labels, so `localhost..` would reach the wire
 /// as `localhost.` while the localhost rule, hosts override and cache key all
 /// read the string. One trailing dot is the FQDN marker and is kept.
+///
+/// Also rejects a scoped IPv6 literal such as `fe80::1%eth0`. The answer types
+/// have no field for the scope, and the literal is not a DNS name. See
+/// <https://github.com/n0-computer/n0-dns-resolver/issues/48>.
 fn validate_name(name: &str) -> Result<(), Error> {
     let stripped = name.strip_suffix('.').unwrap_or(name);
-    if stripped.is_empty() || stripped.split('.').any(str::is_empty) {
+    if stripped.is_empty() || stripped.split('.').any(str::is_empty) || is_scoped_ipv6_literal(name)
+    {
         return Err(e!(Error::InvalidName {
             name: name.to_string()
         }));
@@ -193,6 +198,16 @@ fn parse_ip_literal(name: &str) -> Option<IpAddr> {
         Some(inner) => inner.parse::<Ipv6Addr>().ok().map(IpAddr::V6),
         None => name.parse().ok(),
     }
+}
+
+/// Returns whether `name` is an IPv6 address with a zone ID, bracketed or not.
+fn is_scoped_ipv6_literal(name: &str) -> bool {
+    let name = name
+        .strip_prefix('[')
+        .and_then(|s| s.strip_suffix(']'))
+        .unwrap_or(name);
+    name.split_once('%')
+        .is_some_and(|(addr, _)| addr.parse::<Ipv6Addr>().is_ok())
 }
 
 /// Returns whether `name` is an IP address literal rather than a DNS name.
@@ -1855,6 +1870,22 @@ mod tests {
                     "{name:?} should be rejected"
                 );
             }
+        }
+
+        #[test]
+        fn scoped_ipv6_literals_are_rejected() {
+            for name in [
+                "fe80::1%eth0",
+                "[fe80::1%eth0]",
+                "fe80::1%25eth0",
+                "fe80::1%2",
+            ] {
+                assert!(
+                    matches!(validate_name(name), Err(Error::InvalidName { .. })),
+                    "{name:?} should be rejected"
+                );
+            }
+            assert!(validate_name("not%an.address").is_ok());
         }
 
         #[test]
