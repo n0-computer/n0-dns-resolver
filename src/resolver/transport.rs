@@ -411,7 +411,8 @@ mod tests {
     }
 
     fn build_query() -> (u16, Vec<u8>) {
-        super::super::query::build_query("example.com", TYPE::A).unwrap()
+        let name = simple_dns::Name::new("example.com").unwrap();
+        super::super::query::build_query(&name, TYPE::A).unwrap()
     }
 
     #[tokio::test]

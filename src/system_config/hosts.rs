@@ -6,13 +6,14 @@
 //! way the old hickory-backed resolver did via its `use_hosts_file` default.
 
 use std::{
-    borrow::Cow,
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
 use rustc_hash::FxBuildHasher;
 use tracing::warn;
+
+use crate::resolver::name_key;
 
 /// A hosts-file map, keyed by name.
 ///
@@ -135,28 +136,14 @@ impl Hosts {
         Self { a, aaaa }
     }
 
-    /// Normalizes a query name to the hosts-file key form.
-    ///
-    /// The key form is the name lowercased, without the dot that marks it absolute. A
-    /// name that is already in that form is borrowed rather than copied, since
-    /// every A and AAAA lookup passes through here and query names are
-    /// overwhelmingly lowercase already.
-    fn normalize(name: &str) -> Cow<'_, str> {
-        let name = crate::resolver::strip_root_dot(name).unwrap_or(name);
-        match name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            true => Cow::Owned(name.to_ascii_lowercase()),
-            false => Cow::Borrowed(name),
-        }
-    }
-
     /// Returns the mapped IPv4 addresses for `name`, if any.
     pub(crate) fn lookup_ipv4(&self, name: &str) -> Option<Vec<Ipv4Addr>> {
-        self.a.get(Self::normalize(name).as_ref())?.to_vec()
+        self.a.get(name_key(name).as_ref())?.to_vec()
     }
 
     /// Returns the mapped IPv6 addresses for `name`, if any.
     pub(crate) fn lookup_ipv6(&self, name: &str) -> Option<Vec<Ipv6Addr>> {
-        self.aaaa.get(Self::normalize(name).as_ref())?.to_vec()
+        self.aaaa.get(name_key(name).as_ref())?.to_vec()
     }
 
     /// Builds a hosts map directly from file content, for tests.

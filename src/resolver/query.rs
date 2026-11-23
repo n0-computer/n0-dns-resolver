@@ -88,23 +88,23 @@ pub(super) fn parse_packet(data: &[u8]) -> Result<Packet<'_>, QueryError> {
 /// original 512-byte RFC 1035 limit.
 const EDNS_UDP_PAYLOAD_SIZE: u16 = 1232;
 
-/// Builds a DNS query packet for the given host and query type.
+/// Builds a DNS query packet for the given name and query type.
 ///
 /// The query includes an EDNS(0) OPT record advertising support for
 /// responses up to [`EDNS_UDP_PAYLOAD_SIZE`] bytes over UDP.
 ///
 /// Returns `(query_id, wire_bytes)`.
-pub(super) fn build_query(host: &str, qtype: TYPE) -> Result<(u16, Vec<u8>), QueryError> {
+pub(super) fn build_query(name: &Name<'_>, qtype: TYPE) -> Result<(u16, Vec<u8>), QueryError> {
     let id: u16 = rand::random();
     let mut packet = Packet::new_query(id);
     packet.set_flags(PacketFlag::RECURSION_DESIRED);
 
-    let name = Name::new(host).map_err(|_| {
-        e!(QueryError::BuildQuery {
-            name: host.to_string()
-        })
-    })?;
-    let question = Question::new(name, QTYPE::TYPE(qtype), QCLASS::CLASS(CLASS::IN), false);
+    let question = Question::new(
+        name.clone(),
+        QTYPE::TYPE(qtype),
+        QCLASS::CLASS(CLASS::IN),
+        false,
+    );
     packet.questions.push(question);
 
     // Add EDNS(0) OPT record to advertise larger UDP payload support.
@@ -116,7 +116,7 @@ pub(super) fn build_query(host: &str, qtype: TYPE) -> Result<(u16, Vec<u8>), Que
 
     let bytes = packet.build_bytes_vec().map_err(|_| {
         e!(QueryError::BuildQuery {
-            name: host.to_string()
+            name: name.to_string()
         })
     })?;
     Ok((id, bytes))
@@ -521,7 +521,7 @@ mod tests {
 
     /// Build a query packet for `host` with type A, return (id, bytes).
     fn make_query(host: &str) -> (u16, Vec<u8>) {
-        build_query(host, TYPE::A).unwrap()
+        build_query(&Name::new(host).unwrap(), TYPE::A).unwrap()
     }
 
     /// Parses `data` and reads its records, for tests that start from bytes.
@@ -627,7 +627,7 @@ mod tests {
 
     #[test]
     fn build_query_includes_edns_opt() {
-        let (_, bytes) = build_query("example.com", TYPE::A).unwrap();
+        let (_, bytes) = build_query(&Name::new("example.com").unwrap(), TYPE::A).unwrap();
         let packet = Packet::parse(&bytes).unwrap();
         let opt = packet.opt().expect("query should include OPT record");
         assert_eq!(opt.udp_packet_size, 1232);
@@ -636,7 +636,7 @@ mod tests {
 
     #[test]
     fn strip_edns_removes_opt_and_preserves_question() {
-        let (id, bytes) = build_query("example.com", TYPE::A).unwrap();
+        let (id, bytes) = build_query(&Name::new("example.com").unwrap(), TYPE::A).unwrap();
         assert!(Packet::parse(&bytes).unwrap().opt().is_some());
 
         let stripped = strip_edns(&bytes).expect("query has EDNS to strip");

@@ -1,7 +1,6 @@
 //! TTL-based DNS cache with least-recently-used eviction.
 
 use std::{
-    borrow::Cow,
     hash::{BuildHasher, RandomState},
     sync::{Arc, Mutex},
     time::Duration,
@@ -10,6 +9,7 @@ use std::{
 use lru::LruCache;
 use n0_future::time::Instant;
 
+use super::name_key;
 use crate::{Record, RecordKind};
 
 /// Maximum number of entries in the DNS cache.
@@ -80,30 +80,11 @@ impl CachedResult {
     }
 }
 
-/// Normalizes a host to its cache-key form.
-///
-/// The key is the host lowercased, without the dot that marks it absolute.
-///
-/// DNS names are case-insensitive, and a fully-qualified name with a trailing dot
-/// denotes the same node as the bare name. Normalizing here keeps
-/// `Example.COM.` and `example.com` in one entry, matching the hosts-file
-/// normalization in `Hosts::normalize`.
-/// A name already in that form is borrowed rather than copied. Every cache
-/// probe passes through here, ahead of the lock, and query names are
-/// overwhelmingly lowercase and undotted already.
-fn normalize(host: &str) -> Cow<'_, str> {
-    let host = super::strip_root_dot(host).unwrap_or(host);
-    match host.bytes().any(|byte| byte.is_ascii_uppercase()) {
-        true => Cow::Owned(host.to_ascii_lowercase()),
-        false => Cow::Borrowed(host),
-    }
-}
-
 /// Hashes `(host, kind)` into a u64 key for allocation-free cache lookups.
 ///
 /// A hash collision between different (host, kind) pairs could return records
 /// for the wrong entry. The kind is part of the key, so a collision can only be
-/// between two distinct host+kind pairs; [`DnsCache::get`] rechecks both against
+/// between two distinct host+kind pairs. [`DnsCache::get`] rechecks both against
 /// the stored entry and treats a mismatch as a miss. With 64-bit hashes and a
 /// few-thousand-entry cache, the birthday-bound probability is ~1e-13 per
 /// lookup, negligible in practice.
@@ -111,7 +92,7 @@ fn normalize(host: &str) -> Cow<'_, str> {
 /// The hasher has random keys per cache, so its collisions cannot be computed
 /// in advance.
 ///
-/// `host` is expected to already be [`normalize`]d so that names differing only
+/// `host` is expected to be in [`name_key`] form, so that names differing only
 /// in case or a trailing dot hash to the same key.
 ///
 /// A pre-hashed `u64` key is used rather than a `Hash`-deriving key struct on
@@ -124,7 +105,7 @@ fn cache_key(hasher: &RandomState, host: &str, kind: RecordKind) -> u64 {
 /// A cache entry with TTL expiry tracking.
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    /// The host this entry is for, in [`normalize`] form.
+    /// The host this entry is for, in [`name_key`] form.
     ///
     /// Verified against the query on lookup, together with `kind`, so that a
     /// `u64` key collision returns a miss rather than another entry's records.
@@ -232,7 +213,7 @@ impl DnsCache {
     /// can still serve it as a last resort; it is overwritten on the next
     /// successful insert or evicted by LRU pressure.
     pub(super) fn get(&self, host: &str, kind: RecordKind) -> Option<CachedResult> {
-        let host = normalize(host);
+        let host = name_key(host);
         let key = cache_key(&self.hasher, &host, kind);
         let mut inner = self.inner.lock().expect("poisoned");
         let entry = inner.entries.get(&key)?;
@@ -258,7 +239,7 @@ impl DnsCache {
         kind: RecordKind,
         max_stale: Duration,
     ) -> Option<Vec<Record>> {
-        let host = normalize(host);
+        let host = name_key(host);
         let key = cache_key(&self.hasher, &host, kind);
         let mut inner = self.inner.lock().expect("poisoned");
         let entry = inner.entries.get(&key)?;
@@ -278,8 +259,8 @@ impl DnsCache {
 
     /// Inserts a result into the cache under the given TTL.
     ///
-    /// A TTL of 0 means do not cache. Positive results carry the response's TTL;
-    /// negative results (NODATA, NXDOMAIN) are cached under [`NEGATIVE_TTL_SECS`]
+    /// A TTL of 0 means do not cache. Positive results carry the response's TTL.
+    /// Negative results (NODATA, NXDOMAIN) are cached under [`NEGATIVE_TTL_SECS`]
     /// so a burst of concurrent lookups for the same absent name collapses to
     /// one network query.
     ///
@@ -288,7 +269,7 @@ impl DnsCache {
         if ttl == 0 {
             return;
         }
-        let host = normalize(host);
+        let host = name_key(host);
         let bytes = result.approx_bytes();
         let key = cache_key(&self.hasher, &host, kind);
         let mut inner = self.inner.lock().expect("poisoned");
@@ -325,7 +306,7 @@ impl DnsCache {
         ttl: Duration,
         expired_ago: Duration,
     ) {
-        let host = normalize(host);
+        let host = name_key(host);
         let entry = CacheEntry {
             host: host.to_string(),
             kind,
@@ -343,7 +324,7 @@ impl DnsCache {
     /// Returns the stored TTL for `host`/`kind`, for tests that assert clamping.
     #[cfg(test)]
     fn stored_ttl(&self, host: &str, kind: RecordKind) -> Option<Duration> {
-        let host = normalize(host);
+        let host = name_key(host);
         let mut inner = self.inner.lock().expect("poisoned");
         inner
             .entries

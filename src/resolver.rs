@@ -9,6 +9,7 @@ use std::sync::Arc;
 #[cfg(transport_https)]
 use std::sync::Mutex;
 use std::{
+    borrow::Cow,
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
@@ -207,29 +208,34 @@ fn canonical_name(name: &str) -> Result<Option<String>, Error> {
         None => (name, ""),
     };
     // Ahead of `Name::new`, which splits all labels before it checks the length.
-    if stripped.is_empty() || stripped.len() > MAX_NAME_TEXT_LEN || is_scoped_ipv6_literal(name) {
+    if stripped.is_empty() || stripped.len() > MAX_NAME_TEXT_LEN {
         return Err(invalid());
     }
-    if !stripped.contains('\\') {
+    let canonical = if stripped.contains('\\') {
+        let wire = simple_dns::Name::new(stripped).map_err(|_| invalid())?;
+        // `Name::new` drops empty labels, so a missing label shows in the count.
+        if wire.get_labels().len() != label_dots(stripped).count() + 1 {
+            return Err(invalid());
+        }
+        // An escaped byte that is not UTF-8 may print as another character.
+        let printed = wire.to_string();
+        if simple_dns::Name::new(&printed).ok() != Some(wire) {
+            return Err(invalid());
+        }
+        Some(printed + fqdn)
+    } else {
         let labels_fit = stripped
             .split('.')
             .all(|label| (1..=MAX_LABEL_LEN).contains(&label.len()));
-        return match labels_fit && stripped.len() <= MAX_PLAIN_NAME_LEN {
-            true => Ok(None),
-            false => Err(invalid()),
-        };
-    }
-    let wire = simple_dns::Name::new(stripped).map_err(|_| invalid())?;
-    // `Name::new` drops empty labels, so a missing label shows in the count.
-    if wire.get_labels().len() != label_dots(stripped).count() + 1 {
+        if !labels_fit || stripped.len() > MAX_PLAIN_NAME_LEN {
+            return Err(invalid());
+        }
+        None
+    };
+    if is_scoped_ipv6_literal(canonical.as_deref().unwrap_or(name)) {
         return Err(invalid());
     }
-    // An escaped byte that is not UTF-8 may print as another character.
-    let printed = wire.to_string();
-    if simple_dns::Name::new(&printed).ok() != Some(wire) || is_scoped_ipv6_literal(&printed) {
-        return Err(invalid());
-    }
-    Ok(Some(printed + fqdn))
+    Ok(canonical)
 }
 
 /// Parses `name` as an IP address literal.
@@ -250,11 +256,6 @@ fn is_scoped_ipv6_literal(name: &str) -> bool {
         .unwrap_or(name);
     name.split_once('%')
         .is_some_and(|(addr, _)| addr.parse::<Ipv6Addr>().is_ok())
-}
-
-/// Returns whether `name` is an IP address literal rather than a DNS name.
-fn is_ip_literal(name: &str) -> bool {
-    parse_ip_literal(name).is_some()
 }
 
 /// Returns the answer for `name` when it is an IP address literal.
@@ -287,10 +288,23 @@ fn is_localhost(host: &str) -> bool {
 /// Returns `name` without the trailing dot that marks it absolute, if it has one.
 ///
 /// The dot in `foo\.` is escaped and belongs to the last label.
-pub(crate) fn strip_root_dot(name: &str) -> Option<&str> {
+fn strip_root_dot(name: &str) -> Option<&str> {
     let stripped = name.strip_suffix('.')?;
     let backslashes = stripped.bytes().rev().take_while(|&b| b == b'\\').count();
     (backslashes % 2 == 0).then_some(stripped)
+}
+
+/// Returns the key the cache and the hosts file store `name` under.
+///
+/// The key is lowercase without the root dot, so `Example.COM.` and
+/// `example.com` share one. A name already in that form is borrowed, as almost
+/// every query name is.
+pub(crate) fn name_key(name: &str) -> Cow<'_, str> {
+    let name = strip_root_dot(name).unwrap_or(name);
+    match name.bytes().any(|byte| byte.is_ascii_uppercase()) {
+        true => Cow::Owned(name.to_ascii_lowercase()),
+        false => Cow::Borrowed(name),
+    }
 }
 
 /// Returns the byte positions of the dots that separate the labels of `name`.
@@ -446,10 +460,21 @@ impl DnsResolver {
         name: impl Into<String>,
         kind: RecordKind,
     ) -> Pin<Box<dyn Future<Output = Result<Vec<Record>, Error>> + Send + '_>> {
-        // Type-erase the large lookup future here. Downstream adapters may box
-        // a typed lookup again, and retaining the complete concrete future can
-        // exhaust rustc's trait solver while it proves the outer future is Send.
-        Box::pin(self.lookup_record_impl(name.into(), kind))
+        self.lookup_boxed(name.into(), kind, false)
+    }
+
+    /// Returns the [`Self::lookup_record_impl`] future as a `dyn Future`.
+    ///
+    /// Downstream adapters may box a typed lookup again, and retaining the
+    /// complete concrete future can exhaust rustc's trait solver while it proves
+    /// the outer future is Send.
+    fn lookup_boxed(
+        &self,
+        name: String,
+        kind: RecordKind,
+        read_hosts: bool,
+    ) -> Pin<Box<dyn Future<Output = Result<Vec<Record>, Error>> + Send + '_>> {
+        Box::pin(self.lookup_record_impl(name, kind, read_hosts))
     }
 
     /// Creates a resolver on the system configuration, backed by public resolvers.
@@ -1054,7 +1079,7 @@ impl DnsResolver {
                     name: current_host.clone()
                 })
             })?;
-            let (id, query_bytes) = query::build_query(&current_host, qtype)?;
+            let (id, query_bytes) = query::build_query(&name, qtype)?;
             let response = self.send_query(&query_bytes).await?;
             let packet = query::parse_packet(&response)?;
 
@@ -1073,6 +1098,23 @@ impl DnsResolver {
         Err(e!(Error::InvalidResponse))
     }
 
+    /// Returns the hosts-file addresses of `kind` for `name` or a search name.
+    fn hosts_records(&self, name: &str, kind: RecordKind) -> Option<Vec<Record>> {
+        let hosts = &self.state().config.hosts;
+        let names = self.search_names(name);
+        match kind {
+            RecordKind::A => {
+                let addrs = names.iter().find_map(|name| hosts.lookup_ipv4(name))?;
+                Some(addrs.into_iter().map(Record::A).collect())
+            }
+            RecordKind::Aaaa => {
+                let addrs = names.iter().find_map(|name| hosts.lookup_ipv6(name))?;
+                Some(addrs.into_iter().map(Record::Aaaa).collect())
+            }
+            _ => None,
+        }
+    }
+
     /// Looks up the records of `kind` for `name`, following CNAME chains.
     ///
     /// This is the one generic lookup path. It checks the cache, expands search
@@ -1082,8 +1124,8 @@ impl DnsResolver {
     /// typed methods ([`Self::lookup_ipv4`], [`Self::lookup_ipv6`],
     /// [`Self::lookup_txt`]) are thin wrappers over it.
     ///
-    /// The hosts-file override is specific to A and AAAA lookups and lives in
-    /// [`Self::lookup_ipv4`] and [`Self::lookup_ipv6`].
+    /// With `read_hosts`, a hosts-file entry answers ahead of the cache. Only
+    /// [`Self::lookup_ipv4`] and [`Self::lookup_ipv6`] set it.
     ///
     /// # Errors
     ///
@@ -1093,6 +1135,7 @@ impl DnsResolver {
         &self,
         name: String,
         kind: RecordKind,
+        read_hosts: bool,
     ) -> Result<Vec<Record>, Error> {
         // All ahead of the cache, which reads the string.
         let name = canonical_name(&name)?.unwrap_or(name);
@@ -1106,6 +1149,10 @@ impl DnsResolver {
         }
         if let Some(records) = ip_literal_records(&name, kind) {
             trace!(%name, ?kind, "resolved from IP literal");
+            return Ok(records);
+        }
+        if read_hosts && let Some(records) = self.hosts_records(&name, kind) {
+            trace!(%name, ?kind, ?records, "resolved from hosts file");
             return Ok(records);
         }
         match self.cache.get(&name, kind) {
@@ -1251,27 +1298,11 @@ impl DnsResolver {
     }
 
     /// Looks up the IPv4 (A) records for `name`.
+    ///
+    /// A hosts-file entry answers ahead of the cache and DNS.
     pub async fn lookup_ipv4(&self, name: impl Into<String>) -> Result<Vec<Ipv4Addr>, Error> {
-        let name = name.into();
-        // Ahead of the localhost rule and hosts override, which read the string.
-        let name = canonical_name(&name)?.unwrap_or(name);
-        // RFC 6761: localhost always resolves to loopback.
-        if is_localhost(&name) {
-            return Ok(vec![Ipv4Addr::LOCALHOST]);
-        }
-        // A hosts entry overrides DNS, so check it ahead of the cache, but must
-        // not shadow a literal.
-        if !is_ip_literal(&name)
-            && let Some(addrs) = self
-                .search_names(&name)
-                .iter()
-                .find_map(|name| self.state().config.hosts.lookup_ipv4(name))
-        {
-            trace!(%name, ?addrs, "resolved from hosts file");
-            return Ok(addrs);
-        }
         let addrs: Vec<Ipv4Addr> = self
-            .lookup_record(name, RecordKind::A)
+            .lookup_boxed(name.into(), RecordKind::A, true)
             .await?
             .into_iter()
             .filter_map(|r| match r {
@@ -1283,24 +1314,11 @@ impl DnsResolver {
     }
 
     /// Looks up the IPv6 (AAAA) records for `name`.
+    ///
+    /// A hosts-file entry answers ahead of the cache and DNS.
     pub async fn lookup_ipv6(&self, name: impl Into<String>) -> Result<Vec<Ipv6Addr>, Error> {
-        let name = name.into();
-        let name = canonical_name(&name)?.unwrap_or(name);
-        // RFC 6761: localhost always resolves to loopback.
-        if is_localhost(&name) {
-            return Ok(vec![Ipv6Addr::LOCALHOST]);
-        }
-        if !is_ip_literal(&name)
-            && let Some(addrs) = self
-                .search_names(&name)
-                .iter()
-                .find_map(|name| self.state().config.hosts.lookup_ipv6(name))
-        {
-            trace!(%name, ?addrs, "resolved from hosts file");
-            return Ok(addrs);
-        }
         let addrs: Vec<Ipv6Addr> = self
-            .lookup_record(name, RecordKind::Aaaa)
+            .lookup_boxed(name.into(), RecordKind::Aaaa, true)
             .await?
             .into_iter()
             .filter_map(|r| match r {
