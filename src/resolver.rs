@@ -185,9 +185,19 @@ fn validate_name(name: &str) -> Result<(), Error> {
     Ok(())
 }
 
+/// Parses `name` as an IP address literal.
+///
+/// Also accepts an IPv6 address in brackets, the form a URL host has.
+fn parse_ip_literal(name: &str) -> Option<IpAddr> {
+    match name.strip_prefix('[').and_then(|s| s.strip_suffix(']')) {
+        Some(inner) => inner.parse::<Ipv6Addr>().ok().map(IpAddr::V6),
+        None => name.parse().ok(),
+    }
+}
+
 /// Returns whether `name` is an IP address literal rather than a DNS name.
 fn is_ip_literal(name: &str) -> bool {
-    name.parse::<IpAddr>().is_ok()
+    parse_ip_literal(name).is_some()
 }
 
 /// Returns the answer for `name` when it is an IP address literal.
@@ -197,8 +207,7 @@ fn is_ip_literal(name: &str) -> bool {
 /// A literal has no records of the other address family. Returns `None` when
 /// `name` is not a literal.
 fn ip_literal_records(name: &str, kind: RecordKind) -> Option<Vec<Record>> {
-    let ip: IpAddr = name.parse().ok()?;
-    Some(match (ip, kind) {
+    Some(match (parse_ip_literal(name)?, kind) {
         (IpAddr::V4(ip), RecordKind::A) => vec![Record::A(ip)],
         (IpAddr::V6(ip), RecordKind::Aaaa) => vec![Record::Aaaa(ip)],
         _ => Vec::new(),
@@ -1940,6 +1949,21 @@ mod tests {
                 resolver.lookup_ipv4("127.0.0.1").await.unwrap(),
                 [Ipv4Addr::LOCALHOST]
             );
+        }
+
+        #[tokio::test]
+        async fn a_bracketed_ipv6_literal_resolves_to_itself_without_a_query() {
+            let resolver = resolver();
+
+            assert_eq!(
+                resolver.lookup_ipv6("[2001:db8::1]").await.unwrap(),
+                ["2001:db8::1".parse::<Ipv6Addr>().unwrap()]
+            );
+            assert!(resolver.lookup_ipv4("[::1]").await.unwrap().is_empty());
+            assert!(matches!(
+                resolver.lookup_ipv4("[192.0.2.1]").await.unwrap_err(),
+                Error::NoNameservers { .. }
+            ));
         }
 
         #[tokio::test]
