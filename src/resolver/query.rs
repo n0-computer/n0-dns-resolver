@@ -52,6 +52,7 @@ const DNS_HEADER_LEN: usize = 12;
 /// and pointers is rejected before it is parsed.
 pub(super) fn parse_packet(data: &[u8]) -> Result<Packet<'_>, QueryError> {
     // TODO: remove this pre-scan once simple-dns limits name decoding itself.
+    // See <https://github.com/balliegojr/simple-dns/issues/87>.
     if decoded_name_steps(data, MAX_DECODED_NAME_STEPS).is_none() {
         return Err(e!(QueryError::Malformed));
     }
