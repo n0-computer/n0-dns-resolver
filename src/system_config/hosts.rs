@@ -126,7 +126,7 @@ impl Hosts {
                 continue;
             };
             for name in fields {
-                let key = name.to_ascii_lowercase().into_boxed_str();
+                let key = name_key(name).into_owned().into_boxed_str();
                 match addr {
                     IpAddr::V4(ip) => a.entry(key).or_default().push(ip),
                     IpAddr::V6(ip) => aaaa.entry(key).or_default().push(ip),
@@ -197,11 +197,18 @@ mod tests {
 
     #[test]
     fn lookup_is_case_insensitive_and_fqdn_tolerant() {
-        let hosts = Hosts::parse("10.0.1.10 MyRelay.Test\n");
+        let hosts = Hosts::parse("10.0.1.10 MyRelay.Test\n10.0.1.11 pinned.test.\n");
         assert_eq!(
             hosts.lookup_ipv4("myrelay.test."),
             Some(vec![Ipv4Addr::new(10, 0, 1, 10)])
         );
+        for name in ["pinned.test", "pinned.test."] {
+            assert_eq!(
+                hosts.lookup_ipv4(name),
+                Some(vec![Ipv4Addr::new(10, 0, 1, 11)]),
+                "{name:?}"
+            );
+        }
     }
 
     /// `foo\.` is the one label `foo.`, so its escaped dot stays in the key.
