@@ -175,32 +175,61 @@ const DEFAULT_NDOTS: usize = 1;
 /// Escaping a wire byte as `\DDD` takes four bytes of text.
 const MAX_NAME_TEXT_LEN: usize = 4 * 255;
 
-/// Rejects a name whose text form does not map one-to-one onto a wire name.
+/// Returns `name` as `simple_dns` prints its wire name, or `None` if unchanged.
 ///
-/// `simple_dns::Name` drops empty labels, so `localhost..` would reach the wire
-/// as `localhost.` while the localhost rule, hosts override and cache key all
-/// read the string. One trailing dot is the FQDN marker and is kept.
+/// `simple_dns` resolves escapes, so `local\host` goes out as `localhost`. The
+/// localhost rule, hosts override and cache key read the returned string. Only
+/// a name with an escape is parsed and copied. One trailing dot is kept.
 ///
-/// Also rejects a scoped IPv6 literal such as `fe80::1%eth0`. The answer types
-/// have no field for the scope, and the literal is not a DNS name. See
-/// <https://github.com/n0-computer/n0-dns-resolver/issues/48>.
-fn validate_name(name: &str) -> Result<(), Error> {
-    let stripped = name.strip_suffix('.').unwrap_or(name);
-    if stripped.is_empty()
-        || stripped.len() > MAX_NAME_TEXT_LEN
-        || stripped.split('.').any(str::is_empty)
-        || is_scoped_ipv6_literal(name)
-    {
+/// # Errors
+///
+/// Returns [`Error::InvalidName`] for an empty label, a name or label too long
+/// for the wire, or a scoped IPv6 literal such as `fe80::1%eth0` (see
+/// <https://github.com/n0-computer/n0-dns-resolver/issues/48>).
+fn canonical_name(name: &str) -> Result<Option<String>, Error> {
+    /// The most bytes a label holds (RFC 1035 Section 2.3.4).
+    const MAX_LABEL_LEN: usize = 63;
+    /// The longest unescaped name, 255 wire bytes less two length bytes.
+    const MAX_PLAIN_NAME_LEN: usize = 253;
+
+    let invalid = || {
         // Keeps a huge input out of the error and the logs.
         let mut end = name.len().min(MAX_NAME_TEXT_LEN);
         while !name.is_char_boundary(end) {
             end -= 1;
         }
-        return Err(e!(Error::InvalidName {
+        e!(Error::InvalidName {
             name: name[..end].to_string()
-        }));
+        })
+    };
+    let (stripped, fqdn) = match name.strip_suffix('.') {
+        Some(stripped) => (stripped, "."),
+        None => (name, ""),
+    };
+    // Ahead of `Name::new`, which splits all labels before it checks the length.
+    if stripped.is_empty() || stripped.len() > MAX_NAME_TEXT_LEN || is_scoped_ipv6_literal(name) {
+        return Err(invalid());
     }
-    Ok(())
+    if !stripped.contains('\\') {
+        let labels_fit = stripped
+            .split('.')
+            .all(|label| (1..=MAX_LABEL_LEN).contains(&label.len()));
+        return match labels_fit && stripped.len() <= MAX_PLAIN_NAME_LEN {
+            true => Ok(None),
+            false => Err(invalid()),
+        };
+    }
+    let wire = simple_dns::Name::new(stripped).map_err(|_| invalid())?;
+    // `Name::new` drops empty labels, so a missing label shows in the count.
+    if wire.get_labels().len() != label_dots(stripped).count() + 1 {
+        return Err(invalid());
+    }
+    // An escaped byte that is not UTF-8 may print as another character.
+    let printed = wire.to_string();
+    if simple_dns::Name::new(&printed).ok() != Some(wire) {
+        return Err(invalid());
+    }
+    Ok(Some(printed + fqdn))
 }
 
 /// Parses `name` as an IP address literal.
@@ -248,12 +277,23 @@ fn ip_literal_records(name: &str, kind: RecordKind) -> Option<Vec<Record>> {
 /// DNS names are case-insensitive, so `foo.LOCALHOST` is one of them too, and
 /// must not go out to a nameserver that could answer it with any address.
 ///
-/// Assumes `host` passed [`validate_name`].
+/// Assumes `host` is in the form [`canonical_name`] returns.
 fn is_localhost(host: &str) -> bool {
     let host = host.strip_suffix('.').unwrap_or(host);
-    host.rsplit('.')
-        .next()
-        .is_some_and(|label| label.eq_ignore_ascii_case("localhost"))
+    let last_label = &host[label_dots(host).last().map_or(0, |dot| dot + 1)..];
+    last_label.eq_ignore_ascii_case("localhost")
+}
+
+/// Returns the byte positions of the dots that separate the labels of `name`.
+///
+/// A dot after a backslash, as in `My\.Printer`, is part of a label.
+fn label_dots(name: &str) -> impl Iterator<Item = usize> + '_ {
+    let mut escaped = false;
+    name.bytes().enumerate().filter_map(move |(i, byte)| {
+        let dot = byte == b'.' && !escaped;
+        escaped = byte == b'\\' && !escaped;
+        dot.then_some(i)
+    })
 }
 
 /// A stub DNS resolver over UDP/TCP (and, with a crypto provider, DoT/DoH).
@@ -520,7 +560,7 @@ impl DnsResolver {
         // Label count = dots + 1 (e.g. "foo.bar" has 2 labels).
         // resolv.conf(5): "if the name has more dots than ndots, try as absolute first"
         // which is equivalent to num_labels > ndots.
-        let num_labels = host.bytes().filter(|&b| b == b'.').count() + 1;
+        let num_labels = label_dots(host).count() + 1;
         let bare_first = num_labels > config.ndots.unwrap_or(DEFAULT_NDOTS);
 
         let mut names: Vec<String> = Vec::with_capacity(config.search_domains.len() + 1);
@@ -1045,8 +1085,8 @@ impl DnsResolver {
         name: String,
         kind: RecordKind,
     ) -> Result<Vec<Record>, Error> {
-        // All ahead of the cache: the key is the caller's string.
-        validate_name(&name)?;
+        // All ahead of the cache, which reads the string.
+        let name = canonical_name(&name)?.unwrap_or(name);
         // RFC 6761: localhost resolves to loopback, and has no other records.
         if is_localhost(&name) {
             return Ok(match kind {
@@ -1205,7 +1245,7 @@ impl DnsResolver {
     pub async fn lookup_ipv4(&self, name: impl Into<String>) -> Result<Vec<Ipv4Addr>, Error> {
         let name = name.into();
         // Ahead of the localhost rule and hosts override, which read the string.
-        validate_name(&name)?;
+        let name = canonical_name(&name)?.unwrap_or(name);
         // RFC 6761: localhost always resolves to loopback.
         if is_localhost(&name) {
             return Ok(vec![Ipv4Addr::LOCALHOST]);
@@ -1236,7 +1276,7 @@ impl DnsResolver {
     /// Looks up the IPv6 (AAAA) records for `name`.
     pub async fn lookup_ipv6(&self, name: impl Into<String>) -> Result<Vec<Ipv6Addr>, Error> {
         let name = name.into();
-        validate_name(&name)?;
+        let name = canonical_name(&name)?.unwrap_or(name);
         // RFC 6761: localhost always resolves to loopback.
         if is_localhost(&name) {
             return Ok(vec![Ipv6Addr::LOCALHOST]);
@@ -1568,6 +1608,14 @@ mod tests {
     ///
     /// Only the last label decides; `localhost` elsewhere in the name does not.
     #[test]
+    fn an_escaped_dot_does_not_make_a_name_localhost() {
+        assert!(!super::is_localhost("a\\.localhost"));
+        assert!(super::is_localhost("a\\.b.localhost"));
+        assert_eq!(super::label_dots("a\\.b.c").count(), 1);
+        assert_eq!(super::label_dots("a\\\\.b").count(), 1);
+    }
+
+    #[test]
     fn localhost_is_matched_case_insensitively() {
         for host in ["localhost", "LOCALHOST.", "foo.LocalHost", "a.b.localhost."] {
             assert!(super::is_localhost(host), "{host}");
@@ -1871,11 +1919,11 @@ mod tests {
     }
 
     mod name_validation {
-        use super::{super::validate_name, *};
+        use super::{super::canonical_name, *};
         use crate::Error;
 
-        /// The shapes `Name::new` would rewrite.
-        const REWRITTEN: &[&str] = &[
+        /// Names with an empty label, which `Name::new` would drop.
+        const EMPTY_LABELS: &[&str] = &[
             "",
             ".",
             "..",
@@ -1884,25 +1932,62 @@ mod tests {
             ".example.com",
             "relay..example",
             "example.com..",
+            "a\\.b..c",
         ];
+
+        fn is_invalid(name: &str) -> bool {
+            matches!(canonical_name(name), Err(Error::InvalidName { .. }))
+        }
 
         #[test]
         fn empty_labels_are_rejected() {
-            for name in REWRITTEN {
-                assert!(
-                    matches!(validate_name(name), Err(Error::InvalidName { .. })),
-                    "{name:?} should be rejected"
+            for name in EMPTY_LABELS {
+                assert!(is_invalid(name), "{name:?} should be rejected");
+            }
+        }
+
+        /// `\255` is not UTF-8, and `simple_dns` prints it as U+FFFD.
+        #[test]
+        fn an_escape_that_does_not_print_back_is_rejected() {
+            assert!(is_invalid("a\\255b"));
+        }
+
+        #[test]
+        fn escapes_are_rewritten_to_the_wire_form() {
+            for (name, wire) in [
+                ("local\\host", "localhost"),
+                ("\\108ocalhost", "localhost"),
+                ("foo.localhos\\t.", "foo.localhost."),
+                ("rel\\ay.example", "relay.example"),
+                (
+                    "My\\032Printer._ipp._tcp.local",
+                    "My Printer._ipp._tcp.local",
+                ),
+                (
+                    "My\\.Printer._ipp._tcp.local",
+                    "My\\.Printer._ipp._tcp.local",
+                ),
+            ] {
+                assert_eq!(
+                    canonical_name(name).unwrap().as_deref(),
+                    Some(wire),
+                    "{name:?}"
                 );
             }
         }
 
+        /// Passes without the length check too, which only saves work.
         #[test]
-        fn overlong_names_are_rejected() {
-            let name = "a.".repeat(1_000_000);
+        fn overlong_names_and_labels_are_rejected() {
             assert!(matches!(
-                validate_name(&name),
+                canonical_name(&"a.".repeat(1_000_000)),
                 Err(Error::InvalidName { name, .. }) if name.len() <= super::super::MAX_NAME_TEXT_LEN
             ));
+            assert!(is_invalid(&"a".repeat(64)));
+            assert!(is_invalid(&format!("{}a", "a.".repeat(127))));
+            // 127 one-byte labels are the longest valid wire name.
+            assert_eq!(canonical_name(&"a.".repeat(127)).unwrap(), None);
+            assert_eq!(canonical_name(&"a".repeat(63)).unwrap(), None);
         }
 
         #[test]
@@ -1913,29 +1998,53 @@ mod tests {
                 "fe80::1%25eth0",
                 "fe80::1%2",
             ] {
-                assert!(
-                    matches!(validate_name(name), Err(Error::InvalidName { .. })),
-                    "{name:?} should be rejected"
-                );
+                assert!(is_invalid(name), "{name:?} should be rejected");
             }
-            assert!(validate_name("not%an.address").is_ok());
+            assert_eq!(canonical_name("not%an.address").unwrap(), None);
         }
 
+        /// A name without escapes is already in wire form and is not copied.
         #[test]
-        fn ordinary_names_and_one_trailing_dot_pass() {
+        fn ordinary_names_pass_unchanged() {
             for name in [
                 "example.com",
                 "example.com.",
+                "EXAMPLE.com",
                 "localhost",
                 "localhost.",
                 "a",
+                "_ipp._tcp.local",
+                "My Printer._ipp._tcp.local",
+                "xn--bcher-kva.example",
+                "b\u{fc}cher.example",
             ] {
-                assert!(validate_name(name).is_ok(), "{name:?} should pass");
+                assert_eq!(canonical_name(name).unwrap(), None, "{name:?}");
             }
         }
 
-        /// `localhost..` used to fail the check and reach a nameserver as
-        /// `localhost.`, which could answer it with any address.
+        #[tokio::test]
+        async fn an_escaped_name_gets_the_localhost_rule_and_the_hosts_file() {
+            let mut resolver = empty_resolver();
+            resolver.set_hosts(Hosts::from_content("10.0.1.10 relay.example\n"));
+
+            assert_eq!(
+                resolver.lookup_ipv4("local\\host").await.unwrap(),
+                [Ipv4Addr::LOCALHOST]
+            );
+            assert_eq!(
+                resolver.lookup_ipv4("rel\\ay.example").await.unwrap(),
+                [Ipv4Addr::new(10, 0, 1, 10)]
+            );
+            assert_eq!(
+                resolver
+                    .lookup_record("\\108ocalhost", RecordKind::A)
+                    .await
+                    .unwrap(),
+                [Record::A(Ipv4Addr::LOCALHOST)]
+            );
+        }
+
+        /// `localhost..` once reached a nameserver, which could answer with any address.
         #[tokio::test]
         async fn localhost_with_an_empty_label_never_reaches_a_nameserver() {
             let resolver = empty_resolver();
@@ -1987,8 +2096,7 @@ mod tests {
             );
         }
 
-        /// `search_names("")` expands to `".example.com"`, which `Name::new`
-        /// used to rewrite to `example.com`.
+        /// The empty name expands to `.example.com`, which `Name::new` turns into `example.com`.
         #[tokio::test]
         async fn the_empty_name_is_not_expanded_to_a_search_domain() {
             let mut resolver = empty_resolver();
