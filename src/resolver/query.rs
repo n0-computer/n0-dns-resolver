@@ -42,41 +42,8 @@ pub(super) fn response_code(rcode: RCODE) -> ResponseCode {
     }
 }
 
-/// Length of a fixed DNS message header (RFC 1035 Section 4.1.1).
-///
-/// A buffer shorter than this cannot be a DNS message. The header-flag helpers
-/// index into the first four bytes without bounds-checking, so callers on raw
-/// network input guard against shorter buffers first.
-const DNS_HEADER_LEN: usize = 12;
-
-/// Smallest wire size of a question: a root name, a type, and a class.
-const MIN_QUESTION_LEN: usize = 1 + 2 + 2;
-
-/// Smallest wire size of a resource record.
-///
-/// A root name, a type, a class, a TTL, and a zero rdata length.
-const MIN_RECORD_LEN: usize = 1 + 2 + 2 + 4 + 2;
-
 /// Parses a message from the network.
-///
-/// `simple_dns` reserves each section's vector from the header counts before
-/// it reads a record, so a datagram of a dozen bytes claiming 65535 records
-/// in every section has it allocate tens of megabytes and then fail on the
-/// first record. The counts are checked against the smallest wire form of a
-/// question and a record first, so a message can only make the parser reserve
-/// what its own length could hold.
 pub(super) fn parse_packet(data: &[u8]) -> Result<Packet<'_>, QueryError> {
-    if data.len() < DNS_HEADER_LEN {
-        return Err(e!(QueryError::Malformed));
-    }
-    let questions = usize::from(header_buffer::questions_unchecked(data));
-    let records = usize::from(header_buffer::answers_unchecked(data))
-        + usize::from(header_buffer::name_servers_unchecked(data))
-        + usize::from(header_buffer::additional_records_unchecked(data));
-    let min_len = DNS_HEADER_LEN + questions * MIN_QUESTION_LEN + records * MIN_RECORD_LEN;
-    if data.len() < min_len {
-        return Err(e!(QueryError::Malformed));
-    }
     Packet::parse(data).map_err(|_| e!(QueryError::Malformed))
 }
 
@@ -88,23 +55,23 @@ pub(super) fn parse_packet(data: &[u8]) -> Result<Packet<'_>, QueryError> {
 /// original 512-byte RFC 1035 limit.
 const EDNS_UDP_PAYLOAD_SIZE: u16 = 1232;
 
-/// Builds a DNS query packet for the given host and query type.
+/// Builds a DNS query packet for the given name and query type.
 ///
 /// The query includes an EDNS(0) OPT record advertising support for
 /// responses up to [`EDNS_UDP_PAYLOAD_SIZE`] bytes over UDP.
 ///
 /// Returns `(query_id, wire_bytes)`.
-pub(super) fn build_query(host: &str, qtype: TYPE) -> Result<(u16, Vec<u8>), QueryError> {
+pub(super) fn build_query(name: &Name<'_>, qtype: TYPE) -> Result<(u16, Vec<u8>), QueryError> {
     let id: u16 = rand::random();
     let mut packet = Packet::new_query(id);
     packet.set_flags(PacketFlag::RECURSION_DESIRED);
 
-    let name = Name::new(host).map_err(|_| {
-        e!(QueryError::BuildQuery {
-            name: host.to_string()
-        })
-    })?;
-    let question = Question::new(name, QTYPE::TYPE(qtype), QCLASS::CLASS(CLASS::IN), false);
+    let question = Question::new(
+        name.clone(),
+        QTYPE::TYPE(qtype),
+        QCLASS::CLASS(CLASS::IN),
+        false,
+    );
     packet.questions.push(question);
 
     // Add EDNS(0) OPT record to advertise larger UDP payload support.
@@ -116,7 +83,7 @@ pub(super) fn build_query(host: &str, qtype: TYPE) -> Result<(u16, Vec<u8>), Que
 
     let bytes = packet.build_bytes_vec().map_err(|_| {
         e!(QueryError::BuildQuery {
-            name: host.to_string()
+            name: name.to_string()
         })
     })?;
     Ok((id, bytes))
@@ -137,12 +104,6 @@ pub(super) fn build_query(host: &str, qtype: TYPE) -> Result<(u16, Vec<u8>), Que
 /// the race try another server, and the eventual response is still checked by
 /// [`check_response`].
 pub(super) fn retryable_failure_rcode(data: &[u8]) -> Option<RCODE> {
-    // `header_buffer::rcode` indexes `data[2..4]` without a bounds check, so a
-    // response shorter than a DNS header would panic. This runs on raw,
-    // unvalidated bytes before `check_response`, so guard the length here.
-    if data.len() < DNS_HEADER_LEN {
-        return None;
-    }
     match header_buffer::rcode(data) {
         Ok(rcode @ (RCODE::ServerFailure | RCODE::Refused | RCODE::FormatError)) => Some(rcode),
         _ => None,
@@ -156,7 +117,7 @@ pub(super) fn retryable_failure_rcode(data: &[u8]) -> Option<RCODE> {
 /// same server without EDNS (see [`strip_edns`]) before moving on. Reads only
 /// the header RCODE, so it runs on raw bytes before full validation.
 pub(super) fn is_format_error(data: &[u8]) -> bool {
-    data.len() >= DNS_HEADER_LEN && matches!(header_buffer::rcode(data), Ok(RCODE::FormatError))
+    matches!(header_buffer::rcode(data), Ok(RCODE::FormatError))
 }
 
 /// Returns whether a datagram answers `query`, for the UDP receive loop.
@@ -204,9 +165,7 @@ pub(super) fn answers_query(response: &[u8], query: &[u8]) -> bool {
             .iter()
             .zip(&sent.questions)
             .all(|(got, want)| {
-                names_equal(&got.qname, &want.qname)
-                    && got.qtype == want.qtype
-                    && got.qclass == want.qclass
+                got.qname == want.qname && got.qtype == want.qtype && got.qclass == want.qclass
             })
 }
 
@@ -228,8 +187,7 @@ pub(super) fn strip_edns(query: &[u8]) -> Option<Vec<u8>> {
 /// in the authority section; the negative result should be cached for no longer
 /// than `min(SOA MINIMUM, SOA record TTL)`. Returns `None` when no SOA is
 /// present, so the caller can fall back to a fixed default.
-pub(super) fn negative_ttl(data: &[u8]) -> Option<u32> {
-    let packet = parse_packet(data).ok()?;
+pub(super) fn negative_ttl(packet: &Packet<'_>) -> Option<u32> {
     packet.name_servers.iter().find_map(|rr| match &rr.rdata {
         RData::SOA(soa) => Some(rr.ttl.min(soa.minimum)),
         _ => None,
@@ -238,19 +196,6 @@ pub(super) fn negative_ttl(data: &[u8]) -> Option<u32> {
 
 /// Maximum CNAME chain depth to prevent infinite loops.
 pub(super) const MAX_CNAME_DEPTH: usize = 8;
-
-/// Returns whether `a` and `b` are the same DNS name.
-///
-/// Labels are compared without regard to ASCII case, as RFC 4343 requires.
-/// `simple_dns` derives `PartialEq` for [`Name`] over the raw label bytes, so
-/// `Example.COM` and `example.com` compare unequal there, while a server may
-/// well return an owner name in a case other than the one we asked in.
-pub(super) fn names_equal(a: &Name<'_>, b: &Name<'_>) -> bool {
-    a.get_labels().len() == b.get_labels().len()
-        && a.as_bytes()
-            .zip(b.as_bytes())
-            .all(|(a, b)| a.eq_ignore_ascii_case(b))
-}
 
 /// Returns every name in the CNAME chain starting at `start_name`.
 ///
@@ -268,7 +213,7 @@ fn cname_chain<'a>(packet: &'a Packet<'a>, start_name: &Name<'a>) -> Vec<Name<'a
         let Some(RData::CNAME(cname)) = packet
             .answers
             .iter()
-            .find(|rr| rr.class == CLASS::IN && names_equal(&rr.name, &current))
+            .find(|rr| rr.class == CLASS::IN && rr.name == current)
             .map(|rr| &rr.rdata)
         else {
             break;
@@ -294,16 +239,14 @@ pub(super) fn unresolved_cname_target(
 ) -> Option<String> {
     let chain = cname_chain(packet, qname);
     let answered = packet.answers.iter().any(|rr| {
-        rr.class == CLASS::IN
-            && rr.rdata.type_code() == qtype
-            && chain.iter().any(|name| names_equal(name, &rr.name))
+        rr.class == CLASS::IN && rr.rdata.type_code() == qtype && chain.contains(&rr.name)
     });
     if answered {
         return None;
     }
     // The chain always starts with `qname`.
     let last = chain.last()?;
-    (!names_equal(last, qname)).then(|| last.to_string())
+    (last != qname).then(|| last.to_string())
 }
 
 /// Validates a response against the query that produced it, then surfaces its RCODE.
@@ -327,10 +270,11 @@ pub(super) fn check_response(
     if packet.id() != expected_id {
         return Err(e!(QueryError::Unexpected));
     }
-    // The response must echo exactly the question we sent (RFC 1035 4.1.2).
+    // The response must echo the question we sent (RFC 1035 4.1.2). `Name`
+    // equality ignores ASCII case, as RFC 4343 requires.
     match packet.questions.as_slice() {
         [question]
-            if names_equal(&question.qname, expected_name)
+            if question.qname == *expected_name
                 && question.qtype == QTYPE::TYPE(expected_type)
                 && question.qclass == QCLASS::CLASS(CLASS::IN) => {}
         _ => return Err(e!(QueryError::Unexpected)),
@@ -353,23 +297,21 @@ pub(super) fn check_response(
 /// record even under the same name and type, so records of any other class are
 /// left out rather than returned as answers to an IN question.
 fn parse_response<T>(
-    data: &[u8],
+    packet: &Packet<'_>,
     extract: impl Fn(&Name<'_>, &RData<'_>) -> Option<T>,
 ) -> Result<(Vec<T>, u32), QueryError> {
-    let packet = parse_packet(data)?;
-
     // The chain is empty only for a response with no question section, which
     // `check_response` already rejects; extraction then matches nothing.
     let chain = packet
         .questions
         .first()
-        .map(|question| cname_chain(&packet, &question.qname))
+        .map(|question| cname_chain(packet, &question.qname))
         .unwrap_or_default();
 
     let mut results = Vec::new();
     let mut min_ttl = u32::MAX;
     for rr in &packet.answers {
-        if rr.class != CLASS::IN || !chain.iter().any(|name| names_equal(name, &rr.name)) {
+        if rr.class != CLASS::IN || !chain.contains(&rr.name) {
             continue;
         }
         // A CNAME along the chain bounds the cached lifetime too: a short-TTL
@@ -397,27 +339,27 @@ fn parse_response<T>(
 /// closure for `kind` and runs [`parse_response`], returning the matching
 /// [`Record`]s and the minimum TTL across them.
 pub(super) fn parse_records(
-    data: &[u8],
+    packet: &Packet<'_>,
     kind: RecordKind,
 ) -> Result<(Vec<Record>, u32), QueryError> {
     match kind {
-        RecordKind::A => parse_response(data, |_, rdata| match rdata {
+        RecordKind::A => parse_response(packet, |_, rdata| match rdata {
             RData::A(A { address }) => Some(Record::A(Ipv4Addr::from(*address))),
             _ => None,
         }),
-        RecordKind::Aaaa => parse_response(data, |_, rdata| match rdata {
+        RecordKind::Aaaa => parse_response(packet, |_, rdata| match rdata {
             RData::AAAA(AAAA { address }) => Some(Record::Aaaa(Ipv6Addr::from(*address))),
             _ => None,
         }),
-        RecordKind::Txt => parse_response(data, |_, rdata| match rdata {
+        RecordKind::Txt => parse_response(packet, |_, rdata| match rdata {
             RData::TXT(txt) => Some(Record::Txt(extract_txt_record_data(txt))),
             _ => None,
         }),
-        RecordKind::Ns => parse_response(data, |_, rdata| match rdata {
+        RecordKind::Ns => parse_response(packet, |_, rdata| match rdata {
             RData::NS(ns) => Some(Record::Ns(ns.0.to_string())),
             _ => None,
         }),
-        RecordKind::Srv => parse_response(data, |_, rdata| match rdata {
+        RecordKind::Srv => parse_response(packet, |_, rdata| match rdata {
             RData::SRV(srv) => Some(Record::Srv(SrvRecordData {
                 priority: srv.priority,
                 weight: srv.weight,
@@ -426,14 +368,14 @@ pub(super) fn parse_records(
             })),
             _ => None,
         }),
-        RecordKind::Mx => parse_response(data, |_, rdata| match rdata {
+        RecordKind::Mx => parse_response(packet, |_, rdata| match rdata {
             RData::MX(mx) => Some(Record::Mx(MxRecordData {
                 preference: mx.preference,
                 exchange: mx.exchange.to_string(),
             })),
             _ => None,
         }),
-        RecordKind::Caa => parse_response(data, |_, rdata| match rdata {
+        RecordKind::Caa => parse_response(packet, |_, rdata| match rdata {
             RData::CAA(caa) => Some(Record::Caa(CaaRecordData {
                 flag: caa.flag,
                 tag: caa.tag.to_string(),
@@ -441,11 +383,11 @@ pub(super) fn parse_records(
             })),
             _ => None,
         }),
-        RecordKind::Svcb => parse_response(data, |_, rdata| match rdata {
+        RecordKind::Svcb => parse_response(packet, |_, rdata| match rdata {
             RData::SVCB(svcb) => Some(Record::Svcb(extract_svcb(svcb))),
             _ => None,
         }),
-        RecordKind::Https => parse_response(data, |name, rdata| match rdata {
+        RecordKind::Https => parse_response(packet, |name, rdata| match rdata {
             RData::HTTPS(https) => Some(Record::Https(HttpsRecordData::new(
                 name.to_string(),
                 extract_svcb(&https.0),
@@ -502,12 +444,6 @@ fn extract_txt_record_data(txt: &simple_dns::rdata::TXT<'_>) -> TxtRecordData {
 /// body fails to parse. A buffer too short to hold a header is treated as not
 /// truncated; it will fail to parse downstream.
 pub(super) fn is_truncated(data: &[u8]) -> bool {
-    // As in `server_failure_rcode`, guard against a short buffer: this runs on
-    // the raw UDP datagram before any validation, and `header_buffer::has_flags`
-    // would panic indexing `data[2..4]` on fewer than four bytes.
-    if data.len() < DNS_HEADER_LEN {
-        return false;
-    }
     header_buffer::has_flags(data, PacketFlag::TRUNCATION).unwrap_or(false)
 }
 
@@ -522,16 +458,28 @@ mod tests {
 
     use super::*;
 
+    /// Length of a fixed DNS message header (RFC 1035 Section 4.1.1).
+    const DNS_HEADER_LEN: usize = 12;
+
     /// Build a query packet for `host` with type A, return (id, bytes).
     fn make_query(host: &str) -> (u16, Vec<u8>) {
-        build_query(host, TYPE::A).unwrap()
+        build_query(&Name::new(host).unwrap(), TYPE::A).unwrap()
+    }
+
+    /// Parses `data` and reads its records, for tests that start from bytes.
+    fn parse_records_from(data: &[u8], kind: RecordKind) -> Result<(Vec<Record>, u32), QueryError> {
+        parse_records(&parse_packet(data)?, kind)
+    }
+
+    fn negative_ttl_from(data: &[u8]) -> Option<u32> {
+        negative_ttl(&parse_packet(data).ok()?)
     }
 
     /// Parses `data` down to its A record addresses and TTL.
     ///
     /// Lets the A-focused tests compare against a plain `Vec<Ipv4Addr>`.
     fn parse_a_addrs(data: &[u8]) -> (Vec<Ipv4Addr>, u32) {
-        let (records, ttl) = parse_records(data, RecordKind::A).unwrap();
+        let (records, ttl) = parse_records_from(data, RecordKind::A).unwrap();
         let addrs = records
             .into_iter()
             .filter_map(|r| match r {
@@ -621,7 +569,7 @@ mod tests {
 
     #[test]
     fn build_query_includes_edns_opt() {
-        let (_, bytes) = build_query("example.com", TYPE::A).unwrap();
+        let (_, bytes) = build_query(&Name::new("example.com").unwrap(), TYPE::A).unwrap();
         let packet = Packet::parse(&bytes).unwrap();
         let opt = packet.opt().expect("query should include OPT record");
         assert_eq!(opt.udp_packet_size, 1232);
@@ -630,7 +578,7 @@ mod tests {
 
     #[test]
     fn strip_edns_removes_opt_and_preserves_question() {
-        let (id, bytes) = build_query("example.com", TYPE::A).unwrap();
+        let (id, bytes) = build_query(&Name::new("example.com").unwrap(), TYPE::A).unwrap();
         assert!(Packet::parse(&bytes).unwrap().opt().is_some());
 
         let stripped = strip_edns(&bytes).expect("query has EDNS to strip");
@@ -691,11 +639,11 @@ mod tests {
         ));
         let bytes = packet.build_bytes_vec().unwrap();
         // min(record TTL 900, SOA minimum 300) = 300.
-        assert_eq!(negative_ttl(&bytes), Some(300));
+        assert_eq!(negative_ttl_from(&bytes), Some(300));
 
         // A response with no SOA in the authority section yields None.
         let plain = a_response(id, "example.com", &[Ipv4Addr::new(1, 2, 3, 4)]);
-        assert_eq!(negative_ttl(&plain), None);
+        assert_eq!(negative_ttl_from(&plain), None);
     }
 
     #[test]
@@ -937,7 +885,7 @@ mod tests {
             TYPE::NS,
             RData::NS(Name::new_unchecked("ns1.example.com").into()),
         );
-        let (records, ttl) = parse_records(&resp, RecordKind::Ns).unwrap();
+        let (records, ttl) = parse_records_from(&resp, RecordKind::Ns).unwrap();
         assert_eq!(ttl, 300);
         let [Record::Ns(name)] = records.as_slice() else {
             panic!("expected one NS record, got {records:?}");
@@ -957,7 +905,7 @@ mod tests {
                 target: Name::new_unchecked("sip.example.com"),
             }),
         );
-        let (records, _) = parse_records(&resp, RecordKind::Srv).unwrap();
+        let (records, _) = parse_records_from(&resp, RecordKind::Srv).unwrap();
         let [Record::Srv(srv)] = records.as_slice() else {
             panic!("expected one SRV record, got {records:?}");
         };
@@ -977,7 +925,7 @@ mod tests {
                 exchange: Name::new_unchecked("mail.example.com"),
             }),
         );
-        let (records, _) = parse_records(&resp, RecordKind::Mx).unwrap();
+        let (records, _) = parse_records_from(&resp, RecordKind::Mx).unwrap();
         let [Record::Mx(mx)] = records.as_slice() else {
             panic!("expected one MX record, got {records:?}");
         };
@@ -996,7 +944,7 @@ mod tests {
                 value: b"letsencrypt.org".as_slice().into(),
             }),
         );
-        let (records, _) = parse_records(&resp, RecordKind::Caa).unwrap();
+        let (records, _) = parse_records_from(&resp, RecordKind::Caa).unwrap();
         let [Record::Caa(caa)] = records.as_slice() else {
             panic!("expected one CAA record, got {records:?}");
         };
@@ -1032,7 +980,7 @@ mod tests {
     #[test]
     fn parse_svcb_record() {
         let resp = reply_with_answer("svc.example.com", TYPE::SVCB, RData::SVCB(sample_svcb()));
-        let (records, _) = parse_records(&resp, RecordKind::Svcb).unwrap();
+        let (records, _) = parse_records_from(&resp, RecordKind::Svcb).unwrap();
         let [Record::Svcb(svcb)] = records.as_slice() else {
             panic!("expected one SVCB record, got {records:?}");
         };
@@ -1046,7 +994,7 @@ mod tests {
             TYPE::HTTPS,
             RData::HTTPS(sample_svcb().into()),
         );
-        let (records, _) = parse_records(&resp, RecordKind::Https).unwrap();
+        let (records, _) = parse_records_from(&resp, RecordKind::Https).unwrap();
         let [Record::Https(https)] = records.as_slice() else {
             panic!("expected one HTTPS record, got {records:?}");
         };
@@ -1063,7 +1011,7 @@ mod tests {
         // Parse one HTTPS record from raw rdata; the owner is EXAMPLE_WIRE.
         fn https(rdata: &[u8]) -> HttpsRecordData {
             let resp = raw_response(TYPE_HTTPS, EXAMPLE_WIRE, EXAMPLE_WIRE, TYPE_HTTPS, rdata);
-            let (records, _) = parse_records(&resp, RecordKind::Https).expect("vector parses");
+            let (records, _) = parse_records_from(&resp, RecordKind::Https).expect("vector parses");
             match records.as_slice() {
                 [Record::Https(https)] => https.clone(),
                 other => panic!("expected one HTTPS record, got {other:?}"),
@@ -1137,9 +1085,9 @@ mod tests {
         assert!(answers_query(&cut, &query));
     }
 
-    /// A header that claims more records than the message could hold is rejected.
+    /// A header that claims more records than the message holds is rejected.
     ///
-    /// Before the parser reserves a vector per section from those counts.
+    /// `simple_dns` 0.13.1 caps what it reserves from those counts, so this costs nothing.
     #[test]
     fn parse_packet_rejects_overstated_section_counts() {
         let (id, _) = make_query("example.com");
@@ -1209,7 +1157,7 @@ mod tests {
         ));
         let resp = packet.build_bytes_vec().unwrap();
 
-        let (records, _) = parse_records(&resp, RecordKind::Txt).unwrap();
+        let (records, _) = parse_records_from(&resp, RecordKind::Txt).unwrap();
         let [Record::Txt(data)] = records.as_slice() else {
             panic!("expected one TXT record, got {records:?}");
         };
@@ -1270,7 +1218,7 @@ mod tests {
     /// vectors drive straight through [`parse_records`].
     fn parse_svcb_vector(rtype: u16, kind: RecordKind, rdata: &[u8]) -> SvcbRecordData {
         let resp = raw_response(rtype, EXAMPLE_WIRE, EXAMPLE_WIRE, rtype, rdata);
-        let (records, _) = parse_records(&resp, kind).expect("vector should parse");
+        let (records, _) = parse_records_from(&resp, kind).expect("vector should parse");
         match records.as_slice() {
             [Record::Svcb(svcb)] => svcb.clone(),
             [Record::Https(https)] => https.svcb().clone(),
@@ -1388,7 +1336,7 @@ mod tests {
                       \x00\x01\x00\x09\x02h2\x05h3-19";
         let resp = raw_response(TYPE_SVCB, EXAMPLE_WIRE, EXAMPLE_WIRE, TYPE_SVCB, rdata);
         assert!(matches!(
-            parse_records(&resp, RecordKind::Svcb),
+            parse_records_from(&resp, RecordKind::Svcb),
             Err(QueryError::Malformed { .. })
         ));
     }
@@ -1406,7 +1354,7 @@ mod tests {
             b"\x01\x02\x03",
         );
         assert!(matches!(
-            parse_records(&resp, RecordKind::A),
+            parse_records_from(&resp, RecordKind::A),
             Err(QueryError::Malformed { .. })
         ));
     }
@@ -1447,7 +1395,7 @@ mod tests {
             &[10, 0, 0, 7],
         );
         assert!(matches!(
-            parse_records(&resp, RecordKind::A),
+            parse_records_from(&resp, RecordKind::A),
             Err(QueryError::Malformed { .. })
         ));
     }
@@ -1549,7 +1497,7 @@ mod tests {
         )));
         let resp = reply_with_answer("svc.example.com", TYPE::SVCB, RData::SVCB(svcb));
 
-        let (records, _) = parse_records(&resp, RecordKind::Svcb).unwrap();
+        let (records, _) = parse_records_from(&resp, RecordKind::Svcb).unwrap();
         let [Record::Svcb(data)] = records.as_slice() else {
             panic!("expected one SVCB record, got {records:?}");
         };
@@ -1602,8 +1550,87 @@ mod tests {
         ));
         let resp = packet.build_bytes_vec().unwrap();
 
-        let (records, ttl) = parse_records(&resp, RecordKind::A).unwrap();
+        let (records, ttl) = parse_records_from(&resp, RecordKind::A).unwrap();
         assert_eq!(ttl, 50);
         assert_eq!(records.len(), 1);
+    }
+    /// Builds a response of `size` bytes carrying a compression-pointer ladder.
+    ///
+    /// The ladder is `hops` pointer-to-pointer cells inside an opaque record, and
+    /// every later owner name points at its top. A pointer holds a 14-bit offset,
+    /// so the ladder must end below 16 KiB, about 8000 hops.
+    fn pointer_ladder_response(hops: usize, size: usize) -> (Vec<u8>, u16) {
+        let mut buf = vec![0u8; DNS_HEADER_LEN];
+        buf[2] = 0x80; // QR
+
+        buf.push(0); // root owner name
+        buf.extend_from_slice(&[0x00, 0x63]); // TYPE 99, unknown to the parser
+        buf.extend_from_slice(&[0, 1]); // CLASS IN
+        buf.extend_from_slice(&[0, 0, 0, 60]); // TTL
+        let rdlen_at = buf.len();
+        buf.extend_from_slice(&[0, 0]); // RDLENGTH, patched below
+
+        let rdata_start = buf.len();
+        buf.extend_from_slice(&[1, b'a', 0]); // the real label the ladder ends at
+        let mut prev = rdata_start as u16;
+        for _ in 0..hops {
+            let here = buf.len() as u16;
+            assert!(here < 0x4000, "the ladder must stay in pointer range");
+            buf.push(0xC0 | (prev >> 8) as u8);
+            buf.push((prev & 0xFF) as u8);
+            prev = here;
+        }
+        let top = prev;
+        let rdlen = (buf.len() - rdata_start) as u16;
+        buf[rdlen_at] = (rdlen >> 8) as u8;
+        buf[rdlen_at + 1] = (rdlen & 0xFF) as u8;
+
+        let mut count = 1u16;
+        while buf.len() + 16 < size {
+            buf.push(0xC0 | (top >> 8) as u8);
+            buf.push((top & 0xFF) as u8);
+            buf.extend_from_slice(&[0, 1, 0, 1, 0, 0, 0, 60, 0, 4, 1, 2, 3, 4]);
+            count += 1;
+        }
+        buf[6] = (count >> 8) as u8;
+        buf[7] = (count & 0xFF) as u8;
+        (buf, count)
+    }
+
+    /// A chain of compression pointers resolves to the name at its foot.
+    ///
+    /// The chain is short enough to stay under a hop cap, if `simple_dns` adds one.
+    #[test]
+    fn a_pointer_chain_resolves_to_its_foot() {
+        let (buf, count) = pointer_ladder_response(8, 4096);
+
+        let packet = parse_packet(&buf).expect("a short chain is legal on the wire");
+
+        assert_eq!(packet.answers.len(), count as usize);
+        for rr in packet.answers.iter().skip(1) {
+            assert_eq!(rr.name.to_string(), "a");
+        }
+    }
+
+    /// Reports what one parse of a 64 KB pointer ladder costs.
+    ///
+    /// Ignored: a machine-dependent measurement. Run with `--ignored --nocapture`.
+    #[test]
+    #[ignore = "a measurement, not an assertion"]
+    fn bench_pointer_ladder_parse() {
+        let (buf, count) = pointer_ladder_response(8000, 64 * 1024);
+
+        let start = std::time::Instant::now();
+        let parsed = parse_packet(&buf);
+        let elapsed = start.elapsed();
+
+        let outcome = match parsed {
+            Ok(_) => "walked the whole ladder",
+            Err(_) => "rejected it (the hop cap is in place)",
+        };
+        println!(
+            "{} bytes, {count} records: {outcome} in {elapsed:?}",
+            buf.len()
+        );
     }
 }

@@ -6,13 +6,14 @@
 //! way the old hickory-backed resolver did via its `use_hosts_file` default.
 
 use std::{
-    borrow::Cow,
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
 
 use rustc_hash::FxBuildHasher;
 use tracing::warn;
+
+use crate::resolver::name_key;
 
 /// A hosts-file map, keyed by name.
 ///
@@ -125,7 +126,7 @@ impl Hosts {
                 continue;
             };
             for name in fields {
-                let key = name.to_ascii_lowercase().into_boxed_str();
+                let key = name_key(name).into_owned().into_boxed_str();
                 match addr {
                     IpAddr::V4(ip) => a.entry(key).or_default().push(ip),
                     IpAddr::V6(ip) => aaaa.entry(key).or_default().push(ip),
@@ -135,28 +136,14 @@ impl Hosts {
         Self { a, aaaa }
     }
 
-    /// Normalizes a query name to the hosts-file key form.
-    ///
-    /// The key form is the name lowercased, with any trailing dot removed. A
-    /// name that is already in that form is borrowed rather than copied, since
-    /// every A and AAAA lookup passes through here and query names are
-    /// overwhelmingly lowercase already.
-    fn normalize(name: &str) -> Cow<'_, str> {
-        let name = name.strip_suffix('.').unwrap_or(name);
-        match name.bytes().any(|byte| byte.is_ascii_uppercase()) {
-            true => Cow::Owned(name.to_ascii_lowercase()),
-            false => Cow::Borrowed(name),
-        }
-    }
-
     /// Returns the mapped IPv4 addresses for `name`, if any.
     pub(crate) fn lookup_ipv4(&self, name: &str) -> Option<Vec<Ipv4Addr>> {
-        self.a.get(Self::normalize(name).as_ref())?.to_vec()
+        self.a.get(name_key(name).as_ref())?.to_vec()
     }
 
     /// Returns the mapped IPv6 addresses for `name`, if any.
     pub(crate) fn lookup_ipv6(&self, name: &str) -> Option<Vec<Ipv6Addr>> {
-        self.aaaa.get(Self::normalize(name).as_ref())?.to_vec()
+        self.aaaa.get(name_key(name).as_ref())?.to_vec()
     }
 
     /// Builds a hosts map directly from file content, for tests.
@@ -210,11 +197,25 @@ mod tests {
 
     #[test]
     fn lookup_is_case_insensitive_and_fqdn_tolerant() {
-        let hosts = Hosts::parse("10.0.1.10 MyRelay.Test\n");
+        let hosts = Hosts::parse("10.0.1.10 MyRelay.Test\n10.0.1.11 pinned.test.\n");
         assert_eq!(
             hosts.lookup_ipv4("myrelay.test."),
             Some(vec![Ipv4Addr::new(10, 0, 1, 10)])
         );
+        for name in ["pinned.test", "pinned.test."] {
+            assert_eq!(
+                hosts.lookup_ipv4(name),
+                Some(vec![Ipv4Addr::new(10, 0, 1, 11)]),
+                "{name:?}"
+            );
+        }
+    }
+
+    /// `foo\.` is the one label `foo.`, so its escaped dot stays in the key.
+    #[test]
+    fn lookup_keeps_an_escaped_trailing_dot() {
+        let hosts = Hosts::parse("10.0.1.10 foo\\\n");
+        assert_eq!(hosts.lookup_ipv4("foo\\."), None);
     }
 
     #[test]

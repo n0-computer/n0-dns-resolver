@@ -329,8 +329,9 @@ mod tests {
     ///
     /// Lets the transport tests compare against a plain `Vec<Ipv4Addr>`.
     fn parse_a_addrs(data: &[u8]) -> (Vec<Ipv4Addr>, u32) {
+        let packet = super::super::query::parse_packet(data).unwrap();
         let (records, ttl) =
-            super::super::query::parse_records(data, crate::RecordKind::A).unwrap();
+            super::super::query::parse_records(&packet, crate::RecordKind::A).unwrap();
         let addrs = records
             .into_iter()
             .filter_map(|r| match r {
@@ -410,7 +411,8 @@ mod tests {
     }
 
     fn build_query() -> (u16, Vec<u8>) {
-        super::super::query::build_query("example.com", TYPE::A).unwrap()
+        let name = simple_dns::Name::new("example.com").unwrap();
+        super::super::query::build_query(&name, TYPE::A).unwrap()
     }
 
     #[tokio::test]
