@@ -92,7 +92,7 @@ impl CachedResult {
 /// probe passes through here, ahead of the lock, and query names are
 /// overwhelmingly lowercase and undotted already.
 fn normalize(host: &str) -> Cow<'_, str> {
-    let host = host.strip_suffix('.').unwrap_or(host);
+    let host = super::strip_root_dot(host).unwrap_or(host);
     match host.bytes().any(|byte| byte.is_ascii_uppercase()) {
         true => Cow::Owned(host.to_ascii_lowercase()),
         false => Cow::Borrowed(host),

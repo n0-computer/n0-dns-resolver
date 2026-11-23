@@ -202,7 +202,7 @@ fn canonical_name(name: &str) -> Result<Option<String>, Error> {
             name: name[..end].to_string()
         })
     };
-    let (stripped, fqdn) = match name.strip_suffix('.') {
+    let (stripped, fqdn) = match strip_root_dot(name) {
         Some(stripped) => (stripped, "."),
         None => (name, ""),
     };
@@ -279,9 +279,18 @@ fn ip_literal_records(name: &str, kind: RecordKind) -> Option<Vec<Record>> {
 ///
 /// Assumes `host` is in the form [`canonical_name`] returns.
 fn is_localhost(host: &str) -> bool {
-    let host = host.strip_suffix('.').unwrap_or(host);
+    let host = strip_root_dot(host).unwrap_or(host);
     let last_label = &host[label_dots(host).last().map_or(0, |dot| dot + 1)..];
     last_label.eq_ignore_ascii_case("localhost")
+}
+
+/// Returns `name` without the trailing dot that marks it absolute, if it has one.
+///
+/// The dot in `foo\.` is escaped and belongs to the last label.
+pub(crate) fn strip_root_dot(name: &str) -> Option<&str> {
+    let stripped = name.strip_suffix('.')?;
+    let backslashes = stripped.bytes().rev().take_while(|&b| b == b'\\').count();
+    (backslashes % 2 == 0).then_some(stripped)
 }
 
 /// Returns the byte positions of the dots that separate the labels of `name`.
@@ -553,7 +562,7 @@ impl DnsResolver {
     fn search_names(&self, host: &str) -> Vec<String> {
         let config = &self.state().config;
         // Explicit FQDN: no search domain expansion.
-        if host.ends_with('.') || config.search_domains.is_empty() {
+        if strip_root_dot(host).is_some() || config.search_domains.is_empty() {
             return vec![host.to_string()];
         }
 
@@ -1604,17 +1613,26 @@ mod tests {
         (addr, handle)
     }
 
-    /// Names under `localhost` are recognized whatever their case.
-    ///
-    /// Only the last label decides; `localhost` elsewhere in the name does not.
     #[test]
     fn an_escaped_dot_does_not_make_a_name_localhost() {
         assert!(!super::is_localhost("a\\.localhost"));
         assert!(super::is_localhost("a\\.b.localhost"));
         assert_eq!(super::label_dots("a\\.b.c").count(), 1);
         assert_eq!(super::label_dots("a\\\\.b").count(), 1);
+        assert!(!super::is_localhost("a.localhost\\."));
     }
 
+    #[test]
+    fn only_an_unescaped_trailing_dot_marks_a_name_absolute() {
+        assert_eq!(super::strip_root_dot("a."), Some("a"));
+        assert_eq!(super::strip_root_dot("a\\\\."), Some("a\\\\"));
+        assert_eq!(super::strip_root_dot("a\\."), None);
+        assert_eq!(super::strip_root_dot("a"), None);
+    }
+
+    /// Names under `localhost` are recognized whatever their case.
+    ///
+    /// Only the last label decides; `localhost` elsewhere in the name does not.
     #[test]
     fn localhost_is_matched_case_insensitively() {
         for host in ["localhost", "LOCALHOST.", "foo.LocalHost", "a.b.localhost."] {
@@ -1967,6 +1985,9 @@ mod tests {
                     "My\\.Printer._ipp._tcp.local",
                     "My\\.Printer._ipp._tcp.local",
                 ),
+                ("foo\\046", "foo\\."),
+                ("foo\\.", "foo\\."),
+                ("foo\\046.", "foo\\.."),
             ] {
                 assert_eq!(
                     canonical_name(name).unwrap().as_deref(),
