@@ -250,6 +250,7 @@ fn parse_ip_literal(name: &str) -> Option<IpAddr> {
 
 /// Returns whether `name` is an IPv6 address with a zone ID, bracketed or not.
 fn is_scoped_ipv6_literal(name: &str) -> bool {
+    let name = strip_root_dot(name).unwrap_or(name);
     let name = name
         .strip_prefix('[')
         .and_then(|s| s.strip_suffix(']'))
@@ -2041,6 +2042,14 @@ mod tests {
             }
             assert!(is_invalid("fe80::1\\%eth0"));
             assert!(is_invalid("[fe80::1\\%eth0]"));
+            for name in [
+                "[fe80::1%eth0].",
+                "[fe80::1\\%eth0].",
+                "[fe80::1%e\\th0].",
+                "[fe80::1%eth0\\].",
+            ] {
+                assert!(is_invalid(name), "{name:?} should be rejected");
+            }
             assert_eq!(canonical_name("not%an.address").unwrap(), None);
         }
 
