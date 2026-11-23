@@ -170,6 +170,11 @@ const TCP_JOIN_DELAY: Duration = UDP_RETRANSMIT_MIN.saturating_mul(UDP_PACED_DAT
 /// domains first. See <https://man7.org/linux/man-pages/man5/resolv.conf.5.html>.
 const DEFAULT_NDOTS: usize = 1;
 
+/// The longest name text that can encode a valid wire name.
+///
+/// Escaping a wire byte as `\DDD` takes four bytes of text.
+const MAX_NAME_TEXT_LEN: usize = 4 * 255;
+
 /// Rejects a name whose text form does not map one-to-one onto a wire name.
 ///
 /// `simple_dns::Name` drops empty labels, so `localhost..` would reach the wire
@@ -181,10 +186,18 @@ const DEFAULT_NDOTS: usize = 1;
 /// <https://github.com/n0-computer/n0-dns-resolver/issues/48>.
 fn validate_name(name: &str) -> Result<(), Error> {
     let stripped = name.strip_suffix('.').unwrap_or(name);
-    if stripped.is_empty() || stripped.split('.').any(str::is_empty) || is_scoped_ipv6_literal(name)
+    if stripped.is_empty()
+        || stripped.len() > MAX_NAME_TEXT_LEN
+        || stripped.split('.').any(str::is_empty)
+        || is_scoped_ipv6_literal(name)
     {
+        // Keeps a huge input out of the error and the logs.
+        let mut end = name.len().min(MAX_NAME_TEXT_LEN);
+        while !name.is_char_boundary(end) {
+            end -= 1;
+        }
         return Err(e!(Error::InvalidName {
-            name: name.to_string()
+            name: name[..end].to_string()
         }));
     }
     Ok(())
@@ -1881,6 +1894,15 @@ mod tests {
                     "{name:?} should be rejected"
                 );
             }
+        }
+
+        #[test]
+        fn overlong_names_are_rejected() {
+            let name = "a.".repeat(1_000_000);
+            assert!(matches!(
+                validate_name(&name),
+                Err(Error::InvalidName { name, .. }) if name.len() <= super::super::MAX_NAME_TEXT_LEN
+            ));
         }
 
         #[test]
