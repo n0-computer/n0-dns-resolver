@@ -226,7 +226,7 @@ fn canonical_name(name: &str) -> Result<Option<String>, Error> {
     }
     // An escaped byte that is not UTF-8 may print as another character.
     let printed = wire.to_string();
-    if simple_dns::Name::new(&printed).ok() != Some(wire) {
+    if simple_dns::Name::new(&printed).ok() != Some(wire) || is_scoped_ipv6_literal(&printed) {
         return Err(invalid());
     }
     Ok(Some(printed + fqdn))
@@ -2021,6 +2021,8 @@ mod tests {
             ] {
                 assert!(is_invalid(name), "{name:?} should be rejected");
             }
+            assert!(is_invalid("fe80::1\\%eth0"));
+            assert!(is_invalid("[fe80::1\\%eth0]"));
             assert_eq!(canonical_name("not%an.address").unwrap(), None);
         }
 
