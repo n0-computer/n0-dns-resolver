@@ -18,7 +18,10 @@ const MAX_CACHE_ENTRIES: usize = 4096;
 /// Maximum memory the cached answers may hold, in bytes (8 MiB).
 ///
 /// The entry count alone does not bound memory: one 64 KB answer can hold
-/// about 4,000 A records.
+/// about 4,000 A records. The limit applies to [`Record::approx_bytes`], which
+/// can be below the real size.
+///
+/// [`Record::approx_bytes`]: crate::Record::approx_bytes
 const MAX_CACHE_BYTES: usize = 8 * 1024 * 1024;
 
 /// Maximum memory a single cached answer may hold, in bytes (256 KiB).

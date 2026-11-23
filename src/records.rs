@@ -79,8 +79,8 @@ pub enum Record {
 impl Record {
     /// Returns roughly how much memory this record holds, in bytes.
     ///
-    /// The enum slot plus its heap. It is an upper bound, because the cache's
-    /// byte limit relies on it.
+    /// Counts the enum slot and the length of each heap buffer. Allocator
+    /// overhead and spare capacity can make the real size a small multiple.
     pub(crate) fn approx_bytes(&self) -> usize {
         let heap = match self {
             Record::A(_) | Record::Aaaa(_) => 0,
