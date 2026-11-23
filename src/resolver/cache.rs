@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Cow,
-    hash::{Hash, Hasher},
+    hash::{BuildHasher, RandomState},
     sync::{Arc, Mutex},
     time::Duration,
 };
@@ -108,17 +108,17 @@ fn normalize(host: &str) -> Cow<'_, str> {
 /// few-thousand-entry cache, the birthday-bound probability is ~1e-13 per
 /// lookup, negligible in practice.
 ///
+/// The hasher has random keys per cache, so its collisions cannot be computed
+/// in advance.
+///
 /// `host` is expected to already be [`normalize`]d so that names differing only
 /// in case or a trailing dot hash to the same key.
 ///
 /// A pre-hashed `u64` key is used rather than a `Hash`-deriving key struct on
 /// purpose: the latter would allocate a `String` for the key on every `get`,
 /// whereas hashing the borrowed `&str` here keeps lookups allocation-free.
-fn cache_key(host: &str, kind: RecordKind) -> u64 {
-    let mut hasher = std::hash::DefaultHasher::new();
-    host.hash(&mut hasher);
-    kind.hash(&mut hasher);
-    hasher.finish()
+fn cache_key(hasher: &RandomState, host: &str, kind: RecordKind) -> u64 {
+    hasher.hash_one((host, kind))
 }
 
 /// A cache entry with TTL expiry tracking.
@@ -166,6 +166,8 @@ impl CacheEntry {
 pub(super) struct DnsCache {
     /// Shared by every clone, which is what lets a reset carry the cache over.
     inner: Arc<Mutex<Inner>>,
+    /// The hasher for [`cache_key`], with random keys that clones share.
+    hasher: RandomState,
 }
 
 /// The entries and the running byte total, behind one lock so they cannot drift.
@@ -220,6 +222,7 @@ impl DnsCache {
                 ),
                 bytes: 0,
             })),
+            hasher: RandomState::new(),
         }
     }
 
@@ -230,7 +233,7 @@ impl DnsCache {
     /// successful insert or evicted by LRU pressure.
     pub(super) fn get(&self, host: &str, kind: RecordKind) -> Option<CachedResult> {
         let host = normalize(host);
-        let key = cache_key(&host, kind);
+        let key = cache_key(&self.hasher, &host, kind);
         let mut inner = self.inner.lock().expect("poisoned");
         let entry = inner.entries.get(&key)?;
         // Reject `u64` key collisions: only serve an exact host+kind match.
@@ -256,7 +259,7 @@ impl DnsCache {
         max_stale: Duration,
     ) -> Option<Vec<Record>> {
         let host = normalize(host);
-        let key = cache_key(&host, kind);
+        let key = cache_key(&self.hasher, &host, kind);
         let mut inner = self.inner.lock().expect("poisoned");
         let entry = inner.entries.get(&key)?;
         if entry.host != host || entry.kind != kind {
@@ -287,7 +290,7 @@ impl DnsCache {
         }
         let host = normalize(host);
         let bytes = result.approx_bytes();
-        let key = cache_key(&host, kind);
+        let key = cache_key(&self.hasher, &host, kind);
         let mut inner = self.inner.lock().expect("poisoned");
         if bytes > MAX_ENTRY_BYTES {
             // Drop any earlier entry too, rather than serve a stale smaller one.
@@ -334,7 +337,7 @@ impl DnsCache {
         self.inner
             .lock()
             .expect("poisoned")
-            .put(cache_key(&host, kind), entry);
+            .put(cache_key(&self.hasher, &host, kind), entry);
     }
 
     /// Returns the stored TTL for `host`/`kind`, for tests that assert clamping.
@@ -344,7 +347,7 @@ impl DnsCache {
         let mut inner = self.inner.lock().expect("poisoned");
         inner
             .entries
-            .get(&cache_key(&host, kind))
+            .get(&cache_key(&self.hasher, &host, kind))
             .map(|entry| entry.ttl)
     }
 
