@@ -4,7 +4,10 @@
 
 use std::{net::Ipv4Addr, time::Duration};
 
-use simple_dns::RCODE;
+use simple_dns::{
+    CLASS, Label, Name, RCODE, ResourceRecord,
+    rdata::{A, CNAME, RData},
+};
 
 use super::{a, caa, cname, mx, ns, qname, reply, resolver_for, spawn_mock, srv, txt};
 use crate::{DnsProtocol, DnsResolver, Nameserver, Record, RecordKind};
@@ -37,6 +40,42 @@ async fn cname_chain_resolves_across_hops() {
 
     assert_eq!(addrs, [Ipv4Addr::new(10, 0, 0, 1)]);
     assert_eq!(server.query_count(), 2, "one query per CNAME hop");
+}
+
+/// A CNAME target with a byte that is not UTF-8 is queried as it came off the wire.
+///
+/// Its text form prints the byte as U+FFFD, which would ask for another name.
+#[tokio::test]
+async fn cname_target_with_a_non_utf8_byte_is_queried_as_sent() {
+    let target = Name::new_with_labels(&[
+        Label::new_unchecked(&b"t\xff"[..]),
+        Label::new_unchecked(&b"example"[..]),
+    ])
+    .into_owned();
+    let answer = target.clone();
+    let server = spawn_mock(move |query| {
+        let asked = &query.questions.first()?.qname;
+        let record = if *asked == answer {
+            RData::A(A {
+                address: Ipv4Addr::new(10, 0, 0, 3).into(),
+            })
+        } else if qname(query)? == "alias.example" {
+            RData::CNAME(CNAME(answer.clone()))
+        } else {
+            return Some(reply(query, RCODE::NameError, vec![]));
+        };
+        let owner = asked.clone().into_owned();
+        let answers = vec![ResourceRecord::new(owner, CLASS::IN, 300, record)];
+        Some(reply(query, RCODE::NoError, answers))
+    })
+    .await;
+
+    let resolver = resolver_for(server.addr());
+    let addrs = resolver
+        .lookup_ipv4("alias.example")
+        .await
+        .expect("alias resolves through the target");
+    assert_eq!(addrs, [Ipv4Addr::new(10, 0, 0, 3)]);
 }
 
 /// A record on an intermediate name in the CNAME chain is still collected.
