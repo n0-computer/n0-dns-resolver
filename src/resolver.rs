@@ -1066,7 +1066,8 @@ impl DnsResolver {
     /// type has left the chain unresolved, so the target is queried in turn.
     ///
     /// `read_answer` gets the validated packet that ends the chain, so each
-    /// response is parsed once.
+    /// response is parsed once. An NXDOMAIN response ends the chain as well, and
+    /// [`query::parse_records`] reports it as [`Error::NxDomain`].
     async fn send_query_following_cnames<T>(
         &self,
         host: String,
@@ -1087,7 +1088,11 @@ impl DnsResolver {
             // Validate the id, QR bit, question, and RCODE before trusting the
             // packet to decide the answer or the next CNAME target. This is the
             // only check of the response against the name we actually asked for.
-            query::check_response(&packet, id, &name, qtype)?;
+            match query::check_response(&packet, id, &name, qtype) {
+                // The caller reads the negative TTL from the NXDOMAIN's SOA.
+                Err(QueryError::NxDomain { .. }) => return Ok(read_answer(&packet)),
+                res => res?,
+            }
 
             // The response holds the answer, or has no CNAME to follow.
             let Some(target) = query::unresolved_cname_target(&packet, &name, qtype) else {
@@ -1193,10 +1198,10 @@ impl DnsResolver {
             trace!(%name, ?kind, "resolving");
             let read_answer = |packet: &Packet<'_>| {
                 let parsed = query::parse_records(packet, kind).map_err(Error::from);
-                // RFC 2308 TTL of a NODATA answer. An NXDOMAIN comes back from
-                // `check_response` as an error and gets the default TTL.
+                // RFC 2308 TTL of a NODATA or NXDOMAIN answer.
                 let soa = match &parsed {
                     Ok((records, _)) if records.is_empty() => query::negative_ttl(packet),
+                    Err(Error::NxDomain { .. }) => query::negative_ttl(packet),
                     _ => None,
                 };
                 (parsed, soa)

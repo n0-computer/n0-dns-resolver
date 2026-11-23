@@ -4,9 +4,9 @@
 
 use std::{net::Ipv4Addr, time::Duration};
 
-use simple_dns::RCODE;
+use simple_dns::{Packet, RCODE};
 
-use super::{a, caa, cname, mx, ns, qname, reply, resolver_for, spawn_mock, srv, txt};
+use super::{a, caa, cname, mx, ns, qname, reply, resolver_for, soa, spawn_mock, srv, txt};
 use crate::{DnsProtocol, DnsResolver, Nameserver, Record, RecordKind};
 
 /// A CNAME that only the second query resolves.
@@ -146,6 +146,40 @@ async fn negative_caching_collapses_second_lookup() {
         server.query_count(),
         1,
         "the second lookup is served from the negative cache"
+    );
+}
+
+/// An NXDOMAIN is cached for the TTL its authority SOA gives.
+///
+/// An SOA minimum of 0 means "do not cache", so the second lookup reaches the
+/// nameserver again. The fixed fallback TTL would serve it from the cache.
+///
+/// Exercises RFC 2308 section 5, which derives the NXDOMAIN negative TTL from
+/// the SOA in the authority section, the same as for NODATA.
+#[tokio::test]
+async fn nxdomain_uses_soa_negative_ttl() {
+    let server = spawn_mock(|query| {
+        let mut packet = Packet::new_reply(query.id());
+        *packet.rcode_mut() = RCODE::NameError;
+        packet.questions = query.questions.clone();
+        packet.name_servers.push(soa("example", 0));
+        packet.build_bytes_vec().ok()
+    })
+    .await;
+
+    let resolver = DnsResolver::builder()
+        .negative_max_ttl(Duration::from_secs(30))
+        .nameserver(Nameserver::new(server.addr(), DnsProtocol::Udp))
+        .build();
+    for _ in 0..2 {
+        let result = resolver.lookup_record("nx.example", RecordKind::A).await;
+        assert!(matches!(result, Err(crate::Error::NxDomain { .. })));
+    }
+
+    assert_eq!(
+        server.query_count(),
+        2,
+        "an SOA minimum of 0 must leave the NXDOMAIN uncached"
     );
 }
 

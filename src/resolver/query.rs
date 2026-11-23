@@ -291,7 +291,8 @@ pub(super) fn check_response(
 /// The caller must already have validated the response with [`check_response`];
 /// this walks the CNAME chain anchored on the question and extracts records of
 /// the requested type using `extract` at every name along the chain. Returns the
-/// records and the minimum TTL across them.
+/// records and the minimum TTL across them, or [`QueryError::NxDomain`] for an
+/// NXDOMAIN response.
 ///
 /// Every query is for class IN, and a record of another class is a different
 /// record even under the same name and type, so records of any other class are
@@ -300,6 +301,10 @@ fn parse_response<T>(
     packet: &Packet<'_>,
     extract: impl Fn(&Name<'_>, &RData<'_>) -> Option<T>,
 ) -> Result<(Vec<T>, u32), QueryError> {
+    if packet.rcode() == RCODE::NameError {
+        return Err(e!(QueryError::NxDomain));
+    }
+
     // The chain is empty only for a response with no question section, which
     // `check_response` already rejects; extraction then matches nothing.
     let chain = packet
