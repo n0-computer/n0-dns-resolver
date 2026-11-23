@@ -137,12 +137,12 @@ impl Hosts {
 
     /// Normalizes a query name to the hosts-file key form.
     ///
-    /// The key form is the name lowercased, with any trailing dot removed. A
+    /// The key form is the name lowercased, without the dot that marks it absolute. A
     /// name that is already in that form is borrowed rather than copied, since
     /// every A and AAAA lookup passes through here and query names are
     /// overwhelmingly lowercase already.
     fn normalize(name: &str) -> Cow<'_, str> {
-        let name = name.strip_suffix('.').unwrap_or(name);
+        let name = crate::resolver::strip_root_dot(name).unwrap_or(name);
         match name.bytes().any(|byte| byte.is_ascii_uppercase()) {
             true => Cow::Owned(name.to_ascii_lowercase()),
             false => Cow::Borrowed(name),
@@ -215,6 +215,13 @@ mod tests {
             hosts.lookup_ipv4("myrelay.test."),
             Some(vec![Ipv4Addr::new(10, 0, 1, 10)])
         );
+    }
+
+    /// `foo\.` is the one label `foo.`, so its escaped dot stays in the key.
+    #[test]
+    fn lookup_keeps_an_escaped_trailing_dot() {
+        let hosts = Hosts::parse("10.0.1.10 foo\\\n");
+        assert_eq!(hosts.lookup_ipv4("foo\\."), None);
     }
 
     #[test]

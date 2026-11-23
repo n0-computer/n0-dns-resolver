@@ -82,7 +82,7 @@ impl CachedResult {
 
 /// Normalizes a host to its cache-key form.
 ///
-/// The key is the host lowercased, with any single trailing dot removed.
+/// The key is the host lowercased, without the dot that marks it absolute.
 ///
 /// DNS names are case-insensitive, and a fully-qualified name with a trailing dot
 /// denotes the same node as the bare name. Normalizing here keeps
