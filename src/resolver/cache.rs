@@ -9,7 +9,7 @@ use std::{
 use lru::LruCache;
 use n0_future::time::Instant;
 
-use super::name_key;
+use super::lowercase;
 use crate::{Record, RecordKind};
 
 /// Maximum number of entries in the DNS cache.
@@ -92,8 +92,10 @@ impl CachedResult {
 /// The hasher has random keys per cache, so its collisions cannot be computed
 /// in advance.
 ///
-/// `host` is expected to be in [`name_key`] form, so that names differing only
-/// in case or a trailing dot hash to the same key.
+/// `host` is expected to be [`lowercase`], so that names differing only in case
+/// hash to the same key. The root dot stays in the key. The search list expands
+/// the relative `foo` but not the absolute `foo.`, so the two can resolve to
+/// different nodes.
 ///
 /// A pre-hashed `u64` key is used rather than a `Hash`-deriving key struct on
 /// purpose: the latter would allocate a `String` for the key on every `get`,
@@ -105,7 +107,7 @@ fn cache_key(hasher: &RandomState, host: &str, kind: RecordKind) -> u64 {
 /// A cache entry with TTL expiry tracking.
 #[derive(Debug, Clone)]
 struct CacheEntry {
-    /// The host this entry is for, in [`name_key`] form.
+    /// The host this entry is for, lowercased.
     ///
     /// Verified against the query on lookup, together with `kind`, so that a
     /// `u64` key collision returns a miss rather than another entry's records.
@@ -213,7 +215,7 @@ impl DnsCache {
     /// can still serve it as a last resort; it is overwritten on the next
     /// successful insert or evicted by LRU pressure.
     pub(super) fn get(&self, host: &str, kind: RecordKind) -> Option<CachedResult> {
-        let host = name_key(host);
+        let host = lowercase(host);
         let key = cache_key(&self.hasher, &host, kind);
         let mut inner = self.inner.lock().expect("poisoned");
         let entry = inner.entries.get(&key)?;
@@ -239,7 +241,7 @@ impl DnsCache {
         kind: RecordKind,
         max_stale: Duration,
     ) -> Option<Vec<Record>> {
-        let host = name_key(host);
+        let host = lowercase(host);
         let key = cache_key(&self.hasher, &host, kind);
         let mut inner = self.inner.lock().expect("poisoned");
         let entry = inner.entries.get(&key)?;
@@ -269,7 +271,7 @@ impl DnsCache {
         if ttl == 0 {
             return;
         }
-        let host = name_key(host);
+        let host = lowercase(host);
         let bytes = result.approx_bytes();
         let key = cache_key(&self.hasher, &host, kind);
         let mut inner = self.inner.lock().expect("poisoned");
@@ -306,7 +308,7 @@ impl DnsCache {
         ttl: Duration,
         expired_ago: Duration,
     ) {
-        let host = name_key(host);
+        let host = lowercase(host);
         let entry = CacheEntry {
             host: host.to_string(),
             kind,
@@ -324,7 +326,7 @@ impl DnsCache {
     /// Returns the stored TTL for `host`/`kind`, for tests that assert clamping.
     #[cfg(test)]
     fn stored_ttl(&self, host: &str, kind: RecordKind) -> Option<Duration> {
-        let host = name_key(host);
+        let host = lowercase(host);
         let mut inner = self.inner.lock().expect("poisoned");
         inner
             .entries
@@ -405,10 +407,17 @@ mod tests {
     }
 
     #[test]
-    fn lookup_is_case_and_trailing_dot_insensitive() {
+    fn lookup_is_case_insensitive() {
         let cache = DnsCache::new();
         cache.insert("example.com", RecordKind::A, positive(), 300);
-        assert_single_a(cache.get("Example.COM.", RecordKind::A), ADDR);
+        assert_single_a(cache.get("Example.COM", RecordKind::A), ADDR);
+    }
+
+    #[test]
+    fn trailing_dot_keeps_a_separate_entry() {
+        let cache = DnsCache::new();
+        cache.insert("example.com", RecordKind::A, positive(), 300);
+        assert!(cache.get("example.com.", RecordKind::A).is_none());
     }
 
     #[test]

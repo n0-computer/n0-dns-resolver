@@ -186,6 +186,66 @@ async fn search_list_expansion_reaches_bare_name() {
     assert_eq!(addrs, [Ipv4Addr::new(10, 1, 1, 1)]);
 }
 
+/// An answer for an absolute name does not answer the relative name.
+///
+/// The absolute `foo.` resolves first and fills the cache. The relative `foo`
+/// must still try its search domain, which resolves to another address.
+#[tokio::test]
+async fn absolute_answer_does_not_answer_relative_lookup() {
+    let server = spawn_mock(|query| {
+        let name = qname(query)?;
+        let answers = match name.as_str() {
+            "foo" => vec![a("foo", Ipv4Addr::new(10, 0, 0, 1))],
+            "foo.corp.example" => vec![a("foo.corp.example", Ipv4Addr::new(10, 0, 0, 2))],
+            _ => return Some(reply(query, RCODE::NameError, vec![])),
+        };
+        Some(reply(query, RCODE::NoError, answers))
+    })
+    .await;
+
+    let mut resolver = resolver_for(server.addr());
+    resolver.set_search(vec!["corp.example".to_string()], 1);
+
+    let absolute = resolver.lookup_ipv4("foo.").await.expect("foo. resolves");
+    assert_eq!(absolute, [Ipv4Addr::new(10, 0, 0, 1)]);
+    let relative = resolver.lookup_ipv4("foo").await.expect("foo resolves");
+    assert_eq!(
+        relative,
+        [Ipv4Addr::new(10, 0, 0, 2)],
+        "the relative name must resolve via the search domain, not the cached foo."
+    );
+}
+
+/// A search-domain answer for a relative name does not answer the absolute name.
+///
+/// The search domain holds `foo` with no A records (NODATA), and the absolute
+/// `foo.` does not exist. The cached NODATA for `foo` must not answer `foo.`.
+#[tokio::test]
+async fn relative_answer_does_not_answer_absolute_lookup() {
+    let server = spawn_mock(|query| {
+        let rcode = match qname(query)?.as_str() {
+            "foo.corp.example" => RCODE::NoError,
+            _ => RCODE::NameError,
+        };
+        Some(reply(query, rcode, vec![]))
+    })
+    .await;
+
+    let mut resolver = DnsResolver::builder()
+        .negative_max_ttl(Duration::from_secs(30))
+        .nameserver(Nameserver::new(server.addr(), DnsProtocol::Udp))
+        .build();
+    resolver.set_search(vec!["corp.example".to_string()], 1);
+
+    let relative = resolver.lookup_record("foo", RecordKind::A).await;
+    assert!(matches!(relative, Ok(ref records) if records.is_empty()));
+    let absolute = resolver.lookup_record("foo.", RecordKind::A).await;
+    assert!(
+        matches!(absolute, Err(crate::Error::NxDomain { .. })),
+        "foo. must not be answered with the search domain's NODATA, got {absolute:?}",
+    );
+}
+
 /// A bare name's NXDOMAIN wins over an appended candidate's NODATA.
 ///
 /// The first authoritative negative in search order is the answer, so an

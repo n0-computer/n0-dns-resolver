@@ -6,6 +6,7 @@
 //! way the old hickory-backed resolver did via its `use_hosts_file` default.
 
 use std::{
+    borrow::Cow,
     collections::HashMap,
     net::{IpAddr, Ipv4Addr, Ipv6Addr},
 };
@@ -13,7 +14,7 @@ use std::{
 use rustc_hash::FxBuildHasher;
 use tracing::warn;
 
-use crate::resolver::name_key;
+use crate::resolver::{lowercase, strip_root_dot};
 
 /// A hosts-file map, keyed by name.
 ///
@@ -126,7 +127,7 @@ impl Hosts {
                 continue;
             };
             for name in fields {
-                let key = name_key(name).into_owned().into_boxed_str();
+                let key = Self::key(name).into_owned().into_boxed_str();
                 match addr {
                     IpAddr::V4(ip) => a.entry(key).or_default().push(ip),
                     IpAddr::V6(ip) => aaaa.entry(key).or_default().push(ip),
@@ -136,14 +137,22 @@ impl Hosts {
         Self { a, aaaa }
     }
 
+    /// Returns the key the hosts file stores `name` under.
+    ///
+    /// The key is lowercase without the root dot, so `Example.COM.` and
+    /// `example.com` share one.
+    fn key(name: &str) -> Cow<'_, str> {
+        lowercase(strip_root_dot(name).unwrap_or(name))
+    }
+
     /// Returns the mapped IPv4 addresses for `name`, if any.
     pub(crate) fn lookup_ipv4(&self, name: &str) -> Option<Vec<Ipv4Addr>> {
-        self.a.get(name_key(name).as_ref())?.to_vec()
+        self.a.get(Self::key(name).as_ref())?.to_vec()
     }
 
     /// Returns the mapped IPv6 addresses for `name`, if any.
     pub(crate) fn lookup_ipv6(&self, name: &str) -> Option<Vec<Ipv6Addr>> {
-        self.aaaa.get(name_key(name).as_ref())?.to_vec()
+        self.aaaa.get(Self::key(name).as_ref())?.to_vec()
     }
 
     /// Builds a hosts map directly from file content, for tests.

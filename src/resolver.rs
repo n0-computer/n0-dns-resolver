@@ -289,19 +289,17 @@ fn is_localhost(host: &str) -> bool {
 /// Returns `name` without the trailing dot that marks it absolute, if it has one.
 ///
 /// The dot in `foo\.` is escaped and belongs to the last label.
-fn strip_root_dot(name: &str) -> Option<&str> {
+pub(crate) fn strip_root_dot(name: &str) -> Option<&str> {
     let stripped = name.strip_suffix('.')?;
     let backslashes = stripped.bytes().rev().take_while(|&b| b == b'\\').count();
     (backslashes % 2 == 0).then_some(stripped)
 }
 
-/// Returns the key the cache and the hosts file store `name` under.
+/// Returns `name` lowercased, borrowed if it has no uppercase letter.
 ///
-/// The key is lowercase without the root dot, so `Example.COM.` and
-/// `example.com` share one. A name already in that form is borrowed, as almost
-/// every query name is.
-pub(crate) fn name_key(name: &str) -> Cow<'_, str> {
-    let name = strip_root_dot(name).unwrap_or(name);
+/// DNS names are case-insensitive. Almost every query name is lowercase
+/// already, so this rarely copies.
+pub(crate) fn lowercase(name: &str) -> Cow<'_, str> {
     match name.bytes().any(|byte| byte.is_ascii_uppercase()) {
         true => Cow::Owned(name.to_ascii_lowercase()),
         false => Cow::Borrowed(name),
