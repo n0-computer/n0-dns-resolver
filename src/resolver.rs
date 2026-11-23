@@ -2649,6 +2649,59 @@ mod tests {
         );
     }
 
+    /// A TCP answer to another question fails that nameserver, and the lookup moves on.
+    #[tokio::test]
+    async fn a_tcp_answer_to_another_question_moves_on_to_the_next_nameserver() {
+        /// Spawns a TCP nameserver that answers every query for `qname` with `address`.
+        async fn spawn_nameserver(qname: Option<&'static str>, address: Ipv4Addr) -> SocketAddr {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    let len = stream.read_u16().await.unwrap();
+                    let mut query = vec![0u8; usize::from(len)];
+                    stream.read_exact(&mut query).await.unwrap();
+                    let query = Packet::parse(&query).unwrap();
+                    let mut question = query.questions[0].clone();
+                    if let Some(qname) = qname {
+                        question.qname = Name::new_unchecked(qname);
+                    }
+                    let mut reply = Packet::new_reply(query.id());
+                    reply.answers.push(ResourceRecord::new(
+                        question.qname.clone(),
+                        CLASS::IN,
+                        300,
+                        RData::A(A {
+                            address: address.into(),
+                        }),
+                    ));
+                    reply.questions.push(question);
+                    let bytes = reply.build_bytes_vec().unwrap();
+                    stream
+                        .write_all(&(bytes.len() as u16).to_be_bytes())
+                        .await
+                        .unwrap();
+                    stream.write_all(&bytes).await.unwrap();
+                }
+            });
+            addr
+        }
+
+        let wrong = spawn_nameserver(Some("other.example"), Ipv4Addr::new(6, 6, 6, 6)).await;
+        let right = spawn_nameserver(None, Ipv4Addr::new(10, 0, 0, 1)).await;
+        let resolver = DnsResolver::builder()
+            .nameservers([
+                Nameserver::new(wrong, DnsProtocol::Tcp),
+                Nameserver::new(right, DnsProtocol::Tcp),
+            ])
+            .build();
+
+        assert_eq!(
+            resolver.lookup_ipv4("relay.example").await.unwrap(),
+            [Ipv4Addr::new(10, 0, 0, 1)]
+        );
+    }
+
     /// Ordering nameservers does not panic while other lookups update their estimates.
     #[test]
     fn order_indices_does_not_panic_while_estimates_change() {

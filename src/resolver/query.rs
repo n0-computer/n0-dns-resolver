@@ -42,6 +42,9 @@ pub(super) fn response_code(rcode: RCODE) -> ResponseCode {
     }
 }
 
+/// Length of a fixed DNS message header (RFC 1035 Section 4.1.1).
+const DNS_HEADER_LEN: usize = 12;
+
 /// Parses a message from the network.
 pub(super) fn parse_packet(data: &[u8]) -> Result<Packet<'_>, QueryError> {
     Packet::parse(data).map_err(|_| e!(QueryError::Malformed))
@@ -120,21 +123,21 @@ pub(super) fn is_format_error(data: &[u8]) -> bool {
     matches!(header_buffer::rcode(data), Ok(RCODE::FormatError))
 }
 
-/// Returns whether a datagram answers `query`, for the UDP receive loop.
+/// Returns whether `response` answers `query`, checked on the raw bytes.
 ///
-/// A datagram that does not is one the socket should keep listening past.
-/// Each query goes out from a fresh source port, so an off-path attacker who
+/// The UDP receive loop keeps listening past a datagram that does not. Each
+/// query goes out from a fresh source port, so an off-path attacker who
 /// guesses that port can deliver whatever they like to it, and returning the
 /// first thing that arrives would let a spoofed datagram end the query with a
-/// mismatch before the real answer lands (hickory's GHSA-v44v-c8m4-gc43).
+/// mismatch before the real answer lands (hickory's GHSA-v44v-c8m4-gc43). A
+/// TCP or DoT frame that does not answer the query fails that nameserver, so
+/// the lookup moves on to the next one.
 ///
-/// The transaction id must match and the QR bit must be set. A datagram that
-/// then parses must echo our question, name, type, and class, so one that
-/// carries no question or someone else's is ignored rather than taken as the
-/// answer to ours. One that does not parse is accepted once it carries our id:
-/// a truncated or malformed reply from the server itself then fails the lookup
-/// at once rather than at the timeout, and a truncated one still brings in the
-/// TCP query.
+/// The transaction id must match, the QR bit must be set, and the question
+/// section must repeat ours byte for byte, with the names compared case
+/// insensitively. Nothing past the question is read, so the lookup parses the
+/// response only once. The question of our query is never compressed, and a
+/// valid response cannot compress its first name, so the bytes line up.
 ///
 /// The one response accepted without a question is a FORMERR. A middlebox that
 /// could not parse the query, usually over its EDNS(0) OPT record, may answer
@@ -142,7 +145,10 @@ pub(super) fn is_format_error(data: &[u8]) -> bool {
 /// same server without EDNS. A spoofed one costs a round trip and nothing
 /// else.
 pub(super) fn answers_query(response: &[u8], query: &[u8]) -> bool {
-    let Ok(id) = header_buffer::id(response) else {
+    let (Ok(id), Ok(questions)) = (
+        header_buffer::id(response),
+        header_buffer::questions(response),
+    ) else {
         return false;
     };
     if header_buffer::id(query).ok() != Some(id)
@@ -150,23 +156,42 @@ pub(super) fn answers_query(response: &[u8], query: &[u8]) -> bool {
     {
         return false;
     }
-    let Ok(packet) = parse_packet(response) else {
-        return true;
-    };
-    let Ok(sent) = Packet::parse(query) else {
-        return true;
-    };
-    if packet.questions.is_empty() && packet.rcode() == RCODE::FormatError {
+    if questions == 0 && is_format_error(response) {
         return true;
     }
-    packet.questions.len() == sent.questions.len()
-        && packet
-            .questions
-            .iter()
-            .zip(&sent.questions)
-            .all(|(got, want)| {
-                got.qname == want.qname && got.qtype == want.qtype && got.qclass == want.qclass
-            })
+    header_buffer::questions(query).ok() == Some(questions)
+        && echoes_questions(response, query, questions)
+}
+
+/// Returns whether `response` repeats the question section of `query`.
+///
+/// Walks the uncompressed names [`build_query`] writes. Names compare case
+/// insensitively, and the type and class exactly.
+fn echoes_questions(response: &[u8], query: &[u8], questions: u16) -> bool {
+    let mut pos = DNS_HEADER_LEN;
+    for _ in 0..questions {
+        loop {
+            let Some(&len) = query.get(pos) else {
+                return false;
+            };
+            let end = pos + 1 + usize::from(len);
+            // Our length bytes are at most 63, below every ASCII letter, so
+            // they still compare exactly.
+            match (query.get(pos..end), response.get(pos..end)) {
+                (Some(want), Some(got)) if got.eq_ignore_ascii_case(want) => pos = end,
+                _ => return false,
+            }
+            if len == 0 {
+                break;
+            }
+        }
+        let end = pos + 4;
+        match (query.get(pos..end), response.get(pos..end)) {
+            (Some(want), Some(got)) if got == want => pos = end,
+            _ => return false,
+        }
+    }
+    true
 }
 
 /// Rebuilds `query` without its EDNS(0) OPT record, or `None` if it has none.
@@ -457,9 +482,6 @@ mod tests {
     };
 
     use super::*;
-
-    /// Length of a fixed DNS message header (RFC 1035 Section 4.1.1).
-    const DNS_HEADER_LEN: usize = 12;
 
     /// Build a query packet for `host` with type A, return (id, bytes).
     fn make_query(host: &str) -> (u16, Vec<u8>) {
@@ -1077,6 +1099,15 @@ mod tests {
 
         // Shorter than a header.
         assert!(!answers_query(&good[..8], &query));
+
+        // Our question in another case, or cut off inside it.
+        assert!(answers_query(&a_response(id, "EXAMPLE.com", &[]), &query));
+        assert!(!answers_query(&good[..20], &query));
+
+        // Our name with another type.
+        let mut aaaa = Packet::parse(&good).unwrap();
+        aaaa.questions[0].qtype = QTYPE::TYPE(TYPE::AAAA);
+        assert!(!answers_query(&aaaa.build_bytes_vec().unwrap(), &query));
 
         // Right id and QR bit but unparsable: accepted, so the server's own
         // malformed reply fails the lookup now rather than at the timeout.
