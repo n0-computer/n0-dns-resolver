@@ -1187,8 +1187,8 @@ impl DnsResolver {
         let mut saw_transient = false;
         let names = self.search_names(&name);
         let total = names.len();
-        for (i, name) in names.into_iter().enumerate() {
-            trace!(%name, ?kind, "resolving");
+        for (i, candidate) in names.into_iter().enumerate() {
+            trace!(%candidate, ?kind, "resolving");
             let read_answer = |packet: &Packet<'_>| {
                 let parsed = query::parse_records(packet, kind).map_err(Error::from);
                 // RFC 2308 TTL of a NODATA answer. An NXDOMAIN comes back from
@@ -1200,7 +1200,7 @@ impl DnsResolver {
                 (parsed, soa)
             };
             let (res, soa_negative_ttl) = match self
-                .send_query_following_cnames(name.clone(), kind.dns_type(), read_answer)
+                .send_query_following_cnames(candidate.clone(), kind.dns_type(), read_answer)
                 .await
             {
                 Ok(answer) => answer,
@@ -1209,7 +1209,9 @@ impl DnsResolver {
             match res {
                 Ok((results, ttl)) if !results.is_empty() => {
                     let ttl = ttl.max(self.cache_min_ttl_secs());
-                    debug!(%name, ?kind, ?results, ttl, "resolved");
+                    debug!(%candidate, ?kind, ?results, ttl, "resolved");
+                    // Under the caller's name, which the next lookup probes, as
+                    // the negative answers below are.
                     self.cache
                         .insert(&name, kind, CachedResult::Positive(results.clone()), ttl);
                     return Ok(results);
@@ -1224,7 +1226,7 @@ impl DnsResolver {
                 }
                 Err(e @ Error::NxDomain { .. }) => {
                     let remaining = total - i - 1;
-                    trace!(%name, ?kind, remaining, reason = %e, "lookup failed");
+                    trace!(%candidate, ?kind, remaining, reason = %e, "lookup failed");
                     if first_negative.is_none() {
                         first_negative = Some(CachedResult::NxDomain);
                         negative_ttl_secs = self.negative_cache_ttl_secs(soa_negative_ttl);
@@ -1243,7 +1245,7 @@ impl DnsResolver {
                     | Error::InvalidResponse { .. }),
                 ) => {
                     let remaining = total - i - 1;
-                    trace!(%name, ?kind, remaining, reason = %e, "lookup failed");
+                    trace!(%candidate, ?kind, remaining, reason = %e, "lookup failed");
                     saw_transient = true;
                     last_err = Some(e);
                 }
@@ -1252,7 +1254,7 @@ impl DnsResolver {
                 // candidate identically, so there is nothing to gain by trying
                 // the rest.
                 Err(e) => {
-                    debug!(%name, ?kind, reason = %e, "lookup failed");
+                    debug!(%candidate, ?kind, reason = %e, "lookup failed");
                     return Err(e);
                 }
             }

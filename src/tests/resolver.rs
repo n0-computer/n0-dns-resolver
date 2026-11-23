@@ -216,6 +216,35 @@ async fn absolute_answer_does_not_answer_relative_lookup() {
     );
 }
 
+/// A relative name answered through a search domain hits the cache next time.
+///
+/// The answer is cached under the name the caller asked for, not under the
+/// expanded `foo.corp.example` that the lookup probes never use.
+#[tokio::test]
+async fn search_domain_answer_is_cached_for_the_relative_name() {
+    let server = spawn_mock(|query| {
+        let answers = match qname(query)?.as_str() {
+            "foo.corp.example" => vec![a("foo.corp.example", Ipv4Addr::new(10, 0, 0, 2))],
+            _ => return Some(reply(query, RCODE::NameError, vec![])),
+        };
+        Some(reply(query, RCODE::NoError, answers))
+    })
+    .await;
+
+    let mut resolver = resolver_for(server.addr());
+    resolver.set_search(vec!["corp.example".to_string()], 1);
+
+    for _ in 0..2 {
+        let addrs = resolver.lookup_ipv4("foo").await.expect("foo resolves");
+        assert_eq!(addrs, [Ipv4Addr::new(10, 0, 0, 2)]);
+    }
+    assert_eq!(
+        server.query_count(),
+        1,
+        "the second lookup should hit the cache"
+    );
+}
+
 /// A search-domain answer for a relative name does not answer the absolute name.
 ///
 /// The search domain holds `foo` with no A records (NODATA), and the absolute
