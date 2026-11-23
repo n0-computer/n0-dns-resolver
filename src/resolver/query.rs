@@ -1615,7 +1615,8 @@ mod tests {
     /// Builds a response of `size` bytes carrying a compression-pointer ladder.
     ///
     /// The ladder is `hops` pointer-to-pointer cells inside an opaque record, and
-    /// every later owner name points at its top.
+    /// every later owner name points at its top. A pointer holds a 14-bit offset,
+    /// so the ladder must end below 16 KiB, about 8000 hops.
     fn pointer_ladder_response(hops: usize, size: usize) -> (Vec<u8>, u16) {
         let mut buf = vec![0u8; DNS_HEADER_LEN];
         buf[2] = 0x80; // QR
@@ -1632,6 +1633,7 @@ mod tests {
         let mut prev = rdata_start as u16;
         for _ in 0..hops {
             let here = buf.len() as u16;
+            assert!(here < 0x4000, "the ladder must stay in pointer range");
             buf.push(0xC0 | (prev >> 8) as u8);
             buf.push((prev & 0xFF) as u8);
             prev = here;
@@ -1674,7 +1676,7 @@ mod tests {
     #[test]
     #[ignore = "a measurement, not an assertion"]
     fn bench_pointer_ladder_parse() {
-        let (buf, count) = pointer_ladder_response(16 * 1024, 64 * 1024);
+        let (buf, count) = pointer_ladder_response(8000, 64 * 1024);
 
         let start = std::time::Instant::now();
         let parsed = parse_packet(&buf);
