@@ -1081,20 +1081,17 @@ impl DnsResolver {
     /// type has left the chain unresolved, so the target is queried in turn.
     ///
     /// `read_answer` gets the validated packet that ends the chain, so each
-    /// response is parsed once.
+    /// response is parsed once. A target stays in wire form from one query to
+    /// the next, since its text form loses bytes that are not UTF-8.
     async fn send_query_following_cnames<T>(
         &self,
         host: String,
         qtype: TYPE,
         read_answer: impl Fn(&Packet<'_>) -> T,
     ) -> Result<T, Error> {
-        let mut current_host = host;
+        let mut name = simple_dns::Name::new(&host)
+            .map_err(|_| e!(Error::InvalidName { name: host.clone() }))?;
         for _ in 0..MAX_CNAME_DEPTH {
-            let name = simple_dns::Name::new(&current_host).map_err(|_| {
-                e!(Error::InvalidName {
-                    name: current_host.clone()
-                })
-            })?;
             let (id, query_bytes) = query::build_query(&name, qtype)?;
             let response = self.send_query(&query_bytes).await?;
             let packet = query::parse_packet(&response)?;
@@ -1108,8 +1105,8 @@ impl DnsResolver {
             let Some(target) = query::unresolved_cname_target(&packet, &name, qtype) else {
                 return Ok(read_answer(&packet));
             };
-            debug!(from = %current_host, to = %target, "following CNAME");
-            current_host = target;
+            debug!(from = %name, to = %target, "following CNAME");
+            name = target;
         }
         Err(e!(Error::InvalidResponse))
     }

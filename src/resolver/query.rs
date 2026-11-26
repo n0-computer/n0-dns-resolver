@@ -416,7 +416,7 @@ pub(super) fn unresolved_cname_target(
     packet: &Packet<'_>,
     qname: &Name<'_>,
     qtype: TYPE,
-) -> Option<String> {
+) -> Option<Name<'static>> {
     let chain = cname_chain(packet, qname);
     let answered = packet.answers.iter().any(|rr| {
         rr.class == CLASS::IN && rr.rdata.type_code() == qtype && chain.contains(&rr.name)
@@ -426,7 +426,7 @@ pub(super) fn unresolved_cname_target(
     }
     // The chain always starts with `qname`.
     let last = chain.last()?;
-    (last != qname).then(|| last.to_string())
+    (last != qname).then(|| last.clone().into_owned())
 }
 
 /// Validates a response against the query that produced it, then surfaces its RCODE.
@@ -888,6 +888,7 @@ mod tests {
     /// Returns the target to query next for `qname`, an A question.
     fn cname_target(packet: &Packet<'_>, qname: &str) -> Option<String> {
         unresolved_cname_target(packet, &Name::new_unchecked(qname), TYPE::A)
+            .map(|target| target.to_string())
     }
 
     #[test]
