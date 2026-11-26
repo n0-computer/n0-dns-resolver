@@ -1500,6 +1500,10 @@ impl DnsResolver {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
         time::{Duration, Instant},
     };
 
@@ -1687,37 +1691,48 @@ mod tests {
     /// A FORMERR response triggers an EDNS-less retry to the same server.
     ///
     /// RFC 6891. The mock rejects the EDNS query with FORMERR, then answers the
-    /// retry that carries no OPT record.
+    /// retry that carries no OPT record. The FORMERR is an empty reply, or the
+    /// query's own header with nothing after it, as some middleboxes send.
     #[tokio::test]
     async fn formerr_retries_without_edns() {
-        let expected = Ipv4Addr::new(198, 51, 100, 9);
-        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
-        let addr = server.local_addr().unwrap();
-        let handle = tokio::spawn(async move {
-            let mut buf = vec![0u8; 4096];
-            // First query carries EDNS: reply FORMERR (RCODE 1, low nibble of
-            // header byte 3).
-            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
-            let first = Packet::parse(&buf[..n]).unwrap();
-            assert!(first.opt().is_some(), "first query should carry EDNS");
-            let mut formerr = Packet::new_reply(first.id()).build_bytes_vec().unwrap();
-            formerr[3] = (formerr[3] & 0xF0) | 0x01;
-            server.send_to(&formerr, peer).await.unwrap();
+        for echo_query_header in [false, true] {
+            let expected = Ipv4Addr::new(198, 51, 100, 9);
+            let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+            let addr = server.local_addr().unwrap();
+            let handle = tokio::spawn(async move {
+                let mut buf = vec![0u8; 4096];
+                // First query carries EDNS: reply FORMERR (RCODE 1, low nibble of
+                // header byte 3).
+                let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+                let first = Packet::parse(&buf[..n]).unwrap();
+                assert!(first.opt().is_some(), "first query should carry EDNS");
+                let mut formerr = match echo_query_header {
+                    true => buf[..12].to_vec(),
+                    false => Packet::new_reply(first.id()).build_bytes_vec().unwrap(),
+                };
+                formerr[2] |= 0x80;
+                formerr[3] = (formerr[3] & 0xF0) | 0x01;
+                server.send_to(&formerr, peer).await.unwrap();
 
-            // The retry drops EDNS: answer it with an A record.
-            let (n, peer) = server.recv_from(&mut buf).await.unwrap();
-            let retry = Packet::parse(&buf[..n]).unwrap();
-            assert!(retry.opt().is_none(), "retry should drop EDNS");
-            server
-                .send_to(&a_reply(retry.id(), expected), peer)
-                .await
-                .unwrap();
-        });
+                // The retry drops EDNS: answer it with an A record.
+                let (n, peer) = server.recv_from(&mut buf).await.unwrap();
+                let retry = Packet::parse(&buf[..n]).unwrap();
+                assert!(retry.opt().is_none(), "retry should drop EDNS");
+                server
+                    .send_to(&a_reply(retry.id(), expected), peer)
+                    .await
+                    .unwrap();
+            });
 
-        let resolver = with_proto(addr, DnsProtocol::Udp);
-        let addrs = resolver.lookup_ipv4("example.com").await.unwrap();
-        assert_eq!(addrs, [expected]);
-        handle.await.unwrap();
+            let resolver = with_proto(addr, DnsProtocol::Udp);
+            let addrs =
+                tokio::time::timeout(Duration::from_secs(2), resolver.lookup_ipv4("example.com"))
+                    .await
+                    .expect("the FORMERR should be retried at once")
+                    .unwrap();
+            assert_eq!(addrs, [expected], "echo_query_header: {echo_query_header}");
+            handle.await.unwrap();
+        }
     }
 
     /// A lost datagram costs a retransmit interval, not a timeout.
@@ -2723,6 +2738,67 @@ mod tests {
             held <= MAX_HELD_BYTES,
             "the cache holds {held} bytes of records after {ANSWERS} large answers"
         );
+    }
+
+    /// A TCP answer to another question fails that nameserver, and the lookup moves on.
+    #[tokio::test]
+    async fn a_tcp_answer_to_another_question_moves_on_to_the_next_nameserver() {
+        /// Spawns a TCP nameserver that answers for `qname` with `address`, and counts queries.
+        async fn spawn_nameserver(
+            qname: Option<&'static str>,
+            address: Ipv4Addr,
+        ) -> (SocketAddr, Arc<AtomicUsize>) {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let addr = listener.local_addr().unwrap();
+            let queries = Arc::new(AtomicUsize::new(0));
+            let counter = queries.clone();
+            tokio::spawn(async move {
+                while let Ok((mut stream, _)) = listener.accept().await {
+                    counter.fetch_add(1, Ordering::Relaxed);
+                    let len = stream.read_u16().await.unwrap();
+                    let mut query = vec![0u8; usize::from(len)];
+                    stream.read_exact(&mut query).await.unwrap();
+                    let query = Packet::parse(&query).unwrap();
+                    let mut question = query.questions[0].clone();
+                    if let Some(qname) = qname {
+                        question.qname = Name::new_unchecked(qname);
+                    }
+                    let mut reply = Packet::new_reply(query.id());
+                    reply.answers.push(ResourceRecord::new(
+                        question.qname.clone(),
+                        CLASS::IN,
+                        300,
+                        RData::A(A {
+                            address: address.into(),
+                        }),
+                    ));
+                    reply.questions.push(question);
+                    let bytes = reply.build_bytes_vec().unwrap();
+                    stream
+                        .write_all(&(bytes.len() as u16).to_be_bytes())
+                        .await
+                        .unwrap();
+                    stream.write_all(&bytes).await.unwrap();
+                }
+            });
+            (addr, queries)
+        }
+
+        let (wrong, wrong_queries) =
+            spawn_nameserver(Some("other.example"), Ipv4Addr::new(6, 6, 6, 6)).await;
+        let (right, _) = spawn_nameserver(None, Ipv4Addr::new(10, 0, 0, 1)).await;
+        let resolver = DnsResolver::builder()
+            .nameservers([
+                Nameserver::new(wrong, DnsProtocol::Tcp),
+                Nameserver::new(right, DnsProtocol::Tcp),
+            ])
+            .build();
+
+        assert_eq!(
+            resolver.lookup_ipv4("relay.example").await.unwrap(),
+            [Ipv4Addr::new(10, 0, 0, 1)]
+        );
+        assert_eq!(wrong_queries.load(Ordering::Relaxed), 1);
     }
 
     /// Ordering nameservers does not panic while other lookups update their estimates.
