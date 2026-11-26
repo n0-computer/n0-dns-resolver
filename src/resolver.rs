@@ -289,19 +289,17 @@ fn is_localhost(host: &str) -> bool {
 /// Returns `name` without the trailing dot that marks it absolute, if it has one.
 ///
 /// The dot in `foo\.` is escaped and belongs to the last label.
-fn strip_root_dot(name: &str) -> Option<&str> {
+pub(crate) fn strip_root_dot(name: &str) -> Option<&str> {
     let stripped = name.strip_suffix('.')?;
     let backslashes = stripped.bytes().rev().take_while(|&b| b == b'\\').count();
     (backslashes % 2 == 0).then_some(stripped)
 }
 
-/// Returns the key the cache and the hosts file store `name` under.
+/// Returns `name` lowercased, borrowed if it has no uppercase letter.
 ///
-/// The key is lowercase without the root dot, so `Example.COM.` and
-/// `example.com` share one. A name already in that form is borrowed, as almost
-/// every query name is.
-pub(crate) fn name_key(name: &str) -> Cow<'_, str> {
-    let name = strip_root_dot(name).unwrap_or(name);
+/// DNS names are case-insensitive. Almost every query name is lowercase
+/// already, so this rarely copies.
+pub(crate) fn lowercase(name: &str) -> Cow<'_, str> {
     match name.bytes().any(|byte| byte.is_ascii_uppercase()) {
         true => Cow::Owned(name.to_ascii_lowercase()),
         false => Cow::Borrowed(name),
@@ -1204,8 +1202,8 @@ impl DnsResolver {
         let mut saw_transient = false;
         let names = self.search_names(&name);
         let total = names.len();
-        for (i, name) in names.into_iter().enumerate() {
-            trace!(%name, ?kind, "resolving");
+        for (i, candidate) in names.into_iter().enumerate() {
+            trace!(%candidate, ?kind, "resolving");
             let read_answer = |packet: &Packet<'_>| {
                 let parsed = query::parse_records(packet, kind).map_err(Error::from);
                 // RFC 2308 TTL of a NODATA answer. An NXDOMAIN comes back from
@@ -1217,7 +1215,7 @@ impl DnsResolver {
                 (parsed, soa)
             };
             let (res, soa_negative_ttl) = match self
-                .send_query_following_cnames(name.clone(), kind.dns_type(), read_answer)
+                .send_query_following_cnames(candidate.clone(), kind.dns_type(), read_answer)
                 .await
             {
                 Ok(answer) => answer,
@@ -1226,7 +1224,9 @@ impl DnsResolver {
             match res {
                 Ok((results, ttl)) if !results.is_empty() => {
                     let ttl = ttl.max(self.cache_min_ttl_secs());
-                    debug!(%name, ?kind, ?results, ttl, "resolved");
+                    debug!(%candidate, ?kind, ?results, ttl, "resolved");
+                    // Under the caller's name, which the next lookup probes, as
+                    // the negative answers below are.
                     self.cache
                         .insert(&name, kind, CachedResult::Positive(results.clone()), ttl);
                     return Ok(results);
@@ -1241,7 +1241,7 @@ impl DnsResolver {
                 }
                 Err(e @ Error::NxDomain { .. }) => {
                     let remaining = total - i - 1;
-                    trace!(%name, ?kind, remaining, reason = %e, "lookup failed");
+                    trace!(%candidate, ?kind, remaining, reason = %e, "lookup failed");
                     if first_negative.is_none() {
                         first_negative = Some(CachedResult::NxDomain);
                         negative_ttl_secs = self.negative_cache_ttl_secs(soa_negative_ttl);
@@ -1260,7 +1260,7 @@ impl DnsResolver {
                     | Error::InvalidResponse { .. }),
                 ) => {
                     let remaining = total - i - 1;
-                    trace!(%name, ?kind, remaining, reason = %e, "lookup failed");
+                    trace!(%candidate, ?kind, remaining, reason = %e, "lookup failed");
                     saw_transient = true;
                     last_err = Some(e);
                 }
@@ -1269,7 +1269,7 @@ impl DnsResolver {
                 // candidate identically, so there is nothing to gain by trying
                 // the rest.
                 Err(e) => {
-                    debug!(%name, ?kind, reason = %e, "lookup failed");
+                    debug!(%candidate, ?kind, reason = %e, "lookup failed");
                     return Err(e);
                 }
             }
