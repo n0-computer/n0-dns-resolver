@@ -32,6 +32,10 @@ yet fully-featured DNS resolver. It does not perform recursive resolution.
 
 It does not perform DNSSEC validation.
 
+The resolver limits name decoding to 32,768 label reads and compression-pointer
+hops combined per response. A heavily compressed response can exceed this
+limit even when it is valid DNS. The resolver reports it as malformed.
+
 ## Usage
 
 ```rust,no_run

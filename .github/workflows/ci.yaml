@@ -38,7 +38,7 @@ jobs:
     name: Android Build Only
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     strategy:
       fail-fast: false
       matrix:
@@ -86,10 +86,9 @@ jobs:
         cargo ndk --target $RUST_TARGET build --locked
 
   check_semver:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     env:
       RUSTC_WRAPPER: "sccache"
-      SCCACHE_GHA_ENABLED: "on"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -118,10 +117,9 @@ jobs:
   check_fmt:
     timeout-minutes: 30
     name: Checking fmt
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     env:
       RUSTC_WRAPPER: "sccache"
-      SCCACHE_GHA_ENABLED: "on"
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -142,10 +140,9 @@ jobs:
   check_docs:
     timeout-minutes: 30
     name: Checking docs
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     env:
       RUSTC_WRAPPER: "sccache"
-      SCCACHE_GHA_ENABLED: "on"
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -163,10 +160,9 @@ jobs:
 
   clippy_check:
     timeout-minutes: 30
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     env:
       RUSTC_WRAPPER: "sccache"
-      SCCACHE_GHA_ENABLED: "on"
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -191,10 +187,9 @@ jobs:
     timeout-minutes: 30
     name: Check external types in public API
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     env:
       RUSTC_WRAPPER: "sccache"
-      SCCACHE_GHA_ENABLED: "on"
       # The tool drives an internal rustdoc invocation that only emits JSON for
       # the analyzer, so the workflow-wide `-Dwarnings` would turn unrelated
       # rustdoc lints into hard failures here. Clear it for this job.
@@ -228,10 +223,9 @@ jobs:
     if: "github.event_name != 'pull_request' || ! contains(github.event.pull_request.labels.*.name, 'flaky-test')"
     timeout-minutes: 30
     name: Minimal Supported Rust Version
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     env:
       RUSTC_WRAPPER: "sccache"
-      SCCACHE_GHA_ENABLED: "on"
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
@@ -249,7 +243,7 @@ jobs:
   cargo_deny:
     timeout-minutes: 30
     name: cargo deny
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -262,7 +256,7 @@ jobs:
 
   codespell:
     timeout-minutes: 30
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     steps:
     - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       with:
