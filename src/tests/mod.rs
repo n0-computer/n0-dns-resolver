@@ -24,7 +24,7 @@ use std::{
 
 use simple_dns::{
     CLASS, CharacterString, Name, Packet, PacketFlag, RCODE, ResourceRecord,
-    rdata::{A, CAA, CNAME, MX, NS, RData, SRV, TXT},
+    rdata::{A, CAA, CNAME, MX, NS, RData, SOA, SRV, TXT},
 };
 use tokio::{net::UdpSocket, task::JoinHandle};
 
@@ -162,6 +162,24 @@ pub(crate) fn cname(name: &str, target: &str) -> ResourceRecord<'static> {
         CLASS::IN,
         ANSWER_TTL,
         RData::CNAME(CNAME(Name::new_unchecked(target).into_owned())),
+    )
+}
+
+/// An authority SOA for `zone` with the given `minimum`, as a negative answer carries.
+pub(crate) fn soa(zone: &str, minimum: u32) -> ResourceRecord<'static> {
+    ResourceRecord::new(
+        Name::new_unchecked(zone).into_owned(),
+        CLASS::IN,
+        ANSWER_TTL,
+        RData::SOA(SOA {
+            mname: Name::new_unchecked("ns.example").into_owned(),
+            rname: Name::new_unchecked("hostmaster.example").into_owned(),
+            serial: 1,
+            refresh: 3600,
+            retry: 600,
+            expire: 604_800,
+            minimum,
+        }),
     )
 }
 
