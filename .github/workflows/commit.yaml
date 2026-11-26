@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   check-for-cc:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     steps:
       - name: check-for-cc
         id: check-for-cc

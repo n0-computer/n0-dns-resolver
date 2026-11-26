@@ -2,11 +2,18 @@
 
 #[cfg(with_rustls)]
 use std::sync::Arc;
-use std::{io, net::SocketAddr};
+use std::{
+    io,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 use n0_error::{e, stack_error};
-use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
-use tracing::debug;
+use n0_future::time::{Duration, Instant};
+use tokio::{
+    io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
+    net::UdpSocket,
+};
+use tracing::{debug, trace};
 
 use super::{pool::ConnPool, query};
 
@@ -69,13 +76,6 @@ pub enum TransportError {
     },
 }
 
-// TCP and DoT connections are pooled (see the `pool` module) and reused across
-// queries, so a DoT handshake is paid once and amortized over repeated
-// lookups to the same nameserver.
-//
-// UDP sockets are intentionally not reused (a new random source port per query
-// helps prevent cache poisoning).
-
 /// UDP receive buffer size.
 ///
 /// Well above the advertised EDNS(0) payload of 1232 bytes, so a compliant
@@ -84,49 +84,136 @@ pub enum TransportError {
 /// treated as possibly truncated and also retried over TCP.
 const UDP_RECV_BUFFER: usize = 4096;
 
-/// Sends a DNS query over UDP and reads the response.
+/// One UDP socket for a nameserver attempt and all of its retransmissions.
 ///
-/// Each query uses a fresh socket with a random ephemeral source port to
-/// prevent cache poisoning. The socket keeps listening until a datagram arrives
-/// from the nameserver that answers the query (see [`query::answers_query`]);
-/// anything else that reaches the port is logged and ignored, so a spoofed or
-/// stray datagram cannot end the query ahead of the real answer. The caller
-/// bounds the wait with its timeout.
+/// Each attempt binds a new random source port, which helps prevent cache
+/// poisoning, so sockets are never reused across attempts. Each datagram
+/// carries its own transaction id: the first keeps the query's, and every
+/// retransmission draws a fresh random one. A reply can then be matched to the
+/// send it answers and timed from it, as it could when each datagram had its
+/// own socket, and an off-path attacker still faces one valid id and port pair
+/// per datagram.
 ///
-/// The returned flag is set when the datagram filled the receive buffer and may
-/// be truncated, so the caller can retry over TCP.
-pub(super) async fn udp_query(
+/// The socket keeps listening until a datagram arrives from the nameserver that
+/// answers one of the sends (see [`query::answers_query`]); anything else that
+/// reaches the port is logged and ignored, so a spoofed or stray datagram
+/// cannot end the query ahead of the real answer. The caller bounds the wait
+/// with its timeout.
+#[derive(Debug)]
+pub(super) struct UdpQuery {
+    socket: UdpSocket,
+    /// The nameserver queried.
     addr: SocketAddr,
-    query: &[u8],
-) -> Result<(Vec<u8>, bool), TransportError> {
-    let unspecified: std::net::IpAddr = if addr.is_ipv6() {
-        std::net::Ipv6Addr::UNSPECIFIED.into()
-    } else {
-        std::net::Ipv4Addr::UNSPECIFIED.into()
-    };
-    let bind_addr = SocketAddr::new(unspecified, 0);
-    let socket = tokio::net::UdpSocket::bind(bind_addr).await?;
-    socket.send_to(query, addr).await?;
+    /// The query as built, carrying the transaction id the caller checks.
+    query: Vec<u8>,
+    /// Transaction id of `query`.
+    id: u16,
+    /// Transaction id and send time of every datagram sent so far.
+    sends: Vec<(u16, Instant)>,
+}
 
-    let mut buf = vec![0u8; UDP_RECV_BUFFER];
-    loop {
-        let (len, src) = socket.recv_from(&mut buf).await?;
-        if src != addr {
-            debug!(%addr, %src, "ignoring UDP datagram from an unexpected source");
-            continue;
-        }
-        if !query::answers_query(&buf[..len], query) {
-            debug!(%addr, len, "ignoring UDP datagram that does not answer the query");
-            continue;
-        }
-        // A datagram that fills the whole buffer may have been truncated at the
-        // socket by a sender that ignored our advertised EDNS payload size. The
-        // DNS TC bit only covers server-side truncation, so flag this separately
-        // and let the caller retry over TCP rather than parse a partial message.
-        let maybe_truncated = len == buf.len();
-        buf.truncate(len);
-        return Ok((buf, maybe_truncated));
+/// A datagram that answers one of the sends of a [`UdpQuery`].
+#[derive(Debug)]
+pub(super) struct UdpReply {
+    /// The response, with its transaction id restored to the query's.
+    pub(super) response: Vec<u8>,
+    /// Whether the datagram filled the receive buffer and may be truncated.
+    pub(super) maybe_truncated: bool,
+    /// Time since the datagram this one answers was sent.
+    pub(super) rtt: Duration,
+}
+
+impl UdpQuery {
+    /// Binds a socket on a fresh ephemeral port for querying `addr`.
+    pub(super) async fn bind(addr: SocketAddr, query: &[u8]) -> Result<Self, TransportError> {
+        let id = transaction_id(query).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "query shorter than a DNS header",
+            )
+        })?;
+        let unspecified = if addr.is_ipv6() {
+            Ipv6Addr::UNSPECIFIED.into()
+        } else {
+            Ipv4Addr::UNSPECIFIED.into()
+        };
+        let socket = UdpSocket::bind(SocketAddr::new(unspecified, 0)).await?;
+        Ok(Self {
+            socket,
+            addr,
+            query: query.to_vec(),
+            id,
+            sends: Vec::new(),
+        })
     }
+
+    /// Sends the query once more, under a transaction id not used before.
+    pub(super) async fn send(&mut self) -> Result<(), TransportError> {
+        let id = if self.sends.is_empty() {
+            self.id
+        } else {
+            self.fresh_id()
+        };
+        let mut datagram = self.query.clone();
+        datagram[..2].copy_from_slice(&id.to_be_bytes());
+        let sent = Instant::now();
+        self.socket.send_to(&datagram, self.addr).await?;
+        self.sends.push((id, sent));
+        Ok(())
+    }
+
+    /// Returns a random transaction id that no earlier send used.
+    fn fresh_id(&self) -> u16 {
+        loop {
+            let id: u16 = rand::random();
+            if self.sends.iter().all(|&(used, _)| used != id) {
+                return id;
+            }
+        }
+    }
+
+    /// Waits for a datagram that answers one of the sends so far.
+    ///
+    /// Cancel safe: an answering datagram leaves the socket only when returned.
+    pub(super) async fn recv(&self) -> Result<UdpReply, TransportError> {
+        let addr = self.addr;
+        let mut buf = vec![0u8; UDP_RECV_BUFFER];
+        loop {
+            let (len, src) = self.socket.recv_from(&mut buf).await?;
+            if src != addr {
+                trace!(%addr, %src, "ignoring UDP datagram from an unexpected source");
+                continue;
+            }
+            let send = transaction_id(&buf[..len])
+                .and_then(|id| self.sends.iter().find(|&&(used, _)| used == id));
+            let Some(&(_, sent)) = send else {
+                debug!(%addr, len, "ignoring UDP datagram that does not answer the query");
+                continue;
+            };
+            // The caller checks the response against the query as built.
+            buf[..2].copy_from_slice(&self.id.to_be_bytes());
+            if !query::answers_query(&buf[..len], &self.query) {
+                debug!(%addr, len, "ignoring UDP datagram that does not answer the query");
+                continue;
+            }
+            // A datagram that fills the whole buffer may have been truncated at the
+            // socket by a sender that ignored our advertised EDNS payload size. The
+            // DNS TC bit only covers server-side truncation, so flag this separately
+            // and let the caller retry over TCP rather than parse a partial message.
+            let maybe_truncated = len == buf.len();
+            buf.truncate(len);
+            return Ok(UdpReply {
+                response: buf,
+                maybe_truncated,
+                rtt: sent.elapsed(),
+            });
+        }
+    }
+}
+
+/// Reads the transaction id from the first two bytes of a DNS message.
+fn transaction_id(message: &[u8]) -> Option<u16> {
+    message.first_chunk().map(|&id| u16::from_be_bytes(id))
 }
 
 /// Sends a length-prefixed DNS query on an established stream and reads the reply.
@@ -324,6 +411,14 @@ mod tests {
 
     use super::*;
     use crate::Record;
+
+    /// Sends `query` in a single datagram and waits for the answer.
+    async fn udp_query(addr: SocketAddr, query: &[u8]) -> Result<(Vec<u8>, bool), TransportError> {
+        let mut udp = UdpQuery::bind(addr, query).await?;
+        udp.send().await?;
+        let reply = udp.recv().await?;
+        Ok((reply.response, reply.maybe_truncated))
+    }
 
     /// Parses a response down to its A record addresses and TTL.
     ///

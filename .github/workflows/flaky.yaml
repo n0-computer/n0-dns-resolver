@@ -48,7 +48,7 @@ jobs:
   notify:
     needs: tests
     if: ${{ always() }}
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, linux, X64]
     steps:
       - name: Extract test results
         env:
