@@ -4,8 +4,6 @@
 //! submodules hold the pieces: the cache, the connection pool, the per-server
 //! RTT map, packet construction and parsing, and the transports.
 
-#[cfg(with_rustls)]
-use std::sync::Arc;
 #[cfg(transport_https)]
 use std::sync::Mutex;
 use std::{
@@ -13,7 +11,7 @@ use std::{
     future::Future,
     net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     pin::Pin,
-    sync::OnceLock,
+    sync::{Arc, OnceLock},
 };
 
 use n0_error::e;
@@ -22,6 +20,7 @@ use n0_future::{
     time::{self, Duration, Instant},
 };
 use simple_dns::{Packet, TYPE};
+use tokio::sync::Semaphore;
 use tracing::{debug, trace};
 
 #[cfg(test)]
@@ -105,6 +104,15 @@ const STREAM_TIMEOUT: Duration = Duration::from_secs(5);
 ///
 /// Keeps a long nameserver list from turning every lookup into an N-way fan-out.
 const MAX_CONCURRENT_QUERIES: usize = 3;
+
+/// Most UDP sockets one resolver holds open at once, across all its lookups.
+///
+/// Each UDP nameserver attempt holds a socket for up to
+/// [`UDP_NAMESERVER_TIMEOUT`]. Without a limit, concurrent lookups open sockets
+/// without bound and can run the process out of file descriptors. An attempt
+/// over the limit waits for a socket before it starts, so the wait counts
+/// neither against its timeout nor in the nameserver's round-trip estimate.
+const MAX_UDP_SOCKETS: usize = 64;
 
 /// Delay before starting the next nameserver attempt.
 ///
@@ -352,6 +360,11 @@ pub struct DnsResolver {
     https_client: Mutex<Option<reqwest::Client>>,
     /// Pooled TCP/DoT connections, reused across queries.
     conn_pool: ConnPool,
+    /// Permits for UDP sockets, at most [`MAX_UDP_SOCKETS`] at once.
+    ///
+    /// Used to limit the number of concurrenltly opened UDP sockets, to prevent
+    /// fd exhaustion. The semaphore is retained when resetting through [`Self::reset`].
+    udp_socket_permit: Arc<Semaphore>,
     /// Cached positive and negative answers.
     ///
     /// Shared with the resolver [`Self::reset`] produces, so a network change
@@ -505,7 +518,11 @@ impl DnsResolver {
 
     /// Builds a resolver from `builder`, used by [`Builder::build`].
     pub(crate) fn from_builder(builder: Builder) -> Self {
-        Self::new_deferred(builder, DnsCache::new())
+        Self::new_deferred(
+            builder,
+            DnsCache::new(),
+            Arc::new(Semaphore::new(MAX_UDP_SOCKETS)),
+        )
     }
 
     /// Builds a resolver that reads the system DNS configuration lazily.
@@ -515,7 +532,7 @@ impl DnsResolver {
     /// [`Self::reset`] reuses this to rebuild after a network change while
     /// carrying the cache across, so lookups keep hitting cached records while
     /// the new nameservers settle (see issue #4037), without any eager IO.
-    fn new_deferred(builder: Builder, cache: DnsCache) -> Self {
+    fn new_deferred(builder: Builder, cache: DnsCache, udp_socket_permit: Arc<Semaphore>) -> Self {
         // Use the caller's TLS client config, or fall back to one built from the
         // compiled-in crypto provider. When neither is present, DoT/DoH fail with
         // `MissingTlsConfig` rather than reaching for a reqwest/rustls default.
@@ -531,6 +548,7 @@ impl DnsResolver {
             #[cfg(transport_https)]
             https_client: Mutex::new(None),
             conn_pool: ConnPool::new(),
+            udp_socket_permit,
             cache,
             builder,
             state: OnceLock::new(),
@@ -1016,10 +1034,22 @@ impl DnsResolver {
             {
                 let idx = order[next];
                 next += 1;
-                let start = Instant::now();
                 let retransmit = Self::retransmit_interval(state.rtt_map.get_datagram(idx));
                 dials.push(async move {
                     let ns = &state.config.nameservers[idx];
+                    // We limit the number of concurrently opened UDP sockets to prevent socket
+                    // exhaustion. Waiting for a permit for a new socket happens before the
+                    // attempt timeout, because it mustn't count towards the nameserver's time.
+                    let _permit = match ns.protocol {
+                        DnsProtocol::Udp => Some(
+                            self.udp_socket_permit
+                                .acquire()
+                                .await
+                                .expect("the UDP socket semaphore is never closed"),
+                        ),
+                        _ => None,
+                    };
+                    let start = Instant::now();
                     let res = self.query_nameserver(ns, query_bytes, retransmit).await;
                     (idx, start, res)
                 });
@@ -1492,7 +1522,11 @@ impl DnsResolver {
     /// start DNS cold, which would strand reconnects while the new nameservers
     /// settle (#4037).
     pub fn reset(&self) -> Self {
-        Self::new_deferred(self.builder.clone(), self.cache.clone())
+        Self::new_deferred(
+            self.builder.clone(),
+            self.cache.clone(),
+            self.udp_socket_permit.clone(),
+        )
     }
 }
 
@@ -1500,6 +1534,7 @@ impl DnsResolver {
 mod tests {
     use std::{
         net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
+        sync::Arc,
         time::{Duration, Instant},
     };
 
@@ -1507,7 +1542,11 @@ mod tests {
         CLASS, Name, Packet, PacketFlag, QCLASS, QTYPE, Question, ResourceRecord, TYPE,
         rdata::{A, RData},
     };
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        sync::Semaphore,
+        time,
+    };
     use tracing::info;
 
     use super::{
@@ -1718,6 +1757,100 @@ mod tests {
         let addrs = resolver.lookup_ipv4("example.com").await.unwrap();
         assert_eq!(addrs, [expected]);
         handle.await.unwrap();
+    }
+
+    /// An attempt over the UDP socket limit waits until a socket is free.
+    #[tokio::test]
+    async fn udp_attempt_waits_for_a_socket() {
+        let server = tokio::net::UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = server.local_addr().unwrap();
+        let mut resolver = with_proto(addr, DnsProtocol::Udp);
+        resolver.udp_socket_permit = Arc::new(Semaphore::new(1));
+        let resolver = Arc::new(resolver);
+        let lookup = |resolver: Arc<DnsResolver>| {
+            tokio::spawn(async move { resolver.lookup_ipv4("example.com").await })
+        };
+        let mut buf = [0u8; 4096];
+
+        let first = lookup(resolver.clone());
+        let (len, first_peer) = time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+            .await
+            .expect("the first lookup sends a datagram")
+            .unwrap();
+        let first_id = Packet::parse(&buf[..len]).unwrap().id();
+
+        let second = lookup(resolver.clone());
+        assert!(
+            time::timeout(Duration::from_millis(200), server.recv_from(&mut buf))
+                .await
+                .is_err(),
+            "the second lookup sent a datagram while the only socket was taken"
+        );
+
+        let answer = Ipv4Addr::new(198, 51, 100, 42);
+        server
+            .send_to(&a_reply(first_id, answer), first_peer)
+            .await
+            .unwrap();
+        assert_eq!(first.await.unwrap().unwrap(), [answer]);
+
+        let (len, second_peer) = time::timeout(Duration::from_secs(2), server.recv_from(&mut buf))
+            .await
+            .expect("the second lookup sends once the socket is free")
+            .unwrap();
+        let second_id = Packet::parse(&buf[..len]).unwrap().id();
+        server
+            .send_to(&a_reply(second_id, answer), second_peer)
+            .await
+            .unwrap();
+        assert_eq!(second.await.unwrap().unwrap(), [answer]);
+    }
+
+    /// Time spent waiting for a socket stays out of the nameserver's estimate.
+    ///
+    /// The lookup waits 600 ms for a socket and is then answered at once. Had
+    /// the wait counted, the estimate would rise above the untried baseline.
+    #[tokio::test]
+    async fn waiting_for_a_socket_is_not_charged_to_the_nameserver() {
+        const WAIT: Duration = Duration::from_millis(600);
+        let answer = Ipv4Addr::new(198, 51, 100, 43);
+        let (addr, handle) = udp_nameserver_losing(0, answer).await;
+        let mut resolver = with_proto(addr, DnsProtocol::Udp);
+        resolver.udp_socket_permit = Arc::new(Semaphore::new(1));
+        let resolver = Arc::new(resolver);
+        let held = resolver
+            .udp_socket_permit
+            .clone()
+            .acquire_owned()
+            .await
+            .unwrap();
+
+        let start = Instant::now();
+        let lookup = {
+            let resolver = resolver.clone();
+            tokio::spawn(async move { resolver.lookup_ipv4("example.com").await })
+        };
+        time::sleep(WAIT).await;
+        drop(held);
+        assert_eq!(lookup.await.unwrap().unwrap(), [answer]);
+        handle.await.unwrap();
+
+        assert!(start.elapsed() >= WAIT);
+        let estimate = resolver.state().rtt_map.get_decayed(0);
+        assert!(
+            estimate < 50_000.0,
+            "the wait was charged to the nameserver: {estimate} us"
+        );
+    }
+
+    /// A reset resolver shares the UDP socket limit with the one it replaces.
+    #[test]
+    fn reset_shares_the_udp_socket_limit() {
+        let resolver = DnsResolver::builder().build();
+        assert!(Arc::ptr_eq(
+            &resolver.udp_socket_permit,
+            &resolver.reset().udp_socket_permit
+        ));
     }
 
     /// A lost datagram costs a retransmit interval, not a timeout.
