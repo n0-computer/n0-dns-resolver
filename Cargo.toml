@@ -47,11 +47,13 @@ system-configuration = "0.8"
 ipconfig = "0.3"
 
 [features]
-default = ["transport-tls", "transport-https", "tls-ring"]
+default = ["transport-tls", "transport-https", "http2", "tls-ring"]
 # DNS-over-TLS and DNS-over-HTTPS both build on rustls; each pulls the roots used
 # to build a default client config when the caller does not supply one.
 transport-tls = ["dep:rustls", "dep:tokio-rustls", "dep:webpki-roots"]
 transport-https = ["dep:reqwest", "dep:rustls", "dep:webpki-roots"]
+# HTTP/2 for DNS-over-HTTPS, which some providers require.
+http2 = ["transport-https", "reqwest/http2"]
 # A rustls crypto provider, used to build that default client config.
 tls-ring = ["rustls?/ring"]
 tls-aws-lc-rs = ["rustls?/aws-lc-rs"]

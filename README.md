@@ -93,12 +93,14 @@ feature-gated:
 
 - `transport-tls`: DNS-over-TLS, via rustls.
 - `transport-https`: DNS-over-HTTPS, via reqwest with rustls.
+- `http2`: HTTP/2 for DNS-over-HTTPS. Without it DoH speaks only HTTP/1.1,
+  which some providers, Quad9 among them, no longer serve.
 - `tls-ring` / `tls-aws-lc-rs`: the rustls crypto provider used to build the
   default TLS client config when none is supplied on the builder.
 
-The default features are `transport-tls`, `transport-https`, and `tls-ring`,
-so DoT and DoH work out of the box. With `default-features = false` the
-resolver speaks plain DNS only. Enabling a transport without a crypto
+The default features are `transport-tls`, `transport-https`, `http2`, and
+`tls-ring`, so DoT and DoH work out of the box. With `default-features = false`
+the resolver speaks plain DNS only. Enabling a transport without a crypto
 provider also works, but then a TLS client config must be supplied on the
 builder.
 

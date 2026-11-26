@@ -316,6 +316,11 @@ pub(super) async fn tls_query(
 
 /// Builds a [`reqwest::Client`] for DNS-over-HTTPS queries.
 ///
+/// With the `http2` feature the client offers HTTP/2 and falls back to
+/// HTTP/1.1. RFC 8484 recommends HTTP/2 as the minimum for DoH, and some
+/// providers no longer serve DoH over HTTP/1.1 at all. Without the feature it
+/// offers HTTP/1.1 only.
+///
 /// `resolves` pins each named DoH host to a fixed address, so a hostname-based
 /// DoH URL connects to that IP instead of being resolved recursively.
 #[cfg(transport_https)]
@@ -323,11 +328,20 @@ pub(super) fn build_https_client(
     tls_config: &Arc<rustls::ClientConfig>,
     resolves: &[(String, SocketAddr)],
 ) -> Result<reqwest::Client, TransportError> {
+    // reqwest uses a preconfigured TLS config as given, so the protocols to
+    // offer in ALPN are set here, matching the HTTP versions it can speak.
+    // This copy is for DoH only; DoT keeps none.
+    let mut tls_config = (**tls_config).clone();
+    tls_config.alpn_protocols = vec![
+        #[cfg(feature = "http2")]
+        b"h2".to_vec(),
+        b"http/1.1".to_vec(),
+    ];
     // reqwest wraps the argument in an `Option` and downcasts to
     // `Option<rustls::ClientConfig>`, so hand it a bare `ClientConfig` (not the
     // `Arc`), or it rejects it as an unknown backend at build time.
     let mut builder = reqwest::Client::builder()
-        .use_preconfigured_tls((**tls_config).clone())
+        .use_preconfigured_tls(tls_config)
         .redirect(reqwest::redirect::Policy::none());
     for (host, addr) in resolves {
         builder = builder.resolve(host, *addr);
@@ -707,21 +721,18 @@ mod tests {
         handle.await.unwrap();
     }
 
+    /// Returns a DoH client and a TLS acceptor that trust each other on 127.0.0.1.
+    ///
+    /// The acceptor offers `server_alpn` in ALPN.
     #[cfg(all(transport_https, transport_tls, with_crypto_provider))]
-    #[tokio::test]
-    async fn https_query_does_not_follow_a_redirect() {
-        let bystander = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let bystander_addr = bystander.local_addr().unwrap();
-        let doh = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let doh_addr = doh.local_addr().unwrap();
-
+    fn local_doh_pair(server_alpn: &[&[u8]]) -> (reqwest::Client, tokio_rustls::TlsAcceptor) {
         let key = rcgen::generate_simple_self_signed(vec!["127.0.0.1".to_string()]).unwrap();
         let cert = key.cert.der().clone();
         let provider = crate::DnsResolver::default_tls_config()
             .unwrap()
             .crypto_provider()
             .clone();
-        let server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
+        let mut server_config = rustls::ServerConfig::builder_with_provider(provider.clone())
             .with_safe_default_protocol_versions()
             .unwrap()
             .with_no_client_auth()
@@ -730,6 +741,7 @@ mod tests {
                 rustls::pki_types::PrivatePkcs8KeyDer::from(key.signing_key.serialize_der()).into(),
             )
             .unwrap();
+        server_config.alpn_protocols = server_alpn.iter().map(|p| p.to_vec()).collect();
         let mut roots = rustls::RootCertStore::empty();
         roots.add(cert).unwrap();
         let client_config = rustls::ClientConfig::builder_with_provider(provider)
@@ -738,10 +750,21 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         let client = build_https_client(&Arc::new(client_config), &[]).unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
+        (client, acceptor)
+    }
+
+    #[cfg(all(transport_https, transport_tls, with_crypto_provider))]
+    #[tokio::test]
+    async fn https_query_does_not_follow_a_redirect() {
+        let bystander = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let bystander_addr = bystander.local_addr().unwrap();
+        let doh = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let doh_addr = doh.local_addr().unwrap();
+        let (client, acceptor) = local_doh_pair(&[]);
 
         let (_, query) = build_query();
         let expected = query.clone();
-        let acceptor = tokio_rustls::TlsAcceptor::from(Arc::new(server_config));
         let server = tokio::spawn(async move {
             let (stream, _) = doh.accept().await.unwrap();
             let mut stream = acceptor.accept(stream).await.unwrap();
@@ -762,5 +785,55 @@ mod tests {
         };
         assert!(!did_follow_redirect);
         server.await.unwrap();
+    }
+
+    /// Accepts one DoH connection that offers both HTTP versions in ALPN.
+    ///
+    /// Returns the negotiated protocol and the first bytes the client sent.
+    #[cfg(all(transport_https, transport_tls, with_crypto_provider))]
+    async fn negotiate_doh_version() -> (Option<Vec<u8>>, Vec<u8>) {
+        let doh = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let doh_addr = doh.local_addr().unwrap();
+        let (client, acceptor) = local_doh_pair(&[b"h2", b"http/1.1"]);
+
+        let server = tokio::spawn(async move {
+            let (stream, _) = doh.accept().await.unwrap();
+            let mut stream = acceptor.accept(stream).await.unwrap();
+            let alpn = stream.get_ref().1.alpn_protocol().map(<[u8]>::to_vec);
+            let mut start = vec![0; HTTP2_PREFACE.len()];
+            stream.read_exact(&mut start).await.unwrap();
+            (alpn, start)
+        });
+
+        let (_, query) = build_query();
+        tokio::select! {
+            res = server => res.unwrap(),
+            _ = https_query(doh_addr, None, &query, &client) => panic!("the query finished without a server"),
+        }
+    }
+
+    /// The bytes an HTTP/2 client opens a connection with.
+    #[cfg(all(transport_https, transport_tls, with_crypto_provider))]
+    const HTTP2_PREFACE: &[u8] = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+
+    #[cfg(all(feature = "http2", transport_tls, with_crypto_provider))]
+    #[tokio::test]
+    async fn https_query_speaks_http2_when_offered() {
+        let (alpn, start) = negotiate_doh_version().await;
+        assert_eq!(alpn.as_deref(), Some(&b"h2"[..]));
+        assert_eq!(start, HTTP2_PREFACE);
+    }
+
+    #[cfg(all(
+        transport_https,
+        not(feature = "http2"),
+        transport_tls,
+        with_crypto_provider
+    ))]
+    #[tokio::test]
+    async fn https_query_speaks_http1_without_the_http2_feature() {
+        let (alpn, start) = negotiate_doh_version().await;
+        assert_eq!(alpn.as_deref(), Some(&b"http/1.1"[..]));
+        assert!(start.starts_with(b"POST /dns-query HTTP/1.1"));
     }
 }
