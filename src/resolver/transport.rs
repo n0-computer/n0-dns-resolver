@@ -2,7 +2,10 @@
 
 #[cfg(with_rustls)]
 use std::sync::Arc;
-use std::{io, net::SocketAddr};
+use std::{
+    io,
+    net::{Ipv4Addr, Ipv6Addr, SocketAddr},
+};
 
 use n0_error::{e, stack_error};
 use n0_future::time::{Duration, Instant};
@@ -10,7 +13,7 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt},
     net::UdpSocket,
 };
-use tracing::debug;
+use tracing::{debug, trace};
 
 use super::{pool::ConnPool, query};
 
@@ -129,10 +132,10 @@ impl UdpQuery {
                 "query shorter than a DNS header",
             )
         })?;
-        let unspecified: std::net::IpAddr = if addr.is_ipv6() {
-            std::net::Ipv6Addr::UNSPECIFIED.into()
+        let unspecified = if addr.is_ipv6() {
+            Ipv6Addr::UNSPECIFIED.into()
         } else {
-            std::net::Ipv4Addr::UNSPECIFIED.into()
+            Ipv4Addr::UNSPECIFIED.into()
         };
         let socket = UdpSocket::bind(SocketAddr::new(unspecified, 0)).await?;
         Ok(Self {
@@ -178,7 +181,7 @@ impl UdpQuery {
         loop {
             let (len, src) = self.socket.recv_from(&mut buf).await?;
             if src != addr {
-                debug!(%addr, %src, "ignoring UDP datagram from an unexpected source");
+                trace!(%addr, %src, "ignoring UDP datagram from an unexpected source");
                 continue;
             }
             let send = transaction_id(&buf[..len])
