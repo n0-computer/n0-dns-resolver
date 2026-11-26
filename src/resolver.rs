@@ -1040,12 +1040,14 @@ impl DnsResolver {
                     // We limit the number of concurrently opened UDP sockets to prevent socket
                     // exhaustion. Waiting for a permit for a new socket happens before the
                     // attempt timeout, because it mustn't count towards the nameserver's time.
-                    if ns.protocol == DnsProtocol::Udp {
-                        let _permit = self
-                            .udp_socket_permit
-                            .acquire()
-                            .await
-                            .expect("the UDP socket semaphore is never closed");
+                    let _permit = match ns.protocol {
+                        DnsProtocol::Udp => Some(
+                            self.udp_socket_permit
+                                .acquire()
+                                .await
+                                .expect("the UDP socket semaphore is never closed"),
+                        ),
+                        _ => None,
                     };
                     let start = Instant::now();
                     let res = self.query_nameserver(ns, query_bytes, retransmit).await;
